@@ -390,7 +390,12 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
                 base64Encoded: artworkDataString.trimmingCharacters(in: .whitespacesAndNewlines)
             )
         } else if !diff {
-            newState.artwork = nil
+            // Yandex omits artwork on full snapshots for the CURRENT track (pause / seek / redump).
+            // Keep the existing artwork for the same track — nil-ing then re-setting it would flip
+            // album art and spuriously re-trigger the lyrics fetch. Only clear on a real track change.
+            let sameTrack = (payload.title ?? "") == playbackState.title
+                && (payload.artist ?? "") == playbackState.artist
+            if !sameTrack { newState.artwork = nil }
         }
 
         newState.playbackRate = payload.playbackRate ?? (diff ? playbackState.playbackRate : 1.0)

@@ -60,6 +60,9 @@ class MusicManager: ObservableObject {
     // by artwork arriving late, or a pause/seek update) from here prevents a flaky LRCLIB
     // response from wiping good lyrics to "No lyrics found".
     private var lyricsCache: [String: (plain: String, synced: [(time: Double, text: String)])] = [:]
+    // The track key we last kicked off (or served) a lyrics fetch for. Used to ignore repeated
+    // same-track content changes (e.g. artwork arriving late) so the loader isn't restarted.
+    private var lastLyricsKey: String = ""
 
     // Store last values at the time artwork was changed
     private var lastArtworkTitle: String = "I'm Handsome"
@@ -357,6 +360,22 @@ class MusicManager: ObservableObject {
             return
         }
 
+        let key = lyricsKey(title, artist)
+        // Serve a resolved result (positive or negative) from cache — a re-fetch triggered by
+        // late artwork or any same-track content change never re-hits the network or re-spins.
+        if let cached = lyricsCache[key] {
+            lastLyricsKey = key
+            DispatchQueue.main.async {
+                self.isFetchingLyrics = false
+                self.currentLyrics = cached.plain
+                self.syncedLyrics = cached.synced
+            }
+            return
+        }
+        // Same track already being fetched (or just attempted) — don't restart the loader.
+        if key == lastLyricsKey { return }
+        lastLyricsKey = key
+
         // Prefer native Apple Music lyrics when available
         if let bundleIdentifier = bundleIdentifier, bundleIdentifier.contains("com.apple.Music") {
             Task { @MainActor in
@@ -403,16 +422,6 @@ class MusicManager: ObservableObject {
                 await self.fetchLyricsFromWeb(title: title, artist: artist)
             }
         } else {
-            // Serve a previously fetched result from cache instead of re-hitting the network —
-            // this is what stops a spurious/flaky re-fetch from wiping good lyrics.
-            if let cached = lyricsCache[lyricsKey(title, artist)] {
-                Task { @MainActor in
-                    self.isFetchingLyrics = false
-                    self.currentLyrics = cached.plain
-                    self.syncedLyrics = cached.synced
-                }
-                return
-            }
             Task { @MainActor in
                 self.isFetchingLyrics = true
                 self.currentLyrics = ""
@@ -445,19 +454,25 @@ class MusicManager: ObservableObject {
             return
         }
 
-        // Retry transient failures (network error / non-200) a few times so a momentary blip
-        // doesn't wipe good lyrics. A valid "no results" response is authoritative (not retried).
-        for attempt in 0..<3 {
+        // Bounded, timed request: a short per-request timeout keeps "Loading lyrics…" from
+        // hanging on a slow/VPN network (URLSession defaults to 60s). One retry covers a
+        // momentary blip; a valid "no results" response is authoritative (not retried).
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10)
+        request.setValue("boring.notch (github.com/L3xu5/boring.notch)", forHTTPHeaderField: "User-Agent")
+        for attempt in 0..<2 {
             do {
-                let (data, response) = try await URLSession.shared.data(from: url)
+                let (data, response) = try await URLSession.shared.data(for: request)
                 guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
                     throw URLError(.badServerResponse)
                 }
                 let jsonArray = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]
                 guard let first = jsonArray?.first else {
+                    // Authoritative "no lyrics for this track": cache the negative result so a
+                    // re-fetch doesn't spin the loader again.
                     self.currentLyrics = ""
                     self.syncedLyrics = []
                     self.isFetchingLyrics = false
+                    self.lyricsCache[lyricsKey(title, artist)] = (plain: "", synced: [])
                     return
                 }
                 let plain = (first["plainLyrics"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -472,13 +487,15 @@ class MusicManager: ObservableObject {
                 }
                 return
             } catch {
-                if attempt < 2 {
-                    try? await Task.sleep(for: .milliseconds(500))
+                if attempt < 1 {
+                    try? await Task.sleep(for: .milliseconds(400))
                 }
             }
         }
-        // All attempts errored: stop the spinner but don't assert "No lyrics found" — leave
-        // whatever is already shown (nothing on a fresh track; cached lyrics never reach here).
+        // All attempts errored/timed out: stop the spinner (show "No lyrics found" rather than
+        // an endless spinner). Cached tracks never reach here, so good lyrics aren't wiped.
+        self.currentLyrics = ""
+        self.syncedLyrics = []
         self.isFetchingLyrics = false
     }
 
