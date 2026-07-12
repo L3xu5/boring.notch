@@ -85,6 +85,23 @@ class MusicManager: ObservableObject {
             }
             .store(in: &cancellables)
 
+        // React to the lyrics toggle live: fetch for the current track when enabled, clear when off.
+        Defaults.publisher(.enableLyrics)
+            .sink { [weak self] change in
+                Task { @MainActor in
+                    guard let self else { return }
+                    if change.newValue {
+                        self.lastLyricsKey = ""
+                        self.fetchLyricsIfAvailable(bundleIdentifier: self.bundleIdentifier, title: self.songTitle, artist: self.artistName, album: self.album, duration: self.songDuration)
+                    } else {
+                        self.isFetchingLyrics = false
+                        self.currentLyrics = ""
+                        self.syncedLyrics = []
+                    }
+                }
+            }
+            .store(in: &cancellables)
+
         // Initialize deprecation check asynchronously
         Task { @MainActor in
             do {
@@ -458,7 +475,13 @@ class MusicManager: ObservableObject {
             self.currentLyrics = ""
             self.syncedLyrics = []
             self.isFetchingLyrics = false
-            if cache { self.lyricsCache[key] = (plain: "", synced: []) }
+            if cache {
+                self.lyricsCache[key] = (plain: "", synced: [])
+            } else {
+                // Retryable (network) failure — clear the dedup key so the next content change for
+                // this same track can try again instead of being suppressed forever.
+                lastLyricsKey = ""
+            }
         }
 
         // 1) Exact-recording match via /get (matches by duration → correct timing). Accept it only
@@ -583,6 +606,8 @@ class MusicManager: ObservableObject {
 
     func lyricLine(at elapsed: Double) -> String {
         guard !syncedLyrics.isEmpty else { return currentLyrics }
+        // During the intro (before the first line's timestamp) show nothing, not the first line.
+        if elapsed < syncedLyrics[0].time { return "" }
         // Binary search for last line with time <= elapsed
         var low = 0
         var high = syncedLyrics.count - 1

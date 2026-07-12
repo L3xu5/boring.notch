@@ -61,6 +61,7 @@ jobs:
           APP="build/Build/Products/Release/boringNotch.app"
           KEYCHAIN="$RUNNER_TEMP/sign.keychain-db"
           KCPW="$(openssl rand -hex 12)"
+          trap 'rm -f "$RUNNER_TEMP/cert.p12"' EXIT   # ensure the key material is removed even on failure
           echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           security create-keychain -p "$KCPW" "$KEYCHAIN"
           security set-keychain-settings -lut 21600 "$KEYCHAIN"
@@ -85,6 +86,7 @@ jobs:
         run: |
           set -euo pipefail
           SIGN="$(find build/SourcePackages/artifacts -name sign_update -type f -not -path '*old_dsa*' | head -1)"
+          trap 'rm -f sparkle_key' EXIT   # ensure the private key is removed even on failure
           printf '%s' "$SPARKLE_PRIVATE_KEY" > sparkle_key
           SIGINFO="$("$SIGN" boringNotch.zip -f sparkle_key | grep -oE 'sparkle:edSignature="[^"]+" length="[0-9]+"')"
           rm -f sparkle_key
@@ -123,8 +125,10 @@ jobs:
           \`\`\`bash
           brew install --cask l3xu5/boring-notch/boring-notch-yandex
           \`\`\`"
-          gh release delete latest --cleanup-tag --yes 2>/dev/null || true
-          gh release create latest boringNotch.zip appcast.xml \
-            --title "Latest build" \
-            --notes "$notes" \
-            --target "$GITHUB_SHA"
+          # Update in place (no delete) so the appcast/enclosure never 404s mid-publish.
+          if gh release view latest >/dev/null 2>&1; then
+            gh release edit latest --title "Latest build" --notes "$notes" >/dev/null
+          else
+            gh release create latest --title "Latest build" --notes "$notes" --target "$GITHUB_SHA"
+          fi
+          gh release upload latest boringNotch.zip appcast.xml --clobber

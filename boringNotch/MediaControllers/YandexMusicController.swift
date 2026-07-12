@@ -130,13 +130,17 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         }
         streamTask?.cancel()
 
-        if let pipeHandler = self.pipeHandler {
-            Task { await pipeHandler.close() }
-        }
-
-        if let process = self.process, process.isRunning {
-            process.terminate()
-            process.waitUntilExit()
+        // Tear the adapter subprocess/pipe down OFF the calling thread — waitUntilExit() would
+        // otherwise block whatever thread deallocs the controller (e.g. the main thread during a
+        // media-source switch).
+        let process = self.process
+        let pipeHandler = self.pipeHandler
+        Task.detached {
+            await pipeHandler?.close()
+            if let process, process.isRunning {
+                process.terminate()
+                process.waitUntilExit()
+            }
         }
 
         self.process = nil
@@ -396,18 +400,16 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         }
         newState.lastUpdated = newTimestamp
 
+        // Shuffle/repeat are player-wide settings — carry them forward whenever an update omits
+        // them (Yandex leaves them out of pause/seek/redump snapshots), never reset to off.
         if let shuffleMode = payload.shuffleMode {
             newState.isShuffled = shuffleMode != 1
-        } else if !diff {
-            newState.isShuffled = false
         } else {
             newState.isShuffled = playbackState.isShuffled
         }
 
         if let repeatModeValue = payload.repeatMode {
             newState.repeatMode = RepeatMode(rawValue: repeatModeValue) ?? .off
-        } else if !diff {
-            newState.repeatMode = .off
         } else {
             newState.repeatMode = playbackState.repeatMode
         }
@@ -436,20 +438,26 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         let trackChanged = newState.title != playbackState.title
             || newState.artist != playbackState.artist
             || newState.album != playbackState.album
-        if trackChanged {
-            newState.isFavorite = readLikeState() ?? false
-        } else {
-            newState.isFavorite = playbackState.isFavorite
-        }
+        // Carry the like state forward here. Reading it inline would do a synchronous Accessibility
+        // tree walk on the main actor on every track change (a visible UI stall); the bounded poll
+        // below reconciles it from the (lazily-built) control off the hot path instead.
+        newState.isFavorite = playbackState.isFavorite
 
         self.playbackState = newState
 
         if trackChanged {
-            // Chromium rebuilds the like control lazily, so the up-front read may lag the new
-            // track. Re-read shortly after to correct it (a no-op if already right).
+            // Chromium rebuilds the like control lazily; poll briefly until we get a stable read
+            // for THIS track (bail if the track changes again mid-poll).
+            let trackTitle = newState.title
             Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .milliseconds(400))
-                self?.refreshFavoriteState()
+                for _ in 0..<6 {
+                    try? await Task.sleep(for: .milliseconds(350))
+                    guard let self, self.playbackState.title == trackTitle else { return }
+                    if let liked = self.readLikeState() {
+                        if liked != self.playbackState.isFavorite { self.playbackState.isFavorite = liked }
+                        return
+                    }
+                }
             }
         }
     }
