@@ -56,6 +56,11 @@ class MusicManager: ObservableObject {
 
     private var artworkData: Data? = nil
 
+    // Cache of successfully fetched lyrics, keyed by track. Serving a re-fetch (e.g. triggered
+    // by artwork arriving late, or a pause/seek update) from here prevents a flaky LRCLIB
+    // response from wiping good lyrics to "No lyrics found".
+    private var lyricsCache: [String: (plain: String, synced: [(time: Double, text: String)])] = [:]
+
     // Store last values at the time artwork was changed
     private var lastArtworkTitle: String = "I'm Handsome"
     private var lastArtworkArtist: String = "Me"
@@ -398,6 +403,16 @@ class MusicManager: ObservableObject {
                 await self.fetchLyricsFromWeb(title: title, artist: artist)
             }
         } else {
+            // Serve a previously fetched result from cache instead of re-hitting the network —
+            // this is what stops a spurious/flaky re-fetch from wiping good lyrics.
+            if let cached = lyricsCache[lyricsKey(title, artist)] {
+                Task { @MainActor in
+                    self.isFetchingLyrics = false
+                    self.currentLyrics = cached.plain
+                    self.syncedLyrics = cached.synced
+                }
+                return
+            }
             Task { @MainActor in
                 self.isFetchingLyrics = true
                 self.currentLyrics = ""
@@ -412,54 +427,59 @@ class MusicManager: ObservableObject {
             .replacingOccurrences(of: "\u{FFFD}", with: "")
     }
 
+    private func lyricsKey(_ title: String, _ artist: String) -> String {
+        (normalizedQuery(title) + "|" + normalizedQuery(artist)).lowercased()
+    }
+
     @MainActor
     private func fetchLyricsFromWeb(title: String, artist: String) async {
         let cleanTitle = normalizedQuery(title)
         let cleanArtist = normalizedQuery(artist)
         guard let encodedTitle = cleanTitle.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-              let encodedArtist = cleanArtist.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else {
+              let encodedArtist = cleanArtist.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              // LRCLIB simple search (no auth).
+              let url = URL(string: "https://lrclib.net/api/search?track_name=\(encodedTitle)&artist_name=\(encodedArtist)") else {
             self.currentLyrics = ""
+            self.syncedLyrics = []
             self.isFetchingLyrics = false
             return
         }
 
-        // LRCLIB simple search (no auth): https://lrclib.net/api/search?track_name=...&artist_name=...
-        let urlString = "https://lrclib.net/api/search?track_name=\(encodedTitle)&artist_name=\(encodedArtist)"
-        guard let url = URL(string: urlString) else {
-            self.currentLyrics = ""
-            self.isFetchingLyrics = false
-            return
-        }
-        do {
-            let (data, response) = try await URLSession.shared.data(from: url)
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-                self.currentLyrics = ""
-                self.isFetchingLyrics = false
-                return
-            }
-            if let jsonArray = try JSONSerialization.jsonObject(with: data) as? [[String: Any]],
-               let first = jsonArray.first {
-                // Prefer plain lyrics (syncedLyrics may also be present)
-                let plain = (first["plainLyrics"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                let synced = (first["syncedLyrics"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                let resolved = plain.isEmpty ? synced : plain
-                self.currentLyrics = resolved
-                self.isFetchingLyrics = false
-                if !synced.isEmpty {
-                    self.syncedLyrics = self.parseLRC(synced)
-                } else {
-                    self.syncedLyrics = []
+        // Retry transient failures (network error / non-200) a few times so a momentary blip
+        // doesn't wipe good lyrics. A valid "no results" response is authoritative (not retried).
+        for attempt in 0..<3 {
+            do {
+                let (data, response) = try await URLSession.shared.data(from: url)
+                guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                    throw URLError(.badServerResponse)
                 }
-            } else {
-                self.currentLyrics = ""
+                let jsonArray = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]
+                guard let first = jsonArray?.first else {
+                    self.currentLyrics = ""
+                    self.syncedLyrics = []
+                    self.isFetchingLyrics = false
+                    return
+                }
+                let plain = (first["plainLyrics"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let syncedRaw = (first["syncedLyrics"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let synced = syncedRaw.isEmpty ? [] : self.parseLRC(syncedRaw)
+                let resolved = plain.isEmpty ? syncedRaw : plain
+                self.currentLyrics = resolved
+                self.syncedLyrics = synced
                 self.isFetchingLyrics = false
-                self.syncedLyrics = []
+                if !resolved.isEmpty || !synced.isEmpty {
+                    self.lyricsCache[lyricsKey(title, artist)] = (plain: resolved, synced: synced)
+                }
+                return
+            } catch {
+                if attempt < 2 {
+                    try? await Task.sleep(for: .milliseconds(500))
+                }
             }
-        } catch {
-            self.currentLyrics = ""
-            self.isFetchingLyrics = false
-            self.syncedLyrics = []
         }
+        // All attempts errored: stop the spinner but don't assert "No lyrics found" — leave
+        // whatever is already shown (nothing on a fresh track; cached lyrics never reach here).
+        self.isFetchingLyrics = false
     }
 
     // MARK: - Synced lyrics helpers
