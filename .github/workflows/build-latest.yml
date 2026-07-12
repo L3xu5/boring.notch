@@ -51,6 +51,31 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
             build
 
+      - name: Codesign with stable self-signed identity
+        env:
+          CERT_P12: ${{ secrets.SIGNING_CERT_P12 }}
+          CERT_PW: ${{ secrets.SIGNING_CERT_PASSWORD }}
+          IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          APP="build/Build/Products/Release/boringNotch.app"
+          KEYCHAIN="$RUNNER_TEMP/sign.keychain-db"
+          KCPW="$(openssl rand -hex 12)"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KCPW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KCPW" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PW" -T /usr/bin/codesign -A
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCPW" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          # Sign WITHOUT the App Sandbox entitlement (like the working unsigned build) so the
+          # Accessibility control of Yandex Music keeps working. The stable certificate gives a
+          # stable designated requirement, so the TCC (Accessibility) grant survives updates.
+          codesign --force --deep --timestamp=none -s "$IDENTITY" --keychain "$KEYCHAIN" "$APP"
+          codesign --verify --deep --strict "$APP"
+          echo "Designated requirement:"; codesign -d -r- "$APP" 2>&1 | grep -i "designated =>" || true
+
       - name: Package app
         run: ditto -c -k --keepParent "build/Build/Products/Release/boringNotch.app" boringNotch.zip
 
