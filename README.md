@@ -1,191 +1,86 @@
 <h1 align="center">
   <br>
-  <a href="http://theboring.name"><img src="https://framerusercontent.com/images/RFK4vs0kn8pRMuOO58JeyoemXA.png?scale-down-to=256" alt="Boring Notch" width="150"></a>
-  <br>
-  Boring Notch
+  🎵 Boring Notch — <span>Yandex Music Edition</span>
   <br>
 </h1>
 
-
 <p align="center">
-  <a title="Crowdin" target="_blank" href="https://crowdin.com/project/boring-notch"><img src="https://badges.crowdin.net/boring-notch/localized.svg"></a>
-  <img src="https://github.com/TheBoredTeam/boring.notch/actions/workflows/cicd.yml/badge.svg" alt="TheBoringNotch Build & Test" style="margin-right: 10px;" />
-  <a href="https://discord.gg/c8JXA7qrPm">
-    <img src="https://dcbadge.limes.pink/api/server/https://discord.gg/c8JXA7qrPm?style=flat" alt="Discord Badge" />
-  </a>
-  <a href="https://www.ko-fi.com/alexander5015">
-    <img src="https://srv-cdn.himpfen.io/badges/kofi/kofi-flat.svg" alt="Ko-Fi" />
-  </a>
+  <b>A fork of <a href="https://github.com/TheBoredTeam/boring.notch">boring.notch</a> that turns your MacBook notch into a music control center — now with first-class <b>Yandex Music</b> support.</b>
 </p>
 
-<!--Welcome to **Boring.Notch**, the coolest way to make your MacBook's notch the star of the show! Forget about those boring status bars—our notch turns into a dynamic music control center, complete with a snazzy visualizer and all the music controls you need. It's like having a mini concert right at the top of your screen! -->
-
-Say hello to **Boring Notch**, the coolest way to make your MacBook’s notch the star of the show! Say goodbye to boring status bars: with Boring Notch, your notch transforms into a dynamic music control center, complete with a vibrant visualizer and all the essential music controls you need. But that’s just the start! Boring Notch also offers calendar integration, a handy file shelf with AirDrop support, a complete MacOS HUD replacement and more!
+<p align="center">
+  <img src="https://img.shields.io/badge/platform-macOS%2014%2B-black" alt="macOS 14+">
+  <img src="https://img.shields.io/badge/license-GPLv3-blue" alt="GPLv3">
+  <img src="https://img.shields.io/badge/Yandex%20Music-native-yellow" alt="Yandex Music">
+</p>
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/2d5f69c1-6e7b-4bc2-a6f1-bb9e27cf88a8" alt="Demo GIF" />
 </p>
 
-<!--https://github.com/user-attachments/assets/19b87973-4b3a-4853-b532-7e82d1d6b040-->
----
-<!--## Table of Contents
-- [Installation](#installation)
-- [Usage](#usage)
-- [Roadmap](#-roadmap)
-- [Building from Source](#building-from-source)
-- [Contributing](#-contributing)
-- [Join our Discord Server](#join-our-discord-server)
-- [Star History](#star-history)
-- [Buy us a coffee!](#buy-us-a-coffee)
-- [Acknowledgments](#-acknowledgments)-->
-
-## Installation
-
-**System Requirements:**
-- macOS **14 Sonoma** or later
-- Apple Silicon or Intel Mac
-
 ---
 
-### Option 1: Download and Install Manually
+## ✨ What this fork adds
 
-<a href="https://github.com/TheBoredTeam/boring.notch/releases/latest/download/boringNotch.dmg" target="_self"><img width="200" src="https://github.com/user-attachments/assets/e3179be1-8416-4b8a-b417-743e1ecc67d6" alt="Download for macOS" /></a>
+The upstream app already controls Apple Music, Spotify, YouTube Music and the generic "Now Playing" source. **This fork adds the official Yandex Music desktop app as a native media source** — pick it in onboarding or **Settings → Media Source**.
 
-Once downloaded, open the `.dmg` and move **Boring Notch** to your `/Applications` folder.
+| Capability | Status |
+| --- | :---: |
+| 🎼 Now playing — title / artist / album | ✅ |
+| 🖼️ Album artwork | ✅ |
+| ⏱️ Progress bar & synced lyrics | ✅ |
+| ⏯️ Play / Pause / Next / Previous | ✅ |
+| ❤️ Like (*«Мне нравится»*) | ✅ *best-effort* |
+| 🔀 Shuffle · 🔁 Repeat | ✅ |
 
-> [!IMPORTANT]
-> We don't have an Apple Developer account (yet 👀), so macOS will warn you that Boring Notch is from an unidentified developer on first launch. This is expected behavior.
->
-> You'll need to bypass this before the app will open. You only need to do this once. Use one of the methods below.
+Works with the **official Yandex Music app** (`ru.yandex.desktop.music`) — nothing extra to install, no modified client, no login inside the notch.
 
----
+## 🔧 How it works
 
-#### Recommended: Terminal (Always Works)
+Yandex Music is an Electron app with **no AppleScript dictionary**, so the scripting approach used for Spotify / Apple Music isn't available. The integration uses **two channels**:
 
-This is the quickest and easiest method. It only requires a single command and works consistently for all users. System Settings can sometimes fail and won't work for non-admin users.
+1. **Reading "now playing" — via MediaRemote.**
+   Chromium publishes the track's metadata, artwork and position to the macOS *Now Playing* session. We read that stream (through the bundled [`mediaremote-adapter`](https://github.com/ungive/mediaremote-adapter)) filtered to Yandex's bundle id. Diff updates arrive without an owner id, so the session owner is tracked from full snapshots and diffs are applied to it.
 
-After moving Boring Notch to your Applications folder, run:
+2. **Controlling playback & likes — via the Accessibility API.**
+   Transport commands **press Yandex's own on-screen buttons** instead of sending MediaRemote commands, so they always target Yandex — even when a browser tab currently owns the system media session. The controls are located on the persistent bottom player bar (anchored via the unique *Next / Previous song* buttons), and Chromium's web accessibility tree is enabled with `AXManualAccessibility`. *Like* is the bar's `Like` checkbox; its state is read from `AXValue`.
 
-```bash
-xattr -dr com.apple.quarantine /Applications/boringNotch.app
-```
+The whole integration lives in one file: [`YandexMusicController.swift`](boringNotch/MediaControllers/YandexMusicController.swift).
 
-Then open the app normally.
+## 🚀 Install
 
----
-
-#### Alternative: System Settings
-
-> [!NOTE]
-> This method doesn't work for all users. If this doesn't work, use the Terminal method above.
-
-1. Try to open the app — you'll see a security warning.
-2. Click **OK** to dismiss it.
-3. Open **System Settings** > **Privacy & Security**.
-4. Scroll to the bottom and click **Open Anyway** next to the Boring Notch warning.
-5. Confirm if prompted.
-
----
-
-### Option 2: Install via Homebrew
-
-You can also install using [Homebrew](https://brew.sh). The Homebrew installation automatically bypasses the macOS security warning described above.
-
-```bash
-brew install --cask TheBoredTeam/boring-notch/boring-notch
-```
-
-## Usage
-
-- Launch the app, and voilà—your notch is now the coolest part of your screen.
-- Hover over the notch to see it expand and reveal all its secrets.
-- Use the controls to manage your music like a rockstar.
-- Click the star in your menu bar to customize your notch to your heart's content.
-
-## 📋 Roadmap
-- [x] Playback live activity 🎧
-- [x] Calendar integration 📆
-- [x] Reminders integration ☑️
-- [x] Mirror 📷
-- [x] Charging indicator and current percentage 🔋
-- [x] Customizable gesture control 👆🏻
-- [x] Shelf functionality with AirDrop 📚
-- [x] Notch sizing customization, finetuning on different display sizes 🖥️
-- [x] System HUD replacements (volume, brightness, backlight) 🎚️💡⌨️
-- [ ] Bluetooth Live Activity (connect/disconnect for bluetooth devices) 
-- [ ] Weather integration ⛅️
-- [ ] Customizable Layout options 🛠️
-- [ ] Lock Screen Widgets 🔒
-- [ ] Extension system 🧩
-- [ ] Notifications (under consideration) 🔔
-<!-- - [ ] Clipboard history manager 📌 `Extension` -->
-<!-- - [ ] Download indicator of different browsers (Safari, Chromium browsers, Firefox) 🌍 `Extension`-->
-<!-- - [ ] Customizable function buttons 🎛️ -->
-<!-- - [ ] App switcher 🪄 -->
-
-<!-- ## 🧩 Extensions
-> [!NOTE]
-> We’re hard at work on some awesome extensions! Stay tuned, and we’ll keep you updated as soon as they’re released. -->
-
-## Building from Source
-
-### Prerequisites
-
-- **macOS 15.6 or later**
-- **Xcode 26 or later**
-
-### Installation
-
-1. **Clone the Repository**:
+1. Download **`boringNotch.zip`** from the [latest release](../../releases/latest) and unzip it.
+2. Move **boringNotch.app** to `/Applications`.
+3. This build is **unsigned**, so clear the quarantine flag once:
    ```bash
-   git clone https://github.com/TheBoredTeam/boring.notch.git
-   cd boring.notch
+   xattr -dr com.apple.quarantine /Applications/boringNotch.app
    ```
+4. Launch it.
 
-2. **Open the Project in Xcode**:
-   ```bash
-   open boringNotch.xcodeproj
-   ```
+## ▶️ Enable Yandex Music
 
-3. **Build and Run**:
-    - Click the "Run" button or press `Cmd + R`. Watch the magic unfold!
+1. In the notch settings (menu-bar star → **Settings → Media Source**) choose **Yandex Music**.
+2. Grant **Accessibility** permission — **System Settings → Privacy & Security → Accessibility** → enable **boringNotch**.
+   *Required for transport and likes. Metadata & artwork work without it.*
+3. Play something in the Yandex Music app 🎧
 
-## 🤝 Contributing
+## ⚠️ Known limitation
 
-We’re all about good vibes and awesome contributions! Read [CONTRIBUTING.md](CONTRIBUTING.md) to learn how you can join the fun!
+macOS exposes a **single** system *Now Playing* session. If another app (e.g. a video in Safari) is actively playing and owns that session, Yandex's live position can't be read from the system, so synced lyrics may drift. Yandex Music also doesn't expose a playback slider through Accessibility, so there's no fallback. **For accurate lyrics, keep Yandex Music as the active media session.**
 
-## Join our Discord Server
+## 🛠️ Building from source
 
-<a href="https://discord.gg/GvYcYpAKTu" target="_blank"><img src="https://iili.io/28m3GHv.png" alt="Join The Boring Server!" style="height: 60px !important;width: 217px !important;" ></a>
+- **macOS 15.6+** and **Xcode 26+**
+- Clone, then:
+  ```bash
+  open boringNotch.xcodeproj
+  ```
+  Select the **boringNotch** scheme and press **⌘R**.
 
-## Star History
+## 🙏 Credits & License
 
-<a href="https://www.star-history.com/#TheBoredTeam/boring.notch&Timeline">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=TheBoredTeam/boring.notch&type=Timeline&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=TheBoredTeam/boring.notch&type=Timeline" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=TheBoredTeam/boring.notch&type=Timeline" />
- </picture>
-</a>
+This is a fork of **[boring.notch](https://github.com/TheBoredTeam/boring.notch)** by [The Bored Team](https://github.com/TheBoredTeam) — all credit for the app itself goes to them. See the upstream README for the full feature set (calendar, shelf/AirDrop, HUD replacement, and more).
 
-## Support us on Ko-fi!
-<!-- <a href="https://www.buymeacoffee.com/jfxh67wvfxq" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-red.png" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;" ></a> -->
-<a href="https://www.ko-fi.com/alexander5015" target="_blank"><img src="https://github.com/user-attachments/assets//a76175ef-7e93-475a-8b67-4922ba5964c2" alt="Support us on Ko-fi" style="height: 70px !important;width: 346px !important;" ></a>
+Licensed under **GNU GPLv3** (see [LICENSE](LICENSE)); this fork keeps the same license. Third-party attributions are in [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES).
 
-## 🎉 Acknowledgments
-
-We would like to express our gratitude to the authors and maintainers of the open-source projects that made this possible. 
-
-## Notable Projects
-- **[MediaRemoteAdapter](https://github.com/ungive/mediaremote-adapter)** –  An open-source project that allowed us to use the Now Playing source in macOS 15.4+
-- **[NotchDrop](https://github.com/Lakr233/NotchDrop)** – An open-source project that has been instrumental in developing the first version of the "Shelf" feature in Boring Notch.
-
-For a full list of licenses and attributions, please see the [Third-Party Licenses](./THIRD_PARTY_LICENSES.md) file.
-
-### Icon credits: [@maxtron95](https://github.com/maxtron95)
-### Website credits: [@himanshhhhuv](https://github.com/himanshhhhuv)
-
-- **SwiftUI**: For making us look like coding wizards.
-- **You**: For being awesome and checking out **boring.notch**!
-
-
+> The Yandex Music integration was added on top of The Bored Team's excellent work.
