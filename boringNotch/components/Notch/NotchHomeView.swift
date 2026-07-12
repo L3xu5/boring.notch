@@ -266,6 +266,8 @@ struct MusicControlsView: View {
             VolumeControlView()
         case .favorite:
             FavoriteControlButton()
+        case .dislike:
+            DislikeControlButton()
         case .goBackward:
             HoverButton(icon: "gobackward.15", scale: .medium) {
                 MusicManager.shared.skip(seconds: -15)
@@ -317,6 +319,18 @@ struct FavoriteControlButton: View {
 
     private var iconColor: Color {
         musicManager.isFavoriteTrack ? .red : .primary
+    }
+}
+
+struct DislikeControlButton: View {
+    @ObservedObject var musicManager = MusicManager.shared
+
+    var body: some View {
+        HoverButton(icon: "hand.thumbsdown", scale: .medium) {
+            MusicManager.shared.dislikeCurrentTrack()
+        }
+        .disabled(!musicManager.canDislikeTrack)
+        .opacity(musicManager.canDislikeTrack ? 1 : 0.35)
     }
 }
 

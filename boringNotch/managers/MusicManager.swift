@@ -52,6 +52,7 @@ class MusicManager: ObservableObject {
     @Published var isFetchingLyrics: Bool = false
     @Published var syncedLyrics: [(time: Double, text: String)] = []
     @Published var canFavoriteTrack: Bool = false
+    @Published var canDislikeTrack: Bool = false
     @Published var isFavoriteTrack: Bool = false
 
     private var artworkData: Data? = nil
@@ -212,6 +213,7 @@ class MusicManager: ObservableObject {
         activeController = controller
         
         self.canFavoriteTrack = controller.supportsFavorite
+        self.canDislikeTrack = controller.supportsDislike
 
         // Get current state from active controller
         forceUpdate()
@@ -270,9 +272,6 @@ class MusicManager: ObservableObject {
             if !state.title.isEmpty && !state.artist.isEmpty && state.isPlaying {
                 self.updateSneakPeek()
             }
-
-            // Fetch lyrics on content change
-            self.fetchLyricsIfAvailable(bundleIdentifier: state.bundleIdentifier, title: state.title, artist: state.artist, album: state.album, duration: state.duration)
         }
 
         let timeChanged = state.currentTime != self.elapsedTime
@@ -326,8 +325,14 @@ class MusicManager: ObservableObject {
         if volumeChanged {
             self.volume = state.volume
         }
-        
+
         self.timestampDate = state.lastUpdated
+
+        // (Re)fetch lyrics for the current (title, artist, duration). Running this every update is
+        // cheap — the per-key dedup returns immediately when nothing relevant changed — and it
+        // guarantees a re-fetch once the duration becomes known, so /get can match the exact
+        // recording instead of a wrong-length /search result getting locked into the cache.
+        self.fetchLyricsIfAvailable(bundleIdentifier: state.bundleIdentifier, title: state.title, artist: state.artist, album: state.album, duration: state.duration)
     }
 
     func toggleFavoriteTrack() {
@@ -376,7 +381,10 @@ class MusicManager: ObservableObject {
 
     /// Placeholder dislike function
     func dislikeCurrentTrack() {
-        setFavorite(false)
+        guard canDislikeTrack, let controller = activeController else { return }
+        Task { @MainActor in
+            await controller.dislike()
+        }
     }
 
     // MARK: - Lyrics
@@ -389,11 +397,15 @@ class MusicManager: ObservableObject {
             return
         }
 
-        let key = lyricsKey(title, artist)
-        // Serve a resolved result (positive or negative) from cache — a re-fetch triggered by
-        // late artwork or any same-track content change never re-hits the network or re-spins.
+        let key = lyricsKey(title, artist, duration)
+        // Fast path: nothing relevant changed (called on every update) — already fetched/serving
+        // this exact track+duration, so do nothing.
+        if key == lastLyricsKey { return }
+        lastLyricsKey = key
+
+        // Serve a resolved result (positive or negative) from cache instead of re-hitting the
+        // network (also survives relaunch via the on-disk cache).
         if let cached = lyricsCache[key] {
-            lastLyricsKey = key
             DispatchQueue.main.async {
                 self.isFetchingLyrics = false
                 self.currentLyrics = cached.plain
@@ -401,9 +413,6 @@ class MusicManager: ObservableObject {
             }
             return
         }
-        // Same track already being fetched (or just attempted) — don't restart the loader.
-        if key == lastLyricsKey { return }
-        lastLyricsKey = key
 
         // Prefer native Apple Music lyrics when available
         if let bundleIdentifier = bundleIdentifier, bundleIdentifier.contains("com.apple.Music") {
@@ -465,8 +474,10 @@ class MusicManager: ObservableObject {
             .replacingOccurrences(of: "\u{FFFD}", with: "")
     }
 
-    private func lyricsKey(_ title: String, _ artist: String) -> String {
-        (normalizedQuery(title) + "|" + normalizedQuery(artist)).lowercased()
+    private func lyricsKey(_ title: String, _ artist: String, _ duration: Double = 0) -> String {
+        // Duration is part of the key so a fetch that ran before the duration was known (and thus
+        // fell back to a wrong-length /search result) doesn't shadow the accurate /get result.
+        (normalizedQuery(title) + "|" + normalizedQuery(artist) + "|" + String(Int(duration.rounded()))).lowercased()
     }
 
     private func loadLyricsCache() {
@@ -493,7 +504,7 @@ class MusicManager: ObservableObject {
 
     @MainActor
     private func fetchLyricsFromWeb(title: String, artist: String, album: String = "", duration: Double = 0) async {
-        let key = lyricsKey(title, artist)
+        let key = lyricsKey(title, artist, duration)
 
         // Only apply results if this is still the current track — a fetch started for an earlier
         // (or transient startup) track must not overwrite the one now playing.

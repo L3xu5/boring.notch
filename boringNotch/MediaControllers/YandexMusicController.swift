@@ -47,6 +47,9 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     // Best-effort via Accessibility (see setFavorite / refreshFavoriteState).
     var supportsFavorite: Bool { true }
 
+    // Yandex has a real "I don't like it" control that trains My Wave (pressed via Accessibility).
+    var supportsDislike: Bool { true }
+
     // MARK: - MediaRemote function pointers
     private let mediaRemoteBundle: CFBundle
     private let MRMediaRemoteSendCommandFunction: @convention(c) (Int, AnyObject?) -> Void
@@ -305,6 +308,15 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         if liked != playbackState.isFavorite {
             playbackState.isFavorite = liked
         }
+    }
+
+    // MARK: - Dislike (best-effort via Accessibility)
+    @MainActor
+    func dislike() async {
+        pressDislikeButton()
+        // Dislike un-likes and skips; reconcile the heart shortly after.
+        try? await Task.sleep(for: .milliseconds(200))
+        refreshFavoriteState()
     }
 
     // MARK: - Adapter stream setup
@@ -575,6 +587,32 @@ extension YandexMusicController {
             in: cluster, depth: 0, visited: &visited, maxDepth: 25, maxVisited: 2000,
             where: { self.isLikeButton($0) }
         )
+    }
+
+    @MainActor
+    func pressDislikeButton() {
+        guard AXIsProcessTrusted() else {
+            NSLog("[YandexMusic] Accessibility permission not granted; cannot dislike.")
+            return
+        }
+        guard let cluster = transportCluster() else { return }
+        var visited = 0
+        guard let button = firstDescendant(
+            in: cluster, depth: 0, visited: &visited, maxDepth: 25, maxVisited: 2000,
+            where: { self.isDislikeButton($0) }
+        ) else {
+            NSLog("[YandexMusic] Dislike button not found in accessibility tree.")
+            return
+        }
+        _ = AXUIElementPerformAction(button, kAXPressAction as CFString)
+    }
+
+    @MainActor
+    private func isDislikeButton(_ element: AXUIElement) -> Bool {
+        guard isPressableControl(element) else { return false }
+        let labels = axLabels(element)
+        guard !labels.isEmpty else { return false }
+        return labels.contains { label in Self.dislikeLabelHints.contains(where: label.contains) }
     }
 
     // MARK: Element access & search
