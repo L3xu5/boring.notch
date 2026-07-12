@@ -164,7 +164,9 @@ struct MusicControlsView: View {
                     let line: String = {
                         if musicManager.isFetchingLyrics { return "Loading lyrics…" }
                         if !musicManager.syncedLyrics.isEmpty {
-                            return musicManager.lyricLine(at: currentElapsed)
+                            // Shift the lookup earlier by the user's offset so lines that run
+                            // ahead of the audio (output latency, LRC timing) line up.
+                            return musicManager.lyricLine(at: max(0, currentElapsed - Defaults[.lyricsOffset]))
                         }
                         let trimmed = musicManager.currentLyrics.trimmingCharacters(in: .whitespacesAndNewlines)
                         return trimmed.isEmpty ? "No lyrics found" : trimmed.replacingOccurrences(of: "\n", with: " ")

@@ -600,6 +600,7 @@ struct Media: View {
     @Default(.sneakPeekStyles) var sneakPeekStyles
 
     @Default(.enableLyrics) var enableLyrics
+    @Default(.lyricsOffset) var lyricsOffset
 
     var body: some View {
         Form {
@@ -684,6 +685,19 @@ struct Media: View {
                         Text("Show lyrics below artist name")
                         customBadge(text: "Beta")
                     }
+                }
+                if enableLyrics {
+                    HStack {
+                        Text("Lyrics offset")
+                        Slider(value: $lyricsOffset, in: -2...2, step: 0.05)
+                        Text(String(format: "%+.2fs", lyricsOffset))
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                            .frame(width: 52, alignment: .trailing)
+                    }
+                    Text("Positive delays lyrics (use if they run ahead of the sound); negative shows them earlier.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             } header: {
                 Text("Media controls")
