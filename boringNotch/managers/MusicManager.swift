@@ -64,6 +64,16 @@ class MusicManager: ObservableObject {
     // same-track content changes (e.g. artwork arriving late) so the loader isn't restarted.
     private var lastLyricsKey: String = ""
 
+    // On-disk persistence of the lyrics cache, so lyrics survive relaunches instead of re-hitting
+    // lrclib (slow on some networks) every time.
+    private struct LyricsCacheEntry: Codable {
+        struct Line: Codable { var time: Double; var text: String }
+        var plain: String
+        var synced: [Line]
+    }
+    private static let lyricsCacheURL = temporaryDirectory.appendingPathComponent("boringNotch-lyrics-cache.json")
+    private var lyricsSaveTask: Task<Void, Never>?
+
     // Store last values at the time artwork was changed
     private var lastArtworkTitle: String = "I'm Handsome"
     private var lastArtworkArtist: String = "Me"
@@ -78,6 +88,8 @@ class MusicManager: ObservableObject {
 
     // MARK: - Initialization
     init() {
+        loadLyricsCache()
+
         // Listen for changes to the default controller preference
         NotificationCenter.default.publisher(for: Notification.Name.mediaControllerChanged)
             .sink { [weak self] _ in
@@ -457,6 +469,28 @@ class MusicManager: ObservableObject {
         (normalizedQuery(title) + "|" + normalizedQuery(artist)).lowercased()
     }
 
+    private func loadLyricsCache() {
+        guard let data = try? Data(contentsOf: Self.lyricsCacheURL),
+              let dto = try? JSONDecoder().decode([String: LyricsCacheEntry].self, from: data) else { return }
+        lyricsCache = dto.mapValues { entry in
+            (plain: entry.plain, synced: entry.synced.map { (time: $0.time, text: $0.text) })
+        }
+    }
+
+    /// Debounced write of the lyrics cache to disk (snapshot taken now on the main actor).
+    private func scheduleLyricsCacheSave() {
+        lyricsSaveTask?.cancel()
+        let dto = lyricsCache.mapValues { value in
+            LyricsCacheEntry(plain: value.plain, synced: value.synced.map { .init(time: $0.time, text: $0.text) })
+        }
+        let url = Self.lyricsCacheURL
+        lyricsSaveTask = Task.detached(priority: .utility) {
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled, let data = try? JSONEncoder().encode(dto) else { return }
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
     @MainActor
     private func fetchLyricsFromWeb(title: String, artist: String, album: String = "", duration: Double = 0) async {
         let key = lyricsKey(title, artist)
@@ -469,6 +503,7 @@ class MusicManager: ObservableObject {
             self.syncedLyrics = parsed.synced
             self.isFetchingLyrics = false
             self.lyricsCache[key] = (plain: parsed.plain, synced: parsed.synced)
+            self.scheduleLyricsCacheSave()
         }
         func finishEmpty(cache: Bool) {
             guard key == lastLyricsKey else { return }
@@ -477,6 +512,7 @@ class MusicManager: ObservableObject {
             self.isFetchingLyrics = false
             if cache {
                 self.lyricsCache[key] = (plain: "", synced: [])
+                self.scheduleLyricsCacheSave()
             } else {
                 // Retryable (network) failure — clear the dedup key so the next content change for
                 // this same track can try again instead of being suppressed forever.

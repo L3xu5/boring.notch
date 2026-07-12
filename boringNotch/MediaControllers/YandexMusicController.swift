@@ -74,6 +74,9 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     // Observes Yandex Music quitting so the notch can stop showing it as playing.
     private var terminationObserver: NSObjectProtocol?
 
+    // Watchdog: how many times in a row the adapter subprocess has died, for capped backoff.
+    private var restartAttempts = 0
+
     // MARK: - Initialization
     init?() {
         guard
@@ -328,6 +331,9 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
             try process.run()
             streamTask = Task { [weak self] in
                 await self?.processJSONStream()
+                // The stream ended (subprocess died / pipe closed). If the controller is still
+                // alive (i.e. this wasn't a deinit/source-switch), relaunch it.
+                await self?.streamEnded()
             }
         } catch {
             assertionFailure("Failed to launch mediaremote-adapter.pl: \(error)")
@@ -342,12 +348,34 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         }
     }
 
+    /// Watchdog: restarts the adapter subprocess (with capped exponential backoff) when its
+    /// stream ends unexpectedly, so a crashed perl process doesn't freeze the notch forever.
+    @MainActor
+    private func streamEnded() async {
+        // Tear down the dead process/pipe off the main thread.
+        let oldProcess = process
+        let oldHandler = pipeHandler
+        process = nil
+        pipeHandler = nil
+        Task.detached {
+            await oldHandler?.close()
+            if let oldProcess, oldProcess.isRunning { oldProcess.terminate() }
+        }
+
+        restartAttempts = min(restartAttempts + 1, 6)
+        let delay = min(pow(2.0, Double(restartAttempts)), 30) // 2, 4, 8, 16, 30, 30…s
+        NSLog("[YandexMusic] Adapter stream ended; restarting in \(Int(delay))s.")
+        try? await Task.sleep(for: .seconds(delay))
+        await setupNowPlayingObserver()
+    }
+
     // MARK: - Update handling
     // @MainActor so playbackState/sessionIsYandex are only ever touched on the main actor
     // (the transport methods and refreshFavoriteState are too). The existing
     // `await self?.handleAdapterUpdate(update)` call hops the stream callback onto main.
     @MainActor
     private func handleAdapterUpdate(_ update: NowPlayingUpdate) async {
+        restartAttempts = 0   // receiving data → the stream is healthy; reset watchdog backoff
         let payload = update.payload
         let diff = update.diff ?? false
 
