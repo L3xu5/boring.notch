@@ -71,6 +71,9 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     // tiny subtree search. Only touched on the main actor.
     private var cachedTransportCluster: AXUIElement?
 
+    // Observes Yandex Music quitting so the notch can stop showing it as playing.
+    private var terminationObserver: NSObjectProtocol?
+
     // MARK: - Initialization
     init?() {
         guard
@@ -98,9 +101,33 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
             setRepeatPointer, to: (@convention(c) (Int) -> Void).self)
 
         Task { await setupNowPlayingObserver() }
+
+        // When Yandex Music quits, the adapter stops reporting for it but the last state would
+        // otherwise linger as "playing"; flip it to stopped so the notch goes idle.
+        terminationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self,
+                  (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?
+                    .bundleIdentifier == Self.bundleID else { return }
+            Task { @MainActor [weak self] in self?.handleYandexTerminated() }
+        }
+    }
+
+    @MainActor
+    private func handleYandexTerminated() {
+        sessionIsYandex = false
+        cachedTransportCluster = nil
+        var stopped = playbackState
+        stopped.isPlaying = false
+        stopped.playbackRate = 0
+        playbackState = stopped
     }
 
     deinit {
+        if let terminationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(terminationObserver)
+        }
         streamTask?.cancel()
 
         if let pipeHandler = self.pipeHandler {

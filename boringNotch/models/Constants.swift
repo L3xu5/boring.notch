@@ -130,9 +130,9 @@ extension Defaults.Keys {
     static let waitInterval = Key<Double>("waitInterval", default: 3)
     static let showShuffleAndRepeat = Key<Bool>("showShuffleAndRepeat", default: false)
     static let enableLyrics = Key<Bool>("enableLyrics", default: false)
-    // Seconds to shift synced lyrics. Positive = lyrics appear later (compensates for audio
-    // output latency / lyrics running ahead of the sound); negative = earlier.
-    static let lyricsOffset = Key<Double>("lyricsOffset", default: 0.3)
+    // Optional manual fine-tune for synced-lyrics timing (default 0 — the fetcher matches the
+    // recording by duration, so no offset should normally be needed). Positive = later.
+    static let lyricsOffset = Key<Double>("lyricsOffset", default: 0.0)
     static let musicControlSlots = Key<[MusicControlButton]>(
         "musicControlSlots",
         default: MusicControlButton.defaultLayout
