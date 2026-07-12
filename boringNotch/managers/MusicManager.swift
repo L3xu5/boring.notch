@@ -444,30 +444,40 @@ class MusicManager: ObservableObject {
     private func fetchLyricsFromWeb(title: String, artist: String, album: String = "", duration: Double = 0) async {
         let key = lyricsKey(title, artist)
 
+        // Only apply results if this is still the current track — a fetch started for an earlier
+        // (or transient startup) track must not overwrite the one now playing.
         func apply(_ parsed: (plain: String, synced: [(time: Double, text: String)])) {
+            guard key == lastLyricsKey else { return }
             self.currentLyrics = parsed.plain
             self.syncedLyrics = parsed.synced
             self.isFetchingLyrics = false
             self.lyricsCache[key] = (plain: parsed.plain, synced: parsed.synced)
         }
-
-        // 1) Exact-recording match via /get: LRCLIB matches by duration, so this returns lyrics
-        //    synced to THIS recording. Fetching by /search + first result often returns a
-        //    different-length edit whose timings drift (the "lyrics run ahead" symptom).
-        if duration > 0, !album.isEmpty,
-           let item = await lrclibGet(track: title, artist: artist, album: album, duration: Int(duration.rounded())) {
-            apply(parseLyricsItem(item))
-            return
+        func finishEmpty(cache: Bool) {
+            guard key == lastLyricsKey else { return }
+            self.currentLyrics = ""
+            self.syncedLyrics = []
+            self.isFetchingLyrics = false
+            if cache { self.lyricsCache[key] = (plain: "", synced: []) }
         }
 
-        // 2) Fallback: /search, then pick the result whose duration is CLOSEST to the track
-        //    (preferring ones with synced lyrics), instead of blindly taking the first.
+        // 1) Exact-recording match via /get (matches by duration → correct timing). Accept it only
+        //    if it actually has lyrics: an exact match can be an instrumental/lyric-less entry, in
+        //    which case we still fall through to /search for a version that has them.
+        if duration > 0, !album.isEmpty,
+           let item = await lrclibGet(track: title, artist: artist, album: album, duration: Int(duration.rounded())) {
+            let parsed = parseLyricsItem(item)
+            if !parsed.plain.isEmpty || !parsed.synced.isEmpty {
+                apply(parsed)
+                return
+            }
+        }
+
+        // 2) Fallback: /search, then pick the result that actually has lyrics whose duration is
+        //    CLOSEST to the track (preferring synced), instead of blindly taking the first.
         if let items = await lrclibSearch(track: title, artist: artist) {
             guard let best = bestLyricsMatch(items, duration: duration) else {
-                self.currentLyrics = ""
-                self.syncedLyrics = []
-                self.isFetchingLyrics = false
-                self.lyricsCache[key] = (plain: "", synced: [])   // authoritative "no lyrics"
+                finishEmpty(cache: true)   // authoritative "no lyrics for this track"
                 return
             }
             apply(parseLyricsItem(best))
@@ -475,9 +485,7 @@ class MusicManager: ObservableObject {
         }
 
         // Network failed entirely (timeouts): stop the spinner, don't cache (allow a later retry).
-        self.currentLyrics = ""
-        self.syncedLyrics = []
-        self.isFetchingLyrics = false
+        finishEmpty(cache: false)
     }
 
     /// Bounded, timed GET. Returns the body on HTTP 200, nil on 404 or after retries fail — so a
@@ -528,9 +536,12 @@ class MusicManager: ObservableObject {
     private func bestLyricsMatch(_ items: [[String: Any]], duration: Double) -> [String: Any]? {
         func dur(_ i: [String: Any]) -> Double { (i["duration"] as? NSNumber)?.doubleValue ?? 0 }
         func hasSynced(_ i: [String: Any]) -> Bool { !(((i["syncedLyrics"] as? String) ?? "").isEmpty) }
-        let synced = items.filter(hasSynced)
-        let pool = synced.isEmpty ? items : synced
-        guard !pool.isEmpty else { return nil }
+        func hasAny(_ i: [String: Any]) -> Bool { hasSynced(i) || !(((i["plainLyrics"] as? String) ?? "").isEmpty) }
+        // Consider only results that actually carry lyrics; prefer synced, then closest duration.
+        let withLyrics = items.filter(hasAny)
+        guard !withLyrics.isEmpty else { return nil }
+        let synced = withLyrics.filter(hasSynced)
+        let pool = synced.isEmpty ? withLyrics : synced
         guard duration > 0 else { return pool.first }
         return pool.min { abs(dur($0) - duration) < abs(dur($1) - duration) }
     }
