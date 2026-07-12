@@ -1,9 +1,9 @@
 name: Build latest
 
-# Builds the app on every push to main (including the automatic upstream syncs) and
-# republishes it as the rolling "latest" release. Combined with the Homebrew cask
-# (version :latest), this means `brew` always installs the current build and no version
-# numbers ever have to be bumped by hand.
+# Builds the app on every push to main (including automatic upstream syncs), signs it with
+# the fork's Sparkle EdDSA key, and republishes both the app and a Sparkle appcast as the
+# rolling "latest" release. The app therefore self-updates in place (Check for Updates), and
+# the Homebrew cask installs the same current build — no manual version bumps either way.
 
 on:
   push:
@@ -23,13 +23,22 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so the commit count can be the build number
 
       - name: Select Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: latest-stable
 
-      - name: Build (Release, unsigned)
+      - name: Compute version
+        id: ver
+        run: |
+          BUILD=$(git rev-list --count HEAD)
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+          echo "short=2.7.3-yandex.$BUILD" >> "$GITHUB_OUTPUT"
+
+      - name: Build (Release, unsigned, versioned)
         run: |
           set -o pipefail
           xcodebuild \
@@ -38,25 +47,59 @@ jobs:
             -configuration Release \
             -destination 'generic/platform=macOS' \
             -derivedDataPath build \
+            CURRENT_PROJECT_VERSION=${{ steps.ver.outputs.build }} \
             CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
             build
 
       - name: Package app
         run: ditto -c -k --keepParent "build/Build/Products/Release/boringNotch.app" boringNotch.zip
 
+      - name: Sign update & generate appcast
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          SIGN="$(find build/SourcePackages/artifacts -name sign_update -type f -not -path '*old_dsa*' | head -1)"
+          printf '%s' "$SPARKLE_PRIVATE_KEY" > sparkle_key
+          SIGINFO="$("$SIGN" boringNotch.zip -f sparkle_key | grep -oE 'sparkle:edSignature="[^"]+" length="[0-9]+"')"
+          rm -f sparkle_key
+          BUILD='${{ steps.ver.outputs.build }}'
+          SHORT='${{ steps.ver.outputs.short }}'
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/latest/boringNotch.zip"
+          DATE="$(date -u '+%a, %d %b %Y %H:%M:%S +0000')"
+          {
+            echo '<?xml version="1.0" encoding="utf-8"?>'
+            echo '<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">'
+            echo '  <channel>'
+            echo '    <title>Boring Notch — Yandex Music Edition</title>'
+            echo "    <link>${URL}</link>"
+            echo '    <description>Rolling builds of the Yandex Music fork.</description>'
+            echo '    <item>'
+            echo "      <title>Build ${BUILD}</title>"
+            echo "      <pubDate>${DATE}</pubDate>"
+            echo "      <sparkle:version>${BUILD}</sparkle:version>"
+            echo "      <sparkle:shortVersionString>${SHORT}</sparkle:shortVersionString>"
+            echo '      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>'
+            echo "      <enclosure url=\"${URL}\" ${SIGINFO} type=\"application/octet-stream\" />"
+            echo '    </item>'
+            echo '  </channel>'
+            echo '</rss>'
+          } > appcast.xml
+          echo "Generated appcast for build ${BUILD}"
+
       - name: Publish rolling 'latest' release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          notes="Auto-built from \`main\` (${GITHUB_SHA::7}).
+          notes="Auto-built from \`main\` (${GITHUB_SHA::7}), build ${{ steps.ver.outputs.build }}.
 
-          Unsigned build — after installing, clear quarantine once:
+          The app self-updates in place via Sparkle (Settings → Check for Updates). It can also
+          be installed with Homebrew:
           \`\`\`bash
-          xattr -dr com.apple.quarantine /Applications/boringNotch.app
-          \`\`\`
-          (The Homebrew cask does this automatically.)"
+          brew install --cask l3xu5/boring-notch/boring-notch-yandex
+          \`\`\`"
           gh release delete latest --cleanup-tag --yes 2>/dev/null || true
-          gh release create latest boringNotch.zip \
+          gh release create latest boringNotch.zip appcast.xml \
             --title "Latest build" \
             --notes "$notes" \
             --target "$GITHUB_SHA"
