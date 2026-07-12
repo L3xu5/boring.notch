@@ -5,6 +5,7 @@
 //  Created by Richard Kunkli on 07/08/2024.
 //
 
+import ApplicationServices
 import AVFoundation
 import Defaults
 import EventKit
@@ -615,6 +616,10 @@ struct Media: View {
                         name: Notification.Name.mediaControllerChanged,
                         object: nil
                     )
+                }
+
+                if mediaController == .yandexMusic {
+                    YandexAccessibilityStatusView()
                 }
             } header: {
                 Text("Media Source")
@@ -1754,6 +1759,19 @@ struct Shortcuts: View {
             Section {
                 KeyboardShortcuts.Recorder("Toggle Notch Open:", name: .toggleNotchOpen)
             }
+            Section {
+                KeyboardShortcuts.Recorder("Play / Pause:", name: .mediaPlayPause)
+                KeyboardShortcuts.Recorder("Next track:", name: .mediaNextTrack)
+                KeyboardShortcuts.Recorder("Previous track:", name: .mediaPreviousTrack)
+                KeyboardShortcuts.Recorder("Like:", name: .mediaLike)
+                KeyboardShortcuts.Recorder("Dislike:", name: .mediaDislike)
+            } header: {
+                Text("Media control")
+            } footer: {
+                Text("These control the selected music source directly — for Yandex Music they hit the app even when a browser owns the system Now Playing session.")
+                    .foregroundStyle(.secondary)
+                    .font(.caption)
+            }
         }
         .accentColor(.effectiveAccent)
         .navigationTitle("Shortcuts")
@@ -1810,4 +1828,37 @@ func warningBadge(_ text: String, _ description: String) -> some View {
 
 #Preview {
     HUD()
+}
+
+/// Live Accessibility-permission status + a grant shortcut, shown for the Yandex Music source
+/// (its transport/like/dislike controls need Accessibility).
+struct YandexAccessibilityStatusView: View {
+    @State private var trusted = AXIsProcessTrusted()
+    private let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: trusted ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                .foregroundStyle(trusted ? .green : .orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Yandex Music control")
+                Text(trusted
+                     ? "Accessibility granted — play/pause, next, like & dislike work."
+                     : "Grant Accessibility so the notch can control Yandex Music directly.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if !trusted {
+                Button("Grant…") {
+                    _ = AXIsProcessTrustedWithOptions(
+                        [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary)
+                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+            }
+        }
+        .onReceive(timer) { _ in trusted = AXIsProcessTrusted() }
+    }
 }

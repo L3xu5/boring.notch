@@ -15,4 +15,13 @@ extension KeyboardShortcuts.Name {
     static let increaseBacklight = Self("increaseBacklight", default: .init(.f2, modifiers: [.command]))
     static let toggleSneakPeek = Self("toggleSneakPeek", default: .init(.h, modifiers: [.command, .shift]))
     static let toggleNotchOpen = Self("toggleNotchOpen", default: .init(.i, modifiers: [.command, .shift]))
+
+    // Media hotkeys that target the selected source directly (e.g. Yandex via Accessibility),
+    // so they work even when a browser tab owns the system Now Playing session. No defaults —
+    // the user assigns them in Settings.
+    static let mediaPlayPause = Self("mediaPlayPause")
+    static let mediaNextTrack = Self("mediaNextTrack")
+    static let mediaPreviousTrack = Self("mediaPreviousTrack")
+    static let mediaLike = Self("mediaLike")
+    static let mediaDislike = Self("mediaDislike")
 }

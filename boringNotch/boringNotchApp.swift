@@ -365,6 +365,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        // Media hotkeys — route to the active source (Yandex is driven via Accessibility, so
+        // these hit Yandex even when a browser tab owns the system Now Playing session).
+        KeyboardShortcuts.onKeyDown(for: .mediaPlayPause) { MusicManager.shared.togglePlay() }
+        KeyboardShortcuts.onKeyDown(for: .mediaNextTrack) { MusicManager.shared.nextTrack() }
+        KeyboardShortcuts.onKeyDown(for: .mediaPreviousTrack) { MusicManager.shared.previousTrack() }
+        KeyboardShortcuts.onKeyDown(for: .mediaLike) { MusicManager.shared.toggleFavoriteTrack() }
+        KeyboardShortcuts.onKeyDown(for: .mediaDislike) { MusicManager.shared.dislikeCurrentTrack() }
+
         KeyboardShortcuts.onKeyDown(for: .toggleNotchOpen) { [weak self] in
             Task { [weak self] in
                 guard let self = self else { return }
