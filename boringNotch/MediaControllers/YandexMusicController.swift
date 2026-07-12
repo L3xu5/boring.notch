@@ -118,12 +118,12 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
 
     // MARK: - Transport controls
     //
-    // Transport commands are sent to Yandex Music directly by pressing its own on-screen
-    // controls through Accessibility, so they always target Yandex regardless of which app
-    // currently owns the system Now Playing session (a browser tab can otherwise steal it and
-    // receive the command). If Accessibility is unavailable, fall back to MediaRemote, whose
-    // command indices are 0 play, 1 pause, 2 toggle, 4 next, 5 prev — this routes to the
-    // session owner, which is correct in the common case where only Yandex is playing.
+    // Transport commands are sent to Yandex Music ONLY, by pressing its own on-screen controls
+    // through Accessibility. There is deliberately no MediaRemote fallback: a global MediaRemote
+    // command targets whatever app owns the system Now Playing session, which can be a Safari
+    // video, so falling back would hijack the wrong app. When the press can't be delivered we
+    // instead make sure Yandex is the target — launching it if it isn't running (see
+    // handleTransportMiss).
     //
     // These methods are @MainActor because they read/write `playbackState`/`sessionIsYandex`,
     // which are also mutated by the adapter stream callback; running them all on the main actor
@@ -135,7 +135,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
             applyOptimisticPlayState(true)
             return
         }
-        MRMediaRemoteSendCommandFunction(0, nil)
+        handleTransportMiss()
     }
 
     @MainActor
@@ -145,7 +145,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
             applyOptimisticPlayState(false)
             return
         }
-        MRMediaRemoteSendCommandFunction(1, nil)
+        handleTransportMiss()
     }
 
     @MainActor
@@ -154,7 +154,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
             applyOptimisticPlayState(!playbackState.isPlaying)
             return
         }
-        MRMediaRemoteSendCommandFunction(2, nil)
+        handleTransportMiss()
     }
 
     /// After an AX transport press, reflect the new play/pause state locally right away. When
@@ -178,13 +178,39 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     @MainActor
     func nextTrack() async {
         if pressTransport(exact: Self.nextExact, contains: Self.nextContains) { return }
-        MRMediaRemoteSendCommandFunction(4, nil)
+        handleTransportMiss()
     }
 
     @MainActor
     func previousTrack() async {
         if pressTransport(exact: Self.previousExact, contains: Self.previousContains) { return }
-        MRMediaRemoteSendCommandFunction(5, nil)
+        handleTransportMiss()
+    }
+
+    /// Called when an AX transport press couldn't be delivered. Rather than hijacking another
+    /// app via a global MediaRemote command, ensure Yandex Music itself is the target: launch it
+    /// when it isn't running, or nudge the user to grant Accessibility when it is (which is what
+    /// the on-screen controls need).
+    @MainActor
+    private func handleTransportMiss() {
+        if !isActive() {
+            launchYandexMusic()
+        } else if !AXIsProcessTrusted() {
+            _ = AXIsProcessTrustedWithOptions(
+                [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary)
+        }
+    }
+
+    /// Opens the Yandex Music app (used when a transport command arrives while it isn't running).
+    @MainActor
+    private func launchYandexMusic() {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: Self.bundleID) else {
+            NSLog("[YandexMusic] Yandex Music app not found to launch.")
+            return
+        }
+        NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) { _, error in
+            if let error { NSLog("[YandexMusic] Failed to launch Yandex Music: \(error)") }
+        }
     }
 
     @MainActor
