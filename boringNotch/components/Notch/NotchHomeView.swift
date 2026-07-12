@@ -592,3 +592,77 @@ struct CustomSlider: View {
         }
     }
 }
+
+// MARK: - Karaoke lyrics
+
+/// Full scrolling synced-lyrics panel: dims non-current lines, highlights & auto-scrolls to the
+/// current one, and click-a-line to seek there (works while Yandex owns the session).
+struct LyricsKaraokeView: View {
+    @ObservedObject var musicManager = MusicManager.shared
+    @ObservedObject private var coordinator = BoringViewCoordinator.shared
+    @Default(.lyricsOffset) private var lyricsOffset
+
+    var body: some View {
+        Group {
+            if musicManager.syncedLyrics.isEmpty {
+                VStack(spacing: 6) {
+                    Image(systemName: "quote.bubble")
+                        .font(.title2)
+                        .foregroundStyle(.secondary)
+                    Text(musicManager.isFetchingLyrics ? "Loading lyrics…" : "No synced lyrics")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                // If synced lyrics aren't available, don't strand the user on an empty tab.
+                .onAppear { if !musicManager.isFetchingLyrics { coordinator.currentView = .home } }
+            } else {
+                karaoke
+            }
+        }
+        .frame(height: 130)
+    }
+
+    private var karaoke: some View {
+        TimelineView(.animation(minimumInterval: 0.2)) { timeline in
+            let pos = max(0, musicManager.estimatedPlaybackPosition(at: timeline.date) - lyricsOffset)
+            let current = currentIndex(at: pos)
+            ScrollViewReader { proxy in
+                ScrollView(.vertical, showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 7) {
+                        ForEach(Array(musicManager.syncedLyrics.enumerated()), id: \.offset) { idx, line in
+                            Text(line.text.isEmpty ? "♪" : line.text)
+                                .font(.system(size: idx == current ? 16 : 13,
+                                               weight: idx == current ? .semibold : .regular))
+                                .foregroundStyle(idx == current ? Color.primary : Color.secondary)
+                                .opacity(idx == current ? 1 : (abs(idx - current) == 1 ? 0.55 : 0.3))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
+                                .id(idx)
+                                .onTapGesture { musicManager.seek(to: line.time) }
+                                .animation(.smooth(duration: 0.2), value: current)
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 48)
+                }
+                .onChange(of: current) { _, new in
+                    withAnimation(.smooth(duration: 0.3)) { proxy.scrollTo(new, anchor: .center) }
+                }
+                .onAppear { proxy.scrollTo(current, anchor: .center) }
+            }
+        }
+    }
+
+    private func currentIndex(at pos: Double) -> Int {
+        let lines = musicManager.syncedLyrics
+        guard !lines.isEmpty else { return 0 }
+        if pos < lines[0].time { return 0 }
+        var low = 0, high = lines.count - 1, idx = 0
+        while low <= high {
+            let mid = (low + high) / 2
+            if lines[mid].time <= pos { idx = mid; low = mid + 1 } else { high = mid - 1 }
+        }
+        return idx
+    }
+}

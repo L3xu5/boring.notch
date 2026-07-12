@@ -347,6 +347,8 @@ struct ContentView: View {
                     switch coordinator.currentView {
                     case .home:
                         NotchHomeView(albumArtNamespace: albumArtNamespace)
+                    case .lyrics:
+                        LyricsKaraokeView()
                     case .shelf:
                         ShelfView()
                     }

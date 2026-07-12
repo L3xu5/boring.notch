@@ -5,6 +5,7 @@
 //  Created by Hugo Persson on 2024-08-25.
 //
 
+import Defaults
 import SwiftUI
 
 struct TabModel: Identifiable {
@@ -14,14 +15,22 @@ struct TabModel: Identifiable {
     let view: NotchViews
 }
 
-let tabs = [
-    TabModel(label: "Home", icon: "house.fill", view: .home),
-    TabModel(label: "Shelf", icon: "tray.fill", view: .shelf)
-]
-
 struct TabSelectionView: View {
     @ObservedObject var coordinator = BoringViewCoordinator.shared
+    @ObservedObject var musicManager = MusicManager.shared
+    @Default(.enableLyrics) var enableLyrics
     @Namespace var animation
+
+    // A Lyrics tab appears only when synced lyrics are actually available for the current track.
+    private var tabs: [TabModel] {
+        var result = [TabModel(label: "Home", icon: "house.fill", view: .home)]
+        if enableLyrics, !musicManager.syncedLyrics.isEmpty {
+            result.append(TabModel(label: "Lyrics", icon: "quote.bubble.fill", view: .lyrics))
+        }
+        result.append(TabModel(label: "Shelf", icon: "tray.fill", view: .shelf))
+        return result
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             ForEach(tabs) { tab in
