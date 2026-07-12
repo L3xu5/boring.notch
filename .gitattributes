@@ -1,0 +1,5 @@
+# Keep this fork's own README during automatic upstream merges.
+# The `ours` merge driver is enabled by the sync-upstream workflow
+# (git config merge.ours.driver true); run that once locally too if you
+# merge upstream by hand.
+README.md merge=ours
