@@ -21,11 +21,25 @@ struct DynamicNotchApp: App {
     let updaterController: SPUStandardUpdaterController
 
     init() {
+        Self.migrateControlSlotsIfNeeded()
+
         updaterController = SPUStandardUpdaterController(
             startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
 
         // Initialize the settings window controller with the updater controller
         SettingsWindowController.shared.setUpdaterController(updaterController)
+    }
+
+    /// Bring existing installs onto the new default layout (which now surfaces Favorite/Dislike),
+    /// but only when the saved layout is still the old pristine default — a customised layout is
+    /// left untouched.
+    private static func migrateControlSlotsIfNeeded() {
+        guard !Defaults[.didMigrateControlSlotsV1] else { return }
+        Defaults[.didMigrateControlSlotsV1] = true
+        let oldDefault: [MusicControlButton] = [.none, .previous, .playPause, .next, .none]
+        if Defaults[.musicControlSlots] == oldDefault {
+            Defaults[.musicControlSlots] = MusicControlButton.defaultLayout
+        }
     }
 
     var body: some Scene {

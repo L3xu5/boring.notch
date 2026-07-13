@@ -206,4 +206,7 @@ extension Defaults.Keys {
     }
 
     static let didClearLegacyURLCacheV1 = Key<Bool>("didClearLegacyURLCache_v1", default: false)
+    // One-time upgrade of the control-slot layout to include Favorite/Dislike, but only for users
+    // still on the pristine old default (never customised) — never clobbers a custom layout.
+    static let didMigrateControlSlotsV1 = Key<Bool>("didMigrateControlSlots_v1", default: false)
 }
