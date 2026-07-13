@@ -76,8 +76,8 @@ class MusicManager: ObservableObject {
     // The filename carries a schema/logic version: bump it whenever the lyric-resolution logic
     // changes so entries cached by the old (possibly wrong) logic are dropped instead of shadowing
     // the improved result. (v2: exact-edition Yandex resolution.)
-    private static let lyricsCacheURL = temporaryDirectory.appendingPathComponent("boringNotch-lyrics-cache-v2.json")
-    private static let legacyLyricsCacheURLs = ["boringNotch-lyrics-cache.json"]
+    private static let lyricsCacheURL = temporaryDirectory.appendingPathComponent("boringNotch-lyrics-cache-v3.json")
+    private static let legacyLyricsCacheURLs = ["boringNotch-lyrics-cache.json", "boringNotch-lyrics-cache-v2.json"]
         .map { temporaryDirectory.appendingPathComponent($0) }
     private var lyricsSaveTask: Task<Void, Never>?
 
@@ -955,10 +955,14 @@ struct YandexLyricsProvider {
     /// Returns the raw LRC text for the exact playing recording, or a status for the caller.
     func fetchLRC(title: String, artist: String, album: String, duration: Double) async -> Result {
         guard !token.isEmpty else { return .failed }
-        guard let trackId = await resolveTrackId(title: title, artist: artist, album: album, duration: duration) else {
+        guard let best = await resolveTrack(title: title, artist: artist, album: album, duration: duration) else {
             return .notFound
         }
-        return await lyrics(trackId: trackId)
+        // Synced lyrics are only correct for the *exact* recording. If the best match carries no
+        // synced lyrics (e.g. a live take), don't fetch — it would 404, and any other edition's LRC
+        // would drift. Report notFound so the caller falls back to LRCLIB instead.
+        guard best.hasSync else { return .notFound }
+        return await lyrics(trackId: best.id)
     }
 
     private func authorized(_ url: URL) -> URLRequest {
@@ -970,17 +974,22 @@ struct YandexLyricsProvider {
 
     // MARK: - Track resolution
     //
-    // Finding the *exact* recording is the whole game: Yandex has many editions of a song
-    // (standard / Extended / Edit / remixes / karaoke covers) with very different timings, and a
-    // plain text search returns the popular one — not necessarily the one that's playing. Matching
-    // by duration alone is dangerous too (a *different song* can share a duration — that's how we
-    // once picked "The Lucky One" for "Self Control"). So we resolve in two steps:
-    //   A) Album-first: the now-playing album pins the exact edition. Search the album, then pick
-    //      the track whose title matches and whose duration is essentially identical.
-    //   B) Fallback: track search, but only ever accept a result whose *title matches* and whose
-    //      duration is within a few seconds — preferring one that actually has synced lyrics.
+    // Getting perfect timing means fetching lyrics for the *exact* recording that's playing. Traps:
+    //  1. Yandex has many editions per song (standard / Extended / live / remix / karaoke) with very
+    //     different timings; a plain text search returns the popular one, and some editions surface
+    //     only via the album (the Extended "Self Control" never appears in track search).
+    //  2. Matching by duration alone can grab a *different song* of similar length ("The Lucky One"
+    //     for "Self Control").
+    //  3. The exact recording may have *no synced lyrics* (common for live takes) even when another
+    //     edition does — using that other edition's LRC drifts (this made "Lift Me Up" ~4s late).
+    // So: gather candidates from the album AND from track search, keep only same-title/near-duration
+    // ones, and prefer a candidate that actually has synced lyrics at essentially the same length
+    // (i.e. the same master). If even the best match has no synced lyrics, report notFound.
 
-    private static let durationToleranceMs: Double = 5000
+    private static let durationToleranceMs: Double = 5000   // "same song edition" window
+    private static let sameRecordingMs: Double = 2000       // "same master" window (sync preference)
+
+    private struct Candidate { let id: String; let durMs: Double; let hasSync: Bool }
 
     /// Normalise for comparison: fold case + diacritics, drop punctuation, collapse whitespace.
     private func norm(_ s: String) -> String {
@@ -1013,22 +1022,49 @@ struct YandexLyricsProvider {
         return json
     }
 
-    private func resolveTrackId(title: String, artist: String, album: String, duration: Double) async -> String? {
-        let targetMs = duration * 1000
-        // A) Album-first — the surest way to the exact edition.
-        if !album.isEmpty, targetMs > 0,
-           let id = await trackIdFromAlbum(title: title, artist: artist, album: album, targetMs: targetMs) {
-            return id
-        }
-        // B) Track search, verified by title + duration.
-        return await trackIdFromSearch(title: title, artist: artist, targetMs: targetMs)
+    private func candidate(_ t: [String: Any]) -> Candidate? {
+        guard let id = idOf(t) else { return nil }
+        return Candidate(id: id, durMs: durMs(t), hasSync: hasSync(t))
     }
 
-    private func trackIdFromAlbum(title: String, artist: String, album: String, targetMs: Double) async -> String? {
+    /// The best-matching recording plus whether it carries synced lyrics; nil if nothing matches.
+    private func resolveTrack(title: String, artist: String, album: String, duration: Double) async -> Candidate? {
+        let targetMs = duration * 1000
+        var seen = Set<String>()
+        var candidates: [Candidate] = []
+        func add(_ list: [Candidate]) { for c in list where seen.insert(c.id).inserted { candidates.append(c) } }
+
+        // Album pins editions that text search misses; search adds the popular synced copies.
+        if !album.isEmpty, targetMs > 0 { add(await albumCandidates(title: title, artist: artist, album: album)) }
+        add(await searchCandidates(title: title, artist: artist))
+        guard !candidates.isEmpty else { return nil }
+
+        let pool: [Candidate]
+        if targetMs > 0 {
+            let near = candidates.filter { abs($0.durMs - targetMs) <= Self.durationToleranceMs }
+            // Exact recording isn't in Yandex → don't guess a wrong-length edition; let LRCLIB try.
+            guard !near.isEmpty else { return nil }
+            pool = near
+        } else {
+            pool = candidates
+        }
+        // Prefer a synced-lyrics copy at essentially the same length (same master); otherwise the
+        // closest duration. This never substitutes a *different-length* edition's synced lyrics.
+        func syncedSameMaster(_ c: Candidate) -> Bool {
+            c.hasSync && abs(c.durMs - targetMs) <= Self.sameRecordingMs
+        }
+        return pool.min { a, b in
+            let sa = syncedSameMaster(a), sb = syncedSameMaster(b)
+            if sa != sb { return sa }
+            return abs(a.durMs - targetMs) < abs(b.durMs - targetMs)
+        }
+    }
+
+    private func albumCandidates(title: String, artist: String, album: String) async -> [Candidate] {
         guard let q = "\(album) \(artist)".addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
               let json = await get("/search?text=\(q)&type=album&page=0&nocorrect=false"),
               let result = json["result"] as? [String: Any],
-              let albums = (result["albums"] as? [String: Any])?["results"] as? [[String: Any]] else { return nil }
+              let albums = (result["albums"] as? [String: Any])?["results"] as? [[String: Any]] else { return [] }
         // Choose the album whose title best matches the now-playing album.
         let target = norm(album)
         let scored = albums.compactMap { a -> (id: String, score: Int)? in
@@ -1037,44 +1073,24 @@ struct YandexLyricsProvider {
             let score = at == target ? 2 : ((at.contains(target) || target.contains(at)) && !at.isEmpty ? 1 : 0)
             return (id, score)
         }
-        guard let picked = scored.max(by: { $0.score < $1.score }), picked.score > 0 else { return nil }
-        // Pull the album's tracks and match by title + (near-exact) duration.
-        guard let aj = await get("/albums/\(picked.id)/with-tracks"),
+        guard let picked = scored.max(by: { $0.score < $1.score }), picked.score > 0,
+              let aj = await get("/albums/\(picked.id)/with-tracks"),
               let ar = aj["result"] as? [String: Any],
-              let volumes = ar["volumes"] as? [[[String: Any]]] else { return nil }
-        let tracks = volumes.flatMap { $0 }
-        let matches = tracks.filter {
-            titleMatches($0["title"] as? String ?? "", title)
-                && abs(durMs($0) - targetMs) <= Self.durationToleranceMs
-        }
-        return matches.min(by: { abs(durMs($0) - targetMs) < abs(durMs($1) - targetMs) }).flatMap(idOf)
+              let volumes = ar["volumes"] as? [[[String: Any]]] else { return [] }
+        return volumes.flatMap { $0 }
+            .filter { titleMatches($0["title"] as? String ?? "", title) }
+            .compactMap(candidate)
     }
 
-    private func trackIdFromSearch(title: String, artist: String, targetMs: Double) async -> String? {
+    private func searchCandidates(title: String, artist: String) async -> [Candidate] {
         guard let q = "\(title) \(artist)".addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
               let json = await get("/search?text=\(q)&type=track&page=0&nocorrect=false"),
               let result = json["result"] as? [String: Any],
-              let results = (result["tracks"] as? [String: Any])?["results"] as? [[String: Any]],
-              !results.isEmpty else { return nil }
-
-        // Only ever accept a title match. Never let duration alone pick a *different* song.
-        let titled = results.filter { titleMatches($0["title"] as? String ?? "", title) }
-        guard !titled.isEmpty else { return nil }
-
-        if targetMs > 0 {
-            // Among title matches, require a close duration; prefer one that has synced lyrics,
-            // then the nearest duration.
-            let near = titled.filter { abs(durMs($0) - targetMs) <= Self.durationToleranceMs }
-            let pool = near.isEmpty ? titled : near
-            let best = pool.min(by: { lhs, rhs in
-                let ls = hasSync(lhs), rs = hasSync(rhs)
-                if ls != rs { return ls }   // synced-lyrics tracks first
-                return abs(durMs(lhs) - targetMs) < abs(durMs(rhs) - targetMs)
-            })
-            return best.flatMap(idOf)
-        }
-        // No duration hint: prefer a synced-lyrics title match, else the first.
-        return (titled.first(where: hasSync) ?? titled.first).flatMap(idOf)
+              let results = (result["tracks"] as? [String: Any])?["results"] as? [[String: Any]] else { return [] }
+        // Only ever keep a title match — never let duration alone pull in a different song.
+        return results
+            .filter { titleMatches($0["title"] as? String ?? "", title) }
+            .compactMap(candidate)
     }
 
     private func lyrics(trackId: String) async -> Result {
