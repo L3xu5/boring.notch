@@ -620,6 +620,7 @@ struct Media: View {
 
                 if mediaController == .yandexMusic {
                     YandexAccessibilityStatusView()
+                    YandexTokenSettingsView()
                 }
             } header: {
                 Text("Media Source")
@@ -1828,6 +1829,63 @@ func warningBadge(_ text: String, _ description: String) -> some View {
 
 #Preview {
     HUD()
+}
+
+/// Connect a Yandex Music account (OAuth token) so lyrics come from Yandex's own API — synced
+/// exactly to the playing recording (LRCLIB often lacks the right timing for a given edit).
+struct YandexTokenSettingsView: View {
+    @Default(.yandexMusicToken) private var token
+    @State private var draft = ""
+
+    private let oauthURL = URL(string:
+        "https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b39c32c41195d")!
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Image(systemName: token.isEmpty ? "quote.bubble" : "checkmark.seal.fill")
+                    .foregroundStyle(token.isEmpty ? Color.secondary : Color.green)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Perfectly-synced lyrics (Yandex account)")
+                    Text(token.isEmpty
+                         ? "Optional — connect your account for lyrics synced to the exact recording."
+                         : "Connected. Lyrics come straight from Yandex, in sync with the audio.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if !token.isEmpty {
+                    Button("Disconnect") { token = ""; draft = "" }
+                }
+            }
+
+            if token.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("1. Open the Yandex sign-in page below and log in.\n2. From the address bar copy the value after `access_token=` (up to the next `&`).\n3. Paste it here and press Save.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Link(destination: oauthURL) {
+                        Label("Open Yandex sign-in", systemImage: "safari")
+                            .font(.caption)
+                    }
+                    HStack {
+                        SecureField("Paste OAuth token", text: $draft)
+                            .textFieldStyle(.roundedBorder)
+                        Button("Save") {
+                            token = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+                            draft = ""
+                        }
+                        .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                }
+            }
+        }
+        .onChange(of: token) { _, _ in
+            // Re-fetch lyrics for the current track when the token changes.
+            MusicManager.shared.reloadLyricsForCurrentTrack()
+        }
+    }
 }
 
 /// Live Accessibility-permission status + a grant shortcut, shown for the Yandex Music source

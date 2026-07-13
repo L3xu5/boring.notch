@@ -6,6 +6,7 @@
 //
 import AppKit
 import Combine
+import CryptoKit
 import Defaults
 import SwiftUI
 
@@ -388,6 +389,15 @@ class MusicManager: ObservableObject {
     }
 
     // MARK: - Lyrics
+    /// Forces a fresh lyrics fetch for the current track (e.g. after connecting a Yandex token),
+    /// bypassing the dedup and any cached entry.
+    func reloadLyricsForCurrentTrack() {
+        let key = lyricsKey(songTitle, artistName, songDuration)
+        lyricsCache[key] = nil
+        lastLyricsKey = ""
+        fetchLyricsIfAvailable(bundleIdentifier: bundleIdentifier, title: songTitle, artist: artistName, album: album, duration: songDuration)
+    }
+
     private func fetchLyricsIfAvailable(bundleIdentifier: String?, title: String, artist: String, album: String = "", duration: Double = 0) {
         guard Defaults[.enableLyrics], !title.isEmpty else {
             DispatchQueue.main.async {
@@ -528,6 +538,22 @@ class MusicManager: ObservableObject {
                 // Retryable (network) failure — clear the dedup key so the next content change for
                 // this same track can try again instead of being suppressed forever.
                 lastLyricsKey = ""
+            }
+        }
+
+        // 0) Yandex's own lyrics (perfectly synced to the exact recording) when the source is
+        //    Yandex Music and a token is configured. LRCLIB is only a fallback.
+        let yandexToken = Defaults[.yandexMusicToken]
+        if Defaults[.mediaController] == .yandexMusic, !yandexToken.isEmpty {
+            switch await YandexLyricsProvider(token: yandexToken).fetchLRC(title: title, artist: artist, duration: duration) {
+            case .lrc(let text):
+                let synced = parseLRC(text)
+                if !synced.isEmpty {
+                    apply((plain: synced.map { $0.text }.joined(separator: "\n"), synced: synced))
+                    return
+                }
+            case .notFound, .failed:
+                break // fall through to LRCLIB
             }
         }
 
@@ -900,5 +926,82 @@ class MusicManager: ObservableObject {
                 }
             }
         }
+    }
+}
+
+// MARK: - Yandex Music lyrics API
+
+/// Fetches lyrics that are synced to the exact Yandex recording (LRCLIB only has community
+/// timings, which can be badly off for a specific edit). Needs the user's OAuth token.
+struct YandexLyricsProvider {
+    let token: String
+    private let base = "https://api.music.yandex.net"
+    private let clientHeader = "YandexMusicAndroid/24023621"
+    private let signSecret = "p93jhgh689SBReK6ghtw62"
+
+    enum Result {
+        case lrc(String)   // synced LRC text
+        case notFound      // reached the API, but the track/lyrics don't exist there
+        case failed        // network/auth error — caller should fall back and may retry
+    }
+
+    /// Returns the raw LRC text for the best-matching track, or a status for the caller.
+    func fetchLRC(title: String, artist: String, duration: Double) async -> Result {
+        guard !token.isEmpty else { return .failed }
+        guard let trackId = await searchTrackId(title: title, artist: artist, duration: duration) else {
+            return .notFound
+        }
+        return await lyrics(trackId: trackId)
+    }
+
+    private func authorized(_ url: URL) -> URLRequest {
+        var r = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10)
+        r.setValue("OAuth \(token)", forHTTPHeaderField: "Authorization")
+        r.setValue(clientHeader, forHTTPHeaderField: "X-Yandex-Music-Client")
+        return r
+    }
+
+    private func searchTrackId(title: String, artist: String, duration: Double) async -> String? {
+        guard let q = "\(title) \(artist)".addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "\(base)/search?text=\(q)&type=track&page=0&nocorrect=false"),
+              let (data, resp) = try? await URLSession.shared.data(for: authorized(url)),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let result = json["result"] as? [String: Any],
+              let tracks = result["tracks"] as? [String: Any],
+              let results = tracks["results"] as? [[String: Any]], !results.isEmpty else { return nil }
+
+        func idOf(_ t: [String: Any]) -> String? {
+            if let s = t["id"] as? String { return s }
+            if let n = t["id"] as? NSNumber { return n.stringValue }
+            return nil
+        }
+        func durMs(_ t: [String: Any]) -> Double { (t["durationMs"] as? NSNumber)?.doubleValue ?? 0 }
+        // Pick the result whose duration best matches this recording.
+        let best = duration > 0
+            ? results.min(by: { abs(durMs($0) - duration * 1000) < abs(durMs($1) - duration * 1000) })
+            : results.first
+        return best.flatMap(idOf)
+    }
+
+    private func lyrics(trackId: String) async -> Result {
+        let ts = Int(Date().timeIntervalSince1970)
+        let mac = HMAC<SHA256>.authenticationCode(
+            for: Data("\(trackId)\(ts)".utf8), using: SymmetricKey(data: Data(signSecret.utf8)))
+        let sign = Data(mac).base64EncodedString()
+        guard let signEnc = sign.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "\(base)/tracks/\(trackId)/lyrics?format=LRC&timeStamp=\(ts)&sign=\(signEnc)"),
+              let (data, resp) = try? await URLSession.shared.data(for: authorized(url)) else { return .failed }
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        if code == 404 { return .notFound }   // no lyrics for this track
+        guard code == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let result = json["result"] as? [String: Any],
+              let dl = result["downloadUrl"] as? String,
+              let dlURL = URL(string: dl),
+              let (lrcData, lrcResp) = try? await URLSession.shared.data(from: dlURL),
+              (lrcResp as? HTTPURLResponse)?.statusCode == 200,
+              let text = String(data: lrcData, encoding: .utf8), !text.isEmpty else { return .failed }
+        return .lrc(text)
     }
 }
