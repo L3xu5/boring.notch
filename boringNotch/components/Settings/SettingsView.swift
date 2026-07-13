@@ -11,6 +11,7 @@ import Defaults
 import EventKit
 import KeyboardShortcuts
 import LaunchAtLogin
+import WebKit
 import Sparkle
 import SwiftUI
 import SwiftUIIntrospect
@@ -1836,9 +1837,7 @@ func warningBadge(_ text: String, _ description: String) -> some View {
 struct YandexTokenSettingsView: View {
     @Default(.yandexMusicToken) private var token
     @State private var draft = ""
-
-    private let oauthURL = URL(string:
-        "https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b39c32c41195d")!
+    @State private var showManual = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1854,21 +1853,22 @@ struct YandexTokenSettingsView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                if !token.isEmpty {
+                if token.isEmpty {
+                    Button("Connect…") { YandexAuthWindowController.shared.present() }
+                        .buttonStyle(.borderedProminent)
+                } else {
                     Button("Disconnect") { token = ""; draft = "" }
                 }
             }
 
             if token.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("1. Open the Yandex sign-in page below and log in.\n2. From the address bar copy the value after `access_token=` (up to the next `&`).\n3. Paste it here and press Save.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Link(destination: oauthURL) {
-                        Label("Open Yandex sign-in", systemImage: "safari")
-                            .font(.caption)
-                    }
+                Button(showManual ? "Hide manual entry" : "Enter a token manually instead") {
+                    withAnimation { showManual.toggle() }
+                }
+                .buttonStyle(.link)
+                .font(.caption)
+
+                if showManual {
                     HStack {
                         SecureField("Paste OAuth token", text: $draft)
                             .textFieldStyle(.roundedBorder)
@@ -1882,9 +1882,82 @@ struct YandexTokenSettingsView: View {
             }
         }
         .onChange(of: token) { _, _ in
-            // Re-fetch lyrics for the current track when the token changes.
             MusicManager.shared.reloadLyricsForCurrentTrack()
         }
+    }
+}
+
+/// Popup window that signs the user into Yandex in an embedded web view and captures the OAuth
+/// token from the redirect (`https://music.yandex.ru/#access_token=…`) automatically.
+final class YandexAuthWindowController: NSObject, WKNavigationDelegate {
+    static let shared = YandexAuthWindowController()
+    private var window: NSWindow?
+
+    private let authURL = URL(string:
+        "https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b39c32c41195d&force_confirm=yes")!
+
+    func present() {
+        if let window {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .nonPersistent() // fresh session so the user can pick the account
+        let webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 460, height: 640), configuration: config)
+        webView.navigationDelegate = self
+        // Present as a normal browser so Yandex doesn't refuse the embedded web view.
+        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 640),
+                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        w.title = "Connect Yandex Music"
+        w.contentView = webView
+        w.center()
+        w.isReleasedWhenClosed = false
+        w.level = .floating
+        window = w
+        w.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        webView.load(URLRequest(url: authURL))
+    }
+
+    /// Extracts `access_token` from an OAuth redirect URL; saves it and closes on success.
+    @discardableResult
+    private func captureToken(from url: URL?) -> Bool {
+        guard let url else { return false }
+        let fragment = url.fragment ?? url.absoluteString.components(separatedBy: "#").dropFirst().joined(separator: "#")
+        guard fragment.contains("access_token=") else { return false }
+        for pair in fragment.components(separatedBy: "&") {
+            let kv = pair.components(separatedBy: "=")
+            guard kv.count == 2, kv[0] == "access_token", !kv[1].isEmpty else { continue }
+            let token = kv[1].removingPercentEncoding ?? kv[1]
+            DispatchQueue.main.async {
+                Defaults[.yandexMusicToken] = token
+                MusicManager.shared.reloadLyricsForCurrentTrack()
+                self.window?.close()
+                self.window = nil
+            }
+            return true
+        }
+        return false
+    }
+
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        if captureToken(from: navigationAction.request.url) {
+            decisionHandler(.cancel)
+        } else {
+            decisionHandler(.allow)
+        }
+    }
+
+    func webView(_ webView: WKWebView, didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!) {
+        captureToken(from: webView.url)
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        captureToken(from: webView.url)
     }
 }
 
