@@ -209,4 +209,7 @@ extension Defaults.Keys {
     // One-time upgrade of the control-slot layout to include Favorite/Dislike, but only for users
     // still on the pristine old default (never customised) — never clobbers a custom layout.
     static let didMigrateControlSlotsV1 = Key<Bool>("didMigrateControlSlots_v1", default: false)
+    // v2: also fills an empty slot with Dislike for layouts that had already diverged from the
+    // pristine old default (so the button appears without a manual reset).
+    static let didMigrateControlSlotsV2 = Key<Bool>("didMigrateControlSlots_v2", default: false)
 }

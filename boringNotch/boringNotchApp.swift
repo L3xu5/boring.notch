@@ -30,15 +30,29 @@ struct DynamicNotchApp: App {
         SettingsWindowController.shared.setUpdaterController(updaterController)
     }
 
-    /// Bring existing installs onto the new default layout (which now surfaces Favorite/Dislike),
-    /// but only when the saved layout is still the old pristine default — a customised layout is
-    /// left untouched.
+    /// Bring existing installs onto a layout that surfaces the Dislike button.
+    ///
+    /// v1 upgraded only the pristine old default. That missed anyone whose layout had already
+    /// diverged (e.g. Favorite added, or a different prior default), so Dislike never appeared.
+    /// v2 is non-destructive but broader: if Dislike is missing and there's an empty (.none) slot,
+    /// drop Dislike into the first empty slot. A layout that's already full or already has Dislike
+    /// is left untouched.
     private static func migrateControlSlotsIfNeeded() {
-        guard !Defaults[.didMigrateControlSlotsV1] else { return }
-        Defaults[.didMigrateControlSlotsV1] = true
-        let oldDefault: [MusicControlButton] = [.none, .previous, .playPause, .next, .none]
-        if Defaults[.musicControlSlots] == oldDefault {
-            Defaults[.musicControlSlots] = MusicControlButton.defaultLayout
+        if !Defaults[.didMigrateControlSlotsV1] {
+            Defaults[.didMigrateControlSlotsV1] = true
+            let oldDefault: [MusicControlButton] = [.none, .previous, .playPause, .next, .none]
+            if Defaults[.musicControlSlots] == oldDefault {
+                Defaults[.musicControlSlots] = MusicControlButton.defaultLayout
+            }
+        }
+
+        if !Defaults[.didMigrateControlSlotsV2] {
+            Defaults[.didMigrateControlSlotsV2] = true
+            var slots = Defaults[.musicControlSlots]
+            if !slots.contains(.dislike), let emptyIndex = slots.firstIndex(of: .none) {
+                slots[emptyIndex] = .dislike
+                Defaults[.musicControlSlots] = slots
+            }
         }
     }
 

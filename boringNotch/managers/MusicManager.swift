@@ -73,7 +73,12 @@ class MusicManager: ObservableObject {
         var plain: String
         var synced: [Line]
     }
-    private static let lyricsCacheURL = temporaryDirectory.appendingPathComponent("boringNotch-lyrics-cache.json")
+    // The filename carries a schema/logic version: bump it whenever the lyric-resolution logic
+    // changes so entries cached by the old (possibly wrong) logic are dropped instead of shadowing
+    // the improved result. (v2: exact-edition Yandex resolution.)
+    private static let lyricsCacheURL = temporaryDirectory.appendingPathComponent("boringNotch-lyrics-cache-v2.json")
+    private static let legacyLyricsCacheURLs = ["boringNotch-lyrics-cache.json"]
+        .map { temporaryDirectory.appendingPathComponent($0) }
     private var lyricsSaveTask: Task<Void, Never>?
 
     // Store last values at the time artwork was changed
@@ -491,6 +496,8 @@ class MusicManager: ObservableObject {
     }
 
     private func loadLyricsCache() {
+        // Drop caches written by older resolution logic so their (possibly wrong) lyrics can't win.
+        for legacy in Self.legacyLyricsCacheURLs { try? FileManager.default.removeItem(at: legacy) }
         guard let data = try? Data(contentsOf: Self.lyricsCacheURL),
               let dto = try? JSONDecoder().decode([String: LyricsCacheEntry].self, from: data) else { return }
         lyricsCache = dto.mapValues { entry in
