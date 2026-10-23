@@ -97,13 +97,17 @@ class BoringNotchXPCHelper: NSObject, BoringNotchXPCHelperProtocol {
     }
 
     @objc func setKeyboardBrightness(_ value: Float, with reply: @escaping (Bool) -> Void) {
-        reply(Self.keyboardClient.setBrightness(value))
+        guard value.isFinite else { reply(false); return }
+        reply(Self.keyboardClient.setBrightness(max(0, min(1, value))))
     }
     // MARK: - Screen Brightness (moved from client app into helper)
 
     @objc func isScreenBrightnessAvailable(with reply: @escaping (Bool) -> Void) {
         var b: Float = 0
-        reply(displayServicesGetBrightness(displayID: CGMainDisplayID(), out: &b) || ioServiceFor(displayID: CGMainDisplayID()) != nil)
+        if displayServicesGetBrightness(displayID: CGMainDisplayID(), out: &b) { reply(true); return }
+        guard let service = ioServiceFor(displayID: CGMainDisplayID()) else { reply(false); return }
+        IOObjectRelease(service)
+        reply(true)
     }
 
     @objc func currentScreenBrightness(with reply: @escaping (NSNumber?) -> Void) {
@@ -125,6 +129,7 @@ class BoringNotchXPCHelper: NSObject, BoringNotchXPCHelperProtocol {
     }
 
     @objc func setScreenBrightness(_ value: Float, with reply: @escaping (Bool) -> Void) {
+        guard value.isFinite else { reply(false); return }
         let clamped = max(0, min(1, value))
         if displayServicesSetBrightness(displayID: CGMainDisplayID(), value: clamped) {
             reply(true)

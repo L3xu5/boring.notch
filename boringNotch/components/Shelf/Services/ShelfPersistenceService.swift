@@ -1,81 +1,62 @@
-//
-//  ShelfPersistenceService.swift
-//  boringNotch
-//
-//  Created by Alexander on 2025-09-24.
-//
-
 import Foundation
+import BoringCore
 
-// Access model types
-@_exported import struct Foundation.URL
+protocol ShelfPersistenceProviding: Sendable {
+    func load() async throws -> [ShelfItem]
+    func save(_ items: [ShelfItem], revision: UInt64) async throws
+}
 
-
-final class ShelfPersistenceService {
+/// The persistence boundary owns encoding and disk IO on its actor, away from SwiftUI updates.
+actor ShelfPersistenceService: ShelfPersistenceProviding {
     static let shared = ShelfPersistenceService()
+    private let store: AtomicJSONStore<[ShelfItem]>?
+    private let fileURL: URL?
+    private var memoryItems: [ShelfItem] = []
+    private var memoryRevision: UInt64 = 0
+    private var permitsDiskWrites = false
+    enum PersistenceError: Error { case unreadStorage }
 
-    private let fileURL: URL
-    private let encoder = JSONEncoder()
-    private let decoder = JSONDecoder()
-
-    private init() {
-        let fm = FileManager.default
-        let support = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-        let dir = (support ?? fm.temporaryDirectory).appendingPathComponent("boringNotch", isDirectory: true).appendingPathComponent("Shelf", isDirectory: true)
-        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        fileURL = dir.appendingPathComponent("items.json")
-        encoder.outputFormatting = [.prettyPrinted]
-        decoder.dateDecodingStrategy = .iso8601
-        encoder.dateEncodingStrategy = .iso8601
+    init(fileURL: URL? = nil, liveURL: @Sendable () -> URL = { ShelfStorageEnvironment.liveShelfFileURL() }) {
+        // Even an explicitly injected inaccessible/live URL is ignored by an isolated preview.
+        // Do not query AppSupport, load legacy records or construct a disk actor before this gate.
+        guard !ShelfStorageEnvironment.isIsolatedPreview else {
+            self.fileURL = nil; store = nil
+            return
+        }
+        let location = fileURL ?? liveURL()
+        self.fileURL = location
+        store = AtomicJSONStore(fileURL: location)
     }
 
-    func load() -> [ShelfItem] {
-        guard let data = try? Data(contentsOf: fileURL) else { return [] }
-        
-        // Try to decode as array first (normal case)
-        if let items = try? decoder.decode([ShelfItem].self, from: data) {
+    func load() async throws -> [ShelfItem] {
+        guard let store, let fileURL else { return memoryItems }
+        permitsDiskWrites = false
+        do {
+            let items = try await store.load() ?? []
+            permitsDiskWrites = true
             return items
-        }
-        
-        // If array decoding fails, try to decode individual items
-        do {
-            // Parse as JSON array to get individual item data
-            guard let jsonArray = try JSONSerialization.jsonObject(with: data) as? [Any] else {
-                print("⚠️ Shelf persistence file is not a valid JSON array")
-                return []
-            }
-            
-            var validItems: [ShelfItem] = []
-            var failedCount = 0
-            
-            for (index, jsonItem) in jsonArray.enumerated() {
-                do {
-                    let itemData = try JSONSerialization.data(withJSONObject: jsonItem)
-                    let item = try decoder.decode(ShelfItem.self, from: itemData)
-                    validItems.append(item)
-                } catch {
-                    failedCount += 1
-                    print("⚠️ Failed to decode shelf item at index \(index): \(error.localizedDescription)")
-                }
-            }
-            
-            if failedCount > 0 {
-                print("📦 Successfully loaded \(validItems.count) shelf items, discarded \(failedCount) corrupted items")
-            }
-            
-            return validItems
         } catch {
-            print("❌ Failed to parse shelf persistence file: \(error.localizedDescription)")
-            return []
+            // Recover independently decodable records, preserving the original before a future
+            // successful write. A corrupt file must not silently disappear behind an empty list.
+            let data = try Data(contentsOf: fileURL)
+            let array = (try? JSONSerialization.jsonObject(with: data)) as? [Any] ?? []
+            let recovered = array.compactMap { value -> ShelfItem? in
+                guard let data = try? JSONSerialization.data(withJSONObject: value) else { return nil }
+                return try? JSONDecoder().decode(ShelfItem.self, from: data)
+            }
+            _ = try await store.quarantineCorruptFile()
+            _ = try await store.save(recovered, revision: 0)
+            permitsDiskWrites = true
+            return recovered
         }
     }
 
-    func save(_ items: [ShelfItem]) {
-        do {
-            let data = try encoder.encode(items)
-            try data.write(to: fileURL, options: Data.WritingOptions.atomic)
-        } catch {
-            print("Failed to save shelf items: \(error.localizedDescription)")
+    func save(_ items: [ShelfItem], revision: UInt64) async throws {
+        guard let store else {
+            if revision >= memoryRevision { memoryItems = items; memoryRevision = revision }
+            return
         }
+        guard permitsDiskWrites else { throw PersistenceError.unreadStorage }
+        _ = try await store.save(items, revision: revision)
     }
 }

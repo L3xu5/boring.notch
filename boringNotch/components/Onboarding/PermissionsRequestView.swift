@@ -14,6 +14,9 @@ struct PermissionRequestView: View {
     let privacyNote: String?
     let onAllow: () -> Void
     let onSkip: () -> Void
+    var isRequesting = false
+    var statusMessage: String? = nil
+    var allowTitle = "Allow Access"
 
     var body: some View {
         VStack(spacing: 28) {
@@ -23,10 +26,12 @@ struct PermissionRequestView: View {
                 .frame(width: 70, height: 56)
                 .foregroundColor(.effectiveAccent)
                 .padding(.top, 32)
+                .accessibilityHidden(true)
 
             Text(title)
                 .font(.title)
                 .fontWeight(.semibold)
+                .accessibilityAddTraits(.isHeader)
 
             Text(description)
                 .multilineTextAlignment(.center)
@@ -48,10 +53,18 @@ struct PermissionRequestView: View {
             HStack {
                 Button("Not Now") { onSkip() }
                     .buttonStyle(.bordered)
-                Button("Allow Access") { onAllow() }
+                    .keyboardShortcut(.cancelAction)
+                Button(allowTitle) { onAllow() }
                     .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isRequesting)
+                if isRequesting { ProgressView().controlSize(.small).accessibilityLabel("Waiting for permission") }
             }
             .padding(.top, 10)
+            if let statusMessage {
+                Text(statusMessage).font(.callout).foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center).padding(.horizontal)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
         .background(

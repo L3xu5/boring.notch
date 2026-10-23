@@ -1,133 +1,100 @@
-# Contributing
+# Contributing to this fork
 
-Thank you for taking the time to contribute! ❤️
+Target **`L3xu5/boring.notch`'s `main` branch** for code, documentation and pull requests. This fork has its own release workflow and contribution policy; upstream's `dev` branch and Crowdin process do not apply here. For a separate upstream contribution, follow upstream's instructions.
 
-These guidelines help streamline the contribution process for everyone involved. By following them, you'll make it easier for maintainers to review your work and collaborate with you effectively.
+## Development setup
 
-You can contribute in many ways: writing code, improving documentation, reporting bugs, requesting features, or creating tutorials and blog posts. Every contribution, large or small, helps make Boring Notch better.
+Use **Xcode 26.6**, the toolchain tested by this repository's macOS 26 CI. The app supports macOS 14 and later; releases include Apple Silicon and Intel architectures.
 
-## Table of Contents
+```bash
+git clone https://github.com/L3xu5/boring.notch.git
+cd boring.notch
+git switch -c feature/describe-the-change
+open boringNotch.xcodeproj
+```
 
-- [Localizations](#localizations)
-- [Contributing Code](#contributing-code)
-  - [Before You Start](#before-you-start)
-  - [Setting Up Your Environment](#setting-up-your-environment)
-  - [Making Changes](#making-changes)
-  - [Pull Requests](#pull-requests)
-<!-- - [Code Style Guidelines](#code-style-guidelines) -->
-- [Reporting Bugs](#reporting-bugs)
-- [Feature Requests](#feature-requests)
-- [Getting Help](#getting-help)
+Run the shared **boringNotch** scheme. The project uses filesystem-synchronized source groups, and both local packages resolve from `Packages/`. Add app Swift files to their feature directory; keep the shared scheme, local package references, resources and XPC embedding intact.
 
-## Localizations
+A command-line Debug build is available without a personal development team:
 
-Please submit all translations to [Crowdin](https://crowdin.com/project/boring-notch). New strings added to the `dev` branch from code changes will sync automatically to Crowdin, and Crowdin will automatically open a new PR with translations to allow us to integrate them.
+```bash
+xcodebuild -project boringNotch.xcodeproj -scheme boringNotch \
+  -configuration Debug -destination 'generic/platform=macOS' \
+  -derivedDataPath build -disableAutomaticPackageResolution build
+```
 
-## Contributing Code
+Debug uses ad-hoc signing and disables App Sandbox, as required by the same native integrations used in Release. Grant local builds permissions separately when testing those integrations. Debug does not automatically start Sparkle updates. Release uses the fork's stable signing identity and signed update feed; do not change those identities to make a local build work.
 
-### Before You Start
+## Architecture and ownership
 
-- **Check existing issues**: Before creating a new issue or starting work, search existing issues to avoid duplicates.
-- **Discuss major changes**: For significant features or major changes, please open an issue first to discuss your approach with maintainers and the community.
-<!-- - **Review the code style**: Familiarize yourself with our code style guidelines below to ensure consistency. -->
+| Area | Responsibility |
+| --- | --- |
+| `boringNotch/App/` | Application runtime, onboarding, per-display window ownership and shutdown. |
+| `boringNotch/components/` | Feature views and presentation state; settings pages remain separated by feature. |
+| `boringNotch/MediaControllers/` | Native player adapters, supervised media streams, AX/API clients, lyrics, artwork and recovery services. |
+| `boringNotch/managers/MusicManager.swift` | MainActor media facade consumed by the UI. |
+| `Packages/BoringCore/` | Strict Swift 6 value models, reducers, policies, bounded stores and testable service state machines. |
+| `Packages/BoringRPC/` | Shared Objective-C XPC protocol/schema used by the app and helper. |
+| `BoringNotchXPCHelper/` and `boringNotch/XPCHelperClient/` | Platform helper implementation and client connection/authorization lifetimes. |
+| `Tests/` and `.github/scripts/` | Native integration fixtures, release tests and canonical validation tools. |
 
-> [!IMPORTANT]
-> All code contributions must be based on the `dev` branch, not `main`. Documentation changes should be based on `main` instead.
+Put value-level logic in `BoringCore` and inject operating-system/network/storage boundaries. Native UI and OS integration stay in SwiftUI/AppKit adapters. Keep the XPC schema shared through `BoringRPC`, including its Objective-C runtime name; do not reintroduce copied app/helper protocols.
 
-### Setting Up Your Environment
+Every source, observer, process, socket, camera consumer and async operation needs a clear owner and stop path. Stop must cancel pending reads/reconnects and invalidate late replies. Keep AX IPC and expensive image work off the UI executor. Apply artwork to its current item/revision rather than restoring a captured playback snapshot.
 
-1. **Fork the repository**: Click the "Fork" button at the top of the repository page to create your own copy.
+Preserve these behavioral boundaries:
 
-2. **Clone your fork**:
-   ```bash
-   git clone https://github.com/{your-username}/boring.notch.git
-   cd boring.notch
-   ```
-   Replace `{your-username}` with your GitHub username.
+- Physical media keys always pass to macOS. Yandex recovery requires fresh, unchanged evidence and an accepted action receipt; it must not take control from Safari or another active/focused player.
+- Yandex commands target its own accessible controls. A missing control must not fall back to a global command for another media-session owner.
+- Display-local UI state belongs to its window. Shared capture/resources use explicit consumers; closing one display must not stop another display's camera preview.
+- First-run player initialization follows the user's source confirmation. Camera, calendar and account setup remain optional.
+- Persistent work uses app-owned paths and serialized atomic writes. Respect leases, current revisions and existing data when cleaning up or migrating.
 
-3. **Switch to the `dev` branch**:
-   ```bash
-   git checkout dev
-   ```
-   All code contributions must be based on the `dev` branch, not `main`. Documentation changes should be based on `main` instead.
+Keep bundle/helper IDs, raw preference/source/shortcut identifiers, Keychain service/account, signing identity and Sparkle keys compatible with installed releases. Versioned caches may migrate existing data; retain recoverable originals until a new save succeeds.
 
-5. **Create a new feature branch**:
-   ```bash
-   git checkout -b feature/{your-feature-name}
-   ```
-   Replace `{your-feature-name}` with a descriptive name. Use lowercase letters, numbers, and hyphens only (e.g., `feature/add-dark-mode` or `fix/notification-crash`).
+## Checks
 
-### Making Changes
+From the repository root:
 
-1. **Make your changes**: Implement your feature or bug fix. Write clean, well-documented code <!-- following the project's style guidelines. -->
+```bash
+python3 .github/scripts/check_project.py
+```
 
-2. **Test your changes**: Ensure your changes work as expected and don't break existing functionality.
+The default runs release/tooling Python tests, native `BoringCore` SwiftPM tests and every native platform suite. Native checks compile the real Swift 6 package once and verify source, package, compiler/SDK and archive/module fingerprints before reusing it in fixtures.
 
-3. **Commit your changes**:
-   ```bash
-   git add .
-   git commit -m "Add descriptive commit message"
-   ```
-   Write clear, concise commit messages that explain what your changes do and why.
+```bash
+python3 .github/scripts/check_project.py --python-only  # Linux or macOS
+python3 .github/scripts/check_project.py --native-only  # macOS with Xcode
+```
 
-4. **Keep your branch up to date**:
-   Regularly sync your branch with the latest changes from the `dev` branch to avoid conflicts.
+The current test count is printed by the command. Add regressions to the real module/service boundary: fake HTTP sessions, process/AX providers, clocks, credentials and device state instead of copying algorithms into tests. Keep existing lifecycle, metadata ordering, native-key, migration and publication scenarios. Standalone native scripts still work when diagnosing one boundary.
 
-5. **Push to your fork**:
-   ```bash
-   git push origin feature/{your-feature-name}
-   ```
+Automated checks must not issue commands to real players, read real account credentials, install event taps or request camera/calendar/Accessibility permissions. Live integration checks are a separate, intentional manual step. Check the Debug build too, and compile Release/universal when changing project settings, packaging or platform interfaces.
 
-### Pull Requests
+## Debug UI snapshots
 
-1. **Create a pull request**: Go to the original repository and click "New Pull Request." Select your feature branch and set the base branch to `dev`.
+Use a **Debug build** to render settings, onboarding and notch fixtures:
 
-2. **Write a detailed description**: Your PR should include:
-   - A clear title summarizing the changes
-   - A detailed description of what was changed and why
-   - Reference to any related issues (e.g., "Fixes #123" or "Relates to #456")
-   - Screenshots or screen recordings for UI changes
+```bash
+python3 .github/scripts/preview_ui.py \
+  --app "build/Build/Products/Debug/Boring Notch.app" \
+  --output /tmp/boring-notch-ui
+```
 
-3. **Respond to feedback**: Maintainers may request changes.
+The script creates and ad-hoc signs an isolated copy with the preview bundle ID. Debug snapshot mode uses stopped application services, empty in-memory credentials and isolated in-memory Shelf state; it does not migrate the real token or start playback/capture. The installed app and its identity are not replaced. Use `--help` for page and appearance options. Release binaries do not enable developer snapshot mode.
 
-4. **Be patient**: Reviews take time. Maintainers will get to your PR as soon as they can.
+## Language boundary and Rust assessment
 
-<!-- ## Code Style Guidelines
+Version 3 retains SwiftUI/AppKit UI, native Swift adapters and a strict Swift 6 Core. A full Rust rewrite was not selected: the required work was ownership, cancellation and OS integration, and changing languages would still require those platform lifetimes to be designed and verified.
 
-- Follow the existing code style and conventions used in the project
-- Write clear, self-documenting code with meaningful variable and function names
-- Add comments for complex logic or non-obvious implementations
-- Ensure your code is properly formatted before committing
-- Remove any debugging code, console logs, or commented-out code before submitting -->
+An isolated Swift–Rust prototype scanned LRC timestamp statistics. It did not allocate the production lyric/state models or exercise async services, UI, device ownership or end-to-end application performance. Its timings are not an app benchmark. A future engine could use the replaceable value/event boundary after representative measurements and lifecycle tests. The [official UniFFI cancellation guide](https://mozilla.github.io/uniffi-rs/latest/futures.html#cancelling-async-code) describes library-specific cancellation channels; bindings alone do not replace the app's cancellation and revision guards. Rust is not required to build or run this version.
 
-## Reporting Bugs
+## Pull requests, translations and reports
 
-When reporting bugs, please include:
+Keep a change reviewable: describe the concrete problem, resulting behavior, relevant tests and any manual platform verification. Include snapshots for visible UI changes. Avoid rebasing published `main`, because release build numbers derive from its full commit count.
 
-- A clear, descriptive title
-- Steps to reproduce the issue
-- Expected behavior vs. actual behavior
-- Screenshots or error messages if applicable
-- Your environment details (OS version, app version, etc.)
+Edit translations in `boringNotch/Localizable.xcstrings`; this fork does not run Crowdin synchronization. Preserve existing keys and placeholders when updating strings.
 
-## Feature Requests
+Use [this fork's issues](https://github.com/L3xu5/boring.notch/issues) for reproducible bugs and feature requests. Include macOS/app version, selected player, relevant permission state and reproduction steps. Remove tokens and private file/account information from logs and screenshots. Report security findings privately through [SECURITY.md](SECURITY.md).
 
-Feature requests are welcome! Please:
-
-- Check if the feature has already been requested
-- Clearly describe the feature and its use case
-- Explain why this feature would be valuable to users
-- Be open to discussion and alternative approaches
-
-## Getting Help
-
-If you need help or have questions:
-
-- Check the project documentation
-- Search existing issues for similar questions
-- Open a new issue with the "question" label
-- Join our [community Discord server](https://discord.com/servers/boring-notch-1269588937320566815)
-
----
-
-Thank you for contributing to Boring Notch! Your efforts help make this project better for everyone. 🎉
+Keep upstream credits, GPLv3 terms and third-party notices when contributing code or assets.

@@ -6,6 +6,7 @@
     //
 
 import Foundation
+import BoringCore
 
 
 
@@ -13,32 +14,26 @@ extension Date {
     static var yesterday: Date { return Date().dayBefore }
     static var tomorrow:  Date { return Date().dayAfter }
     var dayBefore: Date {
-        return Calendar.current.date(byAdding: .day, value: -1, to: noon)!
+        return Calendar.current.date(byAdding: .day, value: -1, to: noon) ?? self
     }
     var dayAfter: Date {
-        return Calendar.current.date(byAdding: .day, value: 1, to: noon)!
+        return Calendar.current.date(byAdding: .day, value: 1, to: noon) ?? self
     }
     var noon: Date {
-        return Calendar.current.date(bySettingHour: 12, minute: 0, second: 0, of: self)!
+        return Calendar.current.date(bySettingHour: 12, minute: 0, second: 0, of: self) ?? self
     }
     
     var date: String {
-        let dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "dd"
-        return dateFormatter.string(from: self)
+        formatted(.dateTime.day(.twoDigits))
     }
     
     var month: String {
-        let dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "MMMM"
-        return dateFormatter.string(from: self)
+        formatted(.dateTime.month(.wide))
     }
     
     func dayOfTheWeek(dayOfWeek: Int) -> String {
-        let dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "EEE"
         let date = Calendar.current.date(bySetting: .weekday, value: dayOfWeek, of: self) ?? self
-        return dateFormatter.string(from: date)
+        return date.formatted(.dateTime.weekday(.abbreviated))
     }
 }
 
@@ -46,10 +41,12 @@ extension NSSize {
     var s: String { "\(width.i)×\(height.i)" }
     
     var aspectRatio: Double {
-        width / height
+        guard width.isFinite, height.isFinite, height > 0 else { return 0 }
+        return width / height
     }
     func scaled(by factor: Double) -> CGSize {
-        CGSize(width: (width * factor).evenInt, height: (height * factor).evenInt)
+        guard factor.isFinite, factor >= 0, width.isFinite, height.isFinite else { return .zero }
+        return CGSize(width: max(0, (width * factor).evenInt), height: max(0, (height * factor).evenInt))
     }
     
 }
@@ -69,12 +66,11 @@ extension Double {
     }
     
     @inline(__always) @inlinable var i: Int {
-        Int(self)
+        FiniteNumericConversion.integer(Double(self))
     }
     
     var evenInt: Int {
-        let x = intround
-        return x + x % 2
+        FiniteNumericConversion.evenInteger(Double(self))
     }
 }
 
@@ -84,11 +80,10 @@ extension CGFloat {
     }
     
     @inline(__always) @inlinable var i: Int {
-        Int(self)
+        FiniteNumericConversion.integer(Double(self))
     }
     
     var evenInt: Int {
-        let x = intround
-        return x + x % 2
+        FiniteNumericConversion.evenInteger(Double(self))
     }
 }

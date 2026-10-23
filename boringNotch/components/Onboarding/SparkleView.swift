@@ -10,6 +10,19 @@ import AppKit
 
 class SparkleNSView: NSView {
     private var emitterLayer: CAEmitterLayer?
+    private var animationAllowed = true
+
+    func setAnimationAllowed(_ allowed: Bool) {
+        animationAllowed = allowed
+        let active = allowed && window != nil
+        emitterLayer?.birthRate = active ? 1 : 0
+        emitterLayer?.isHidden = !active
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        setAnimationAllowed(animationAllowed)
+    }
     
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -55,8 +68,6 @@ class SparkleNSView: NSView {
         emitterLayer.emitterPosition = CGPoint(x: bounds.width / 2, y: bounds.height / 2)
         
         // Adjust birth rate based on view size
-        let area = bounds.width * bounds.height
-        let baseBirthRate: Float = 50
         let adjustedBirthRate = 20 // Assuming 200x200 as base size
         emitterLayer.emitterCells?.first?.birthRate = Float(adjustedBirthRate)
     }
@@ -68,9 +79,14 @@ class SparkleNSView: NSView {
 }
 
 struct SparkleView: NSViewRepresentable {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     func makeNSView(context: Context) -> SparkleNSView {
-        return SparkleNSView()
+        let view = SparkleNSView()
+        view.setAnimationAllowed(!reduceMotion)
+        return view
     }
     
-    func updateNSView(_ nsView: SparkleNSView, context: Context) {}
+    func updateNSView(_ nsView: SparkleNSView, context: Context) { nsView.setAnimationAllowed(!reduceMotion) }
+
+    static func dismantleNSView(_ nsView: SparkleNSView, coordinator: ()) { nsView.setAnimationAllowed(false) }
 }

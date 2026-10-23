@@ -9,16 +9,20 @@ import Defaults
 import SwiftUI
 
 struct TabModel: Identifiable {
-    let id = UUID()
+    var id: NotchViews { view }
     let label: String
     let icon: String
     let view: NotchViews
 }
 
 struct TabSelectionView: View {
+    @EnvironmentObject private var vm: BoringViewModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject var coordinator = BoringViewCoordinator.shared
     @ObservedObject var musicManager = MusicManager.shared
+    @ObservedObject private var shelf = ShelfStateViewModel.shared
     @Default(.enableLyrics) var enableLyrics
+    @Default(.boringShelf) private var shelfEnabled
     @Namespace var animation
 
     // A Lyrics tab appears only when synced lyrics are actually available for the current track.
@@ -27,35 +31,48 @@ struct TabSelectionView: View {
         if enableLyrics, !musicManager.syncedLyrics.isEmpty {
             result.append(TabModel(label: "Lyrics", icon: "quote.bubble.fill", view: .lyrics))
         }
-        result.append(TabModel(label: "Shelf", icon: "tray.fill", view: .shelf))
+        if shelfEnabled { result.append(TabModel(label: "Shelf", icon: "tray.fill", view: .shelf)) }
         return result
     }
 
     var body: some View {
         HStack(spacing: 0) {
+            if coordinator.alwaysShowTabs || tabs.contains(where: { $0.view == .lyrics }) || (shelfEnabled && !shelf.isEmpty) {
             ForEach(tabs) { tab in
-                    TabButton(label: tab.label, icon: tab.icon, selected: coordinator.currentView == tab.view) {
-                        withAnimation(.smooth) {
-                            coordinator.currentView = tab.view
+                    TabButton(label: tab.label, icon: tab.icon, selected: vm.currentView == tab.view) {
+                        withAnimation(reduceMotion ? nil : .smooth) {
+                            vm.currentView = tab.view
                         }
                     }
                     .frame(height: 26)
-                    .foregroundStyle(tab.view == coordinator.currentView ? .white : .gray)
+                    .foregroundStyle(tab.view == vm.currentView ? .white : .gray)
                     .background {
-                        if tab.view == coordinator.currentView {
+                        if tab.view == vm.currentView {
                             Capsule()
-                                .fill(coordinator.currentView == tab.view ? Color(nsColor: .secondarySystemFill) : Color.clear)
+                                .fill(Color(nsColor: .secondarySystemFill))
                                 .matchedGeometryEffect(id: "capsule", in: animation)
                         } else {
                             Capsule()
-                                .fill(coordinator.currentView == tab.view ? Color(nsColor: .secondarySystemFill) : Color.clear)
+                                .fill(Color.clear)
                                 .matchedGeometryEffect(id: "capsule", in: animation)
                                 .hidden()
                         }
                     }
             }
+            }
         }
         .clipShape(Capsule())
+        .onAppear { validateSelection() }
+        .onChange(of: tabs.map(\.id)) { _, _ in validateSelection() }
+        .onChange(of: coordinator.alwaysShowTabs) { _, showing in
+            if !showing && !tabs.contains(where: { $0.view == .lyrics }) && shelf.isEmpty {
+                vm.currentView = .home
+            }
+        }
+    }
+
+    private func validateSelection() {
+        if !tabs.contains(where: { $0.view == vm.currentView }) { vm.currentView = .home }
     }
 }
 

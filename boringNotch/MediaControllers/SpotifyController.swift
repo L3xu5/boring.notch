@@ -13,12 +13,12 @@ class SpotifyController: MediaControllerProtocol {
     func setFavorite(_ favorite: Bool) async {
         //Placeholder
     }
-    
+
     // MARK: - Properties
     @Published private var playbackState: PlaybackState = PlaybackState(
         bundleIdentifier: "com.spotify.client"
     )
-    
+
     var playbackStatePublisher: AnyPublisher<PlaybackState, Never> {
         $playbackState.eraseToAnyPublisher()
     }
@@ -30,39 +30,64 @@ class SpotifyController: MediaControllerProtocol {
     var supportsFavorite: Bool { false }
 
     private var notificationTask: Task<Void, Never>?
-    
+    private var applicationObserver: MediaApplicationObserver?
+    private var refreshID = UUID()
+    private var stopped = false
+    private let playbackInfoProvider: (@MainActor () async throws -> NSAppleEventDescriptor?)?
+    private let fetchArtwork: @Sendable (URL) async throws -> Data
+    private let runningApplication: @MainActor () -> Bool
+
     // Constant for time between command and update
     private let commandUpdateDelay: Duration = .milliseconds(25)
 
     private var lastArtworkURL: String?
     private var artworkFetchTask: Task<Void, Never>?
-    
-    init() {
+    private var artworkRequestID = UUID()
+
+    init(playbackInfo: (@MainActor () async throws -> NSAppleEventDescriptor?)? = nil,
+         image: @escaping @Sendable (URL) async throws -> Data = { try await ImageService.shared.fetchImageData(from: $0) },
+         isRunning: @escaping @MainActor () -> Bool = {
+             NSWorkspace.shared.runningApplications.contains { $0.bundleIdentifier == "com.spotify.client" }
+         }, observeChanges: Bool = true) {
+        self.playbackInfoProvider = playbackInfo
+        self.fetchArtwork = image
+        self.runningApplication = isRunning
+        guard observeChanges else { return }
         setupPlaybackStateChangeObserver()
+        applicationObserver = MediaApplicationObserver(bundleIdentifier: "com.spotify.client") { [weak self] in
+            Task { @MainActor [weak self] in await self?.updatePlaybackInfo() }
+        }
         Task {
             if isActive() {
                 await updatePlaybackInfo()
             }
         }
     }
-    
+
     private func setupPlaybackStateChangeObserver() {
         notificationTask = Task { @Sendable [weak self] in
             let notifications = DistributedNotificationCenter.default().notifications(
                 named: NSNotification.Name("com.spotify.client.PlaybackStateChanged")
             )
-            
+
             for await _ in notifications {
                 await self?.updatePlaybackInfo()
             }
         }
     }
-    
+
     deinit {
         notificationTask?.cancel()
         artworkFetchTask?.cancel()
     }
-    
+
+    func stop() {
+        stopped = true; refreshID = UUID(); artworkRequestID = UUID()
+        notificationTask?.cancel(); notificationTask = nil
+        artworkFetchTask?.cancel(); artworkFetchTask = nil
+        applicationObserver?.stop(); applicationObserver = nil
+    }
+
     // MARK: - Protocol Implementation
     func play() async { await executeCommand("play") }
     func pause() async { await executeCommand("pause") }
@@ -71,19 +96,19 @@ class SpotifyController: MediaControllerProtocol {
     func previousTrack() async {
         await executeAndRefresh("previous track")
     }
-    
+
     func seek(to time: Double) async {
         await executeAndRefresh("set player position to \(time)")
     }
-    
+
     func toggleShuffle() async {
         await executeAndRefresh("set shuffling to not shuffling")
     }
-    
+
     func toggleRepeat() async {
         await executeAndRefresh("set repeating to not repeating")
     }
-    
+
     func setVolume(_ level: Double) async {
         let clampedLevel = max(0.0, min(1.0, level))
         let volumePercentage = Int(clampedLevel * 100)
@@ -91,15 +116,24 @@ class SpotifyController: MediaControllerProtocol {
         try? await Task.sleep(for: commandUpdateDelay)
         await updatePlaybackInfo()
     }
-    
+
     func isActive() -> Bool {
-        NSWorkspace.shared.runningApplications.contains { $0.bundleIdentifier == playbackState.bundleIdentifier }
+        !stopped && runningApplication()
     }
-    
+
     func updatePlaybackInfo() async {
+        guard !stopped, !Task.isCancelled else { return }
+        guard isActive() else {
+            artworkRequestID = UUID()
+            artworkFetchTask?.cancel(); artworkFetchTask = nil
+            playbackState = PlaybackState(bundleIdentifier: "com.spotify.client")
+            return
+        }
+        let request = UUID(); refreshID = request
         guard let descriptor = try? await fetchPlaybackInfoAsync() else { return }
+        guard !stopped, !Task.isCancelled, refreshID == request else { return }
         guard descriptor.numberOfItems >= 10 else { return }
-        
+
         let isPlaying = descriptor.atIndex(1)?.booleanValue ?? false
         let currentTrack = descriptor.atIndex(2)?.stringValue ?? "Unknown"
         let currentTrackArtist = descriptor.atIndex(3)?.stringValue ?? "Unknown"
@@ -110,7 +144,7 @@ class SpotifyController: MediaControllerProtocol {
         let isRepeating = descriptor.atIndex(8)?.booleanValue ?? false
         let volumePercentage = descriptor.atIndex(9)?.int32Value ?? 50
         let artworkURL = descriptor.atIndex(10)?.stringValue ?? ""
-        
+
         var state = PlaybackState(
             bundleIdentifier: "com.spotify.client",
             isPlaying: isPlaying,
@@ -127,41 +161,36 @@ class SpotifyController: MediaControllerProtocol {
             volume: Double(volumePercentage) / 100.0
         )
 
-        if artworkURL == lastArtworkURL, let existingArtwork = self.playbackState.artwork {
-            state.artwork = existingArtwork
+        let sameArtwork = artworkURL == lastArtworkURL
+        let changedIdentity = state.identity != playbackState.identity
+        if sameArtwork { state.artwork = playbackState.artwork }
+        // A completed A request must not occupy B's slot forever just because both tracks
+        // refer to the same cover URL. Ready bytes may be reused; pending work is rebound.
+        if !sameArtwork || changedIdentity {
+            artworkRequestID = UUID()
+            artworkFetchTask?.cancel(); artworkFetchTask = nil
+            lastArtworkURL = artworkURL
         }
-
-    playbackState = state
-
-        if !artworkURL.isEmpty, let url = URL(string: artworkURL) {
-            guard artworkURL != lastArtworkURL || state.artwork == nil else { return }
-            artworkFetchTask?.cancel()
-
-            let currentState = state
-
-            artworkFetchTask = Task {
-                do {
-                    let data = try await ImageService.shared.fetchImageData(from: url)
-
-                    await MainActor.run { [weak self] in
-                        guard let self = self else { return }
-                        var updatedState = currentState
-                        updatedState.artwork = data
-                        self.playbackState = updatedState
-                        self.lastArtworkURL = artworkURL
-                        self.artworkFetchTask = nil
-                    }
-                } catch {
-                    await MainActor.run { [weak self] in
-                        self?.artworkFetchTask = nil
-                    }
-                }
+        playbackState = state
+        guard !artworkURL.isEmpty, let url = URL(string: artworkURL), state.artwork == nil, artworkFetchTask == nil else { return }
+        let identity = state.identity
+        let artworkRequest = UUID(); artworkRequestID = artworkRequest
+        artworkFetchTask = Task { @MainActor [weak self, fetchArtwork] in
+            defer {
+                if let self, self.artworkRequestID == artworkRequest { self.artworkFetchTask = nil }
             }
+            do {
+                let data = try await fetchArtwork(url)
+                guard !Task.isCancelled, let self, !self.stopped,
+                      self.playbackState.identity == identity, self.lastArtworkURL == artworkURL,
+                      self.artworkRequestID == artworkRequest else { return }
+                self.playbackState.artwork = data
+            } catch { /* the current request releases its own slot; a later update can retry */ }
         }
     }
-    
+
 // MARK: - Private Methods
-    
+
     private func executeCommand(_ command: String) async {
         let script = "tell application \"Spotify\" to \(command)"
         try? await AppleScriptHelper.executeVoid(script)
@@ -172,8 +201,9 @@ class SpotifyController: MediaControllerProtocol {
         try? await Task.sleep(for: commandUpdateDelay)
         await updatePlaybackInfo()
     }
-    
+
     private func fetchPlaybackInfoAsync() async throws -> NSAppleEventDescriptor? {
+        if let playbackInfoProvider { return try await playbackInfoProvider() }
         let script = """
         tell application "Spotify"
             set isRunning to true
@@ -194,8 +224,8 @@ class SpotifyController: MediaControllerProtocol {
             end try
         end tell
         """
-        
+
         return try await AppleScriptHelper.execute(script)
     }
-    
+
 }

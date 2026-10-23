@@ -3,10 +3,10 @@ name: Validate fork
 on:
   push:
     branches: [main]
-    paths: ['.github/**', 'boringNotch/**', 'Tests/**']
+    paths: ['.github/**', 'boringNotch/**', 'BoringNotchXPCHelper/**', 'Packages/**', 'Tests/**', 'boringNotch.xcodeproj/**', 'Configuration/**']
   pull_request:
     branches: [main]
-    paths: ['.github/**', 'boringNotch/**', 'Tests/**']
+    paths: ['.github/**', 'boringNotch/**', 'BoringNotchXPCHelper/**', 'Packages/**', 'Tests/**', 'boringNotch.xcodeproj/**', 'Configuration/**']
   workflow_dispatch: {}
 
 permissions:
@@ -22,7 +22,7 @@ jobs:
       - name: Test release scripts
         env:
           PYTHONDONTWRITEBYTECODE: '1'
-        run: python3 -m unittest discover -s .github/scripts/tests -v
+        run: python3 .github/scripts/check_project.py --python-only
 
   app-helpers:
     runs-on: macos-26
@@ -33,17 +33,12 @@ jobs:
       - uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: '26.6'
-      - name: Test Yandex authentication and token migration
-        run: python3 .github/scripts/run_yandex_auth_tests.py
-      - name: Test lyrics selection and request cancellation
-        run: python3 .github/scripts/test_lyrics.py
-      - name: Test track metadata and artwork transitions
-        run: python3 .github/scripts/test_music_metadata.py
-      - name: Test fragmented MediaRemote stream decoding
-        run: python3 .github/scripts/test_media_stream.py
-      - name: Test hardware media key routing
-        run: python3 .github/scripts/test_media_keys.py
-      - name: Test conservative native media-key recovery
-        run: python3 .github/scripts/test_media_key_recovery.py
-      - name: Test Yandex metadata stream and fallback parsing
-        run: python3 .github/scripts/test_yandex_metadata.py
+      - name: Test Swift 6 Core and native integration boundaries
+        run: python3 .github/scripts/check_project.py --native-only
+      - name: Compile the application in Debug
+        run: |
+          xcodebuild -project boringNotch.xcodeproj -scheme boringNotch \
+            -configuration Debug -destination 'generic/platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/boring-debug" \
+            -disableAutomaticPackageResolution ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build

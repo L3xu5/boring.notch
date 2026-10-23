@@ -26,6 +26,13 @@ class AudioSpectrum: NSView {
         setupBars()
     }
 
+    deinit { animationTimer?.invalidate() }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil { stopAnimating() } else if isPlaying { startAnimating() }
+    }
+
     private func setupBars() {
         let barWidth: CGFloat = 2
         let barCount = 4
@@ -55,7 +62,7 @@ class AudioSpectrum: NSView {
     }
     
     private func startAnimating() {
-        guard animationTimer == nil else { return }
+        guard animationTimer == nil, window != nil else { return }
         animationTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
             self?.updateBars()
         }
@@ -106,15 +113,20 @@ class AudioSpectrum: NSView {
 
 struct AudioSpectrumView: NSViewRepresentable {
     @Binding var isPlaying: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     
     func makeNSView(context: Context) -> AudioSpectrum {
         let spectrum = AudioSpectrum()
-        spectrum.setPlaying(isPlaying)
+        spectrum.setPlaying(isPlaying && !reduceMotion)
         return spectrum
     }
     
     func updateNSView(_ nsView: AudioSpectrum, context: Context) {
-        nsView.setPlaying(isPlaying)
+        nsView.setPlaying(isPlaying && !reduceMotion)
+    }
+
+    static func dismantleNSView(_ nsView: AudioSpectrum, coordinator: ()) {
+        nsView.setPlaying(false)
     }
 }
 

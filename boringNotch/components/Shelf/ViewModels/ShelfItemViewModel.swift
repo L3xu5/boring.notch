@@ -19,26 +19,40 @@ final class ShelfItemViewModel: ObservableObject {
     @Published var isDropTargeted: Bool = false
     @Published var isRenaming: Bool = false
     @Published var draftTitle: String = ""
-    private var sharingLifecycle: SharingLifecycleDelegate?
-    private var quickShareLifecycle: SharingLifecycleDelegate?
-    private var sharingAccessingURLs: [URL] = []
-    private static var copiedURLs: [URL] = []
+    @Published private(set) var displayName = ""
+    @Published private(set) var fallbackIcon = NSImage(systemSymbolName: "doc", accessibilityDescription: nil) ?? NSImage()
 
     private let selection = ShelfSelectionModel.shared
 
     init(item: ShelfItem) {
         self.item = item
-        self.draftTitle = item.displayName
-        Task { await loadThumbnail() }
+        self.draftTitle = ""
+        switch item.kind {
+        case .file: self.displayName = "File"
+        case .text(let text): self.displayName = text
+        case .link(let url): self.displayName = url.absoluteString
+        }
     }
 
     var isSelected: Bool { selection.isSelected(item.id) }
 
+    func update(item: ShelfItem) {
+        guard self.item != item else { return }
+        self.item = item
+        self.thumbnail = nil
+    }
+
     func loadThumbnail() async {
-        guard let url = item.fileURL else { return }
-        if let image = await ThumbnailService.shared.thumbnail(for: url, size: CGSize(width: 56, height: 56)) {
-            self.thumbnail = image
-        }
+        let snapshot = item
+        let details = await ShelfMetadataService.shared.details(for: snapshot)
+        guard !Task.isCancelled, item == snapshot else { return }
+        displayName = details.displayName
+        draftTitle = details.displayName
+        guard let url = details.fileURL else { return }
+        fallbackIcon = NSWorkspace.shared.icon(forFile: url.path)
+        let image = await ThumbnailService.shared.thumbnail(for: url, size: CGSize(width: 56, height: 56))
+        guard !Task.isCancelled, item == snapshot else { return }
+        thumbnail = image
     }
 
     // MARK: - Drag & Drop helpers
@@ -122,55 +136,18 @@ final class ShelfItemViewModel: ObservableObject {
     }
 
     func shareItem(from view: NSView?) {
+        let selected = selection.selectedItems(in: ShelfStateViewModel.shared.items)
+        let payload: [Any] = selected.compactMap { item in
+            switch item.kind {
+            case .file: return ShelfStateViewModel.shared.resolveAndUpdateBookmark(for: item)
+            case .text(let text): return text
+            case .link(let url): return url
+            }
+        }
         Task {
-            var itemsToShare: [Any] = []
-            var fileURLs: [URL] = []
-            if case .text(let text) = item.kind {
-                itemsToShare.append(text)
-            } else {
-                for item in ShelfSelectionModel.shared.selectedItems(in: ShelfStateViewModel.shared.items) {
-                    switch item.kind {
-                    case .file:
-                        // Use immediate update for user-initiated share action
-                        if let url = ShelfStateViewModel.shared.resolveAndUpdateBookmark(for: item) {
-                            itemsToShare.append(url)
-                            fileURLs.append(url)
-                        }
-                    case .text(let string):
-                        itemsToShare.append(string)
-                    case .link(let url):
-                        itemsToShare.append(url)
-                    }
-                }
-            }
-            
-            guard !itemsToShare.isEmpty else { return }
-             
-            stopSharingAccessingURLs()
-            // Start security-scoped access for all file URLs and keep it active during sharing
-            sharingAccessingURLs = fileURLs.filter { $0.startAccessingSecurityScopedResource() }
-            
-            // Create and retain lifecycle delegate for the entire share operation
-            let lifecycle = SharingStateManager.shared.makeDelegate { [weak self] in
-                self?.sharingLifecycle = nil
-                self?.stopSharingAccessingURLs()
-            }
-            self.sharingLifecycle = lifecycle
-            
-            let picker = NSSharingServicePicker(items: itemsToShare)
-            picker.delegate = lifecycle
-            lifecycle.markPickerBegan()
-            if let view {
-                picker.show(relativeTo: .zero, of: view, preferredEdge: .minY)
-            }
+            await QuickShareService.shared.shareFilesOrText(payload,
+                using: QuickShareProvider(id: "System Share Menu", imageData: nil, supportsRawText: true), from: view)
         }
-    }
-    
-    private func stopSharingAccessingURLs() {
-        for url in sharingAccessingURLs {
-            url.stopAccessingSecurityScopedResource()
-        }
-        sharingAccessingURLs.removeAll()
     }
 
     /// Call this closure to request a QuickLook preview for the given URLs.
@@ -222,7 +199,6 @@ final class ShelfItemViewModel: ObservableObject {
             if case .link(let url) = itm.kind { return url }
             return nil
         }
-        let selectedFolderURLs = selectedFileURLs.filter { isDirectory($0) }
         // URLs valid for Open/Open With (exclude folders)
         let selectedOpenableURLs = selectedItems.compactMap { itm -> URL? in
             if let u = itm.fileURL { return isDirectory(u) ? nil : u }
@@ -404,7 +380,6 @@ final class ShelfItemViewModel: ObservableObject {
         unowned let viewModel: ShelfItemViewModel
 
         // Keep associated objects (like accessory view handlers) without magic keys
-        private static var sliderHandlerAssoc = AssociatedObject<AnyObject>()
 
         init(item: ShelfItem, view: NSView, viewModel: ShelfItemViewModel) {
             self.item = item
@@ -509,49 +484,22 @@ final class ShelfItemViewModel: ObservableObject {
 
             case "Copy":
                 let selected = ShelfSelectionModel.shared.selectedItems(in: ShelfStateViewModel.shared.items)
-                let pb = NSPasteboard.general
-                
-                // Stop accessing previously copied URLs
-                for url in ShelfItemViewModel.copiedURLs {
-                    url.stopAccessingSecurityScopedResource()
-                }
-                ShelfItemViewModel.copiedURLs.removeAll()
-                
-                pb.clearContents()
-                Task {
-                    let fileURLs = await selected.asyncCompactMap { item -> URL? in
-                        if case .file = item.kind {
-                            return ShelfStateViewModel.shared.resolveAndUpdateBookmark(for: item)
-                        }
-                        return nil
-                    }
-                    if !fileURLs.isEmpty {
-                        // Start security-scoped access for all URLs and keep them active
-                        ShelfItemViewModel.copiedURLs = fileURLs.filter { $0.startAccessingSecurityScopedResource() }
-                        NSLog("🔐 Started security-scoped access for \(ShelfItemViewModel.copiedURLs.count) copied files")
-                        
-                        // Write to pasteboard
-                        pb.writeObjects(fileURLs as [NSURL])
-                    } else {
-                        let strings = selected.map { $0.displayName }
-                        if !strings.isEmpty {
-                            pb.setString(strings.joined(separator: "\n"), forType: .string)
-                        }
-                    }
-                }
+                let fileURLs = selected.compactMap { $0.fileURL }
+                let text = selected.map { $0.displayName }.joined(separator: "\n")
+                Task { await ShelfClipboardService.shared.copy(fileURLs: fileURLs, fallbackText: text) }
 
             case "Remove":
                 let selected = ShelfSelectionModel.shared.selectedItems(in: ShelfStateViewModel.shared.items)
                 for it in selected { ShelfActionService.remove(it) }
                 
             case "Remove Background":
-                handleRemoveBackground()
+                ShelfImageActions.removeBackground()
                 
             case "Convert Image…":
-                showConvertImageDialog()
+                ShelfImageActions.showConversionDialog()
                 
             case "Create PDF":
-                handleCreatePDF()
+                ShelfImageActions.createPDF()
             
             case "Compress":
                 let selected = ShelfSelectionModel.shared.selectedItems(in: ShelfStateViewModel.shared.items)
@@ -559,21 +507,10 @@ final class ShelfItemViewModel: ObservableObject {
                 guard !fileURLs.isEmpty else { break }
 
                 Task {
-                    do {
-                        // Create ZIP in a temporary location while holding access to selected resources
-                        if let zipTempURL = try await fileURLs.accessSecurityScopedResources(accessor: { urls in
-                            await TemporaryFileStorageService.shared.createZip(from: urls)
-                        }) {
-                            if let bookmark = try? Bookmark(url: zipTempURL) {
-                                let newItem = ShelfItem(kind: .file(bookmark: bookmark.data), isTemporary: true)
-                                ShelfStateViewModel.shared.add([newItem])
-                            } else {
-                                // Fallback: reveal the temporary file in Finder
-                                NSWorkspace.shared.activateFileViewerSelecting([zipTempURL])
-                            }
-                        }
-                    } catch {
-                        print("❌ Compress failed: \(error)")
+                    if let result = await fileURLs.accessSecurityScopedResources(accessor: { urls in
+                        await TemporaryFileStorageService.shared.createZip(from: urls)
+                    }) {
+                        await ShelfStateViewModel.shared.addGeneratedFile(at: result)
                     }
                 }
                 
@@ -690,7 +627,8 @@ final class ShelfItemViewModel: ObservableObject {
             panel.isAccessoryViewDisclosed = true
 
             // Wire up popup to switch filter mode
-            class PopupBinder: NSObject {
+            @MainActor
+            final class PopupBinder: NSObject {
                 weak var popup: NSPopUpButton?
                 weak var chooserDelegate: AppChooserDelegate?
                 weak var panel: NSOpenPanel?
@@ -699,7 +637,10 @@ final class ShelfItemViewModel: ObservableObject {
                     self.chooserDelegate = chooserDelegate
                     self.panel = panel
                 }
-                @objc func changed(_ sender: Any?) {
+                @objc nonisolated func changed(_ sender: Any?) {
+                    Task { @MainActor [weak self] in self?.applySelection() }
+                }
+                private func applySelection() {
                     if popup?.indexOfSelectedItem == 1 {
                         chooserDelegate?.mode = .all
                     } else {
@@ -716,7 +657,8 @@ final class ShelfItemViewModel: ObservableObject {
             popup.target = binder
             popup.action = #selector(PopupBinder.changed(_:))
 
-            panel.begin { response in
+            panel.begin { [binder, chooserDelegate] response in
+                withExtendedLifetime((binder, chooserDelegate)) { }
                 if response == .OK, let appURL = panel.url {
                     Task {
                         do {
@@ -743,9 +685,7 @@ final class ShelfItemViewModel: ObservableObject {
                         }
                     }
                 }
-                // Keep binder/delegate alive until panel finishes
-                _ = binder
-                _ = chooserDelegate
+                // The completion's explicit captures retain the weak AppKit targets through panel lifetime.
             }
         }
         
@@ -787,284 +727,7 @@ final class ShelfItemViewModel: ObservableObject {
             }
         }
         
-        @MainActor
-        private func handleRemoveBackground() {
-            let selected = ShelfSelectionModel.shared.selectedItems(in: ShelfStateViewModel.shared.items)
-            let imageURLs = selected.compactMap { $0.fileURL }.filter { ImageProcessingService.shared.isImageFile($0) }
-            
-            guard let imageURL = imageURLs.first else { return }
-            
-            Task {
-                do {
-                    let resultURL = try await imageURL.accessSecurityScopedResource { url in
-                        try await ImageProcessingService.shared.removeBackground(from: url)
-                    }
-                    
-                    if let resultURL = resultURL {
-                        // Create bookmark and add to shelf as temporary item
-                        if let bookmark = try? Bookmark(url: resultURL) {
-                            let newItem = ShelfItem(
-                                kind: .file(bookmark: bookmark.data),
-                                isTemporary: true
-                            )
-                            ShelfStateViewModel.shared.add([newItem])
-                        }
-                    }
-                } catch {
-                    print("❌ Failed to remove background: \(error.localizedDescription)")
-                    await showErrorAlert(title: "Background Removal Failed", message: error.localizedDescription)
-                }
-            }
-        }
-        
-        @MainActor
-        private func handleCreatePDF() {
-            let selected = ShelfSelectionModel.shared.selectedItems(in: ShelfStateViewModel.shared.items)
-            let imageURLs = selected.compactMap { $0.fileURL }.filter { ImageProcessingService.shared.isImageFile($0) }
-            
-            guard !imageURLs.isEmpty else { return }
-            
-            Task {
-                do {
-                    let resultURL = try await imageURLs.accessSecurityScopedResources { urls in
-                        try await ImageProcessingService.shared.createPDF(from: urls)
-                    }
-                    
-                    if let resultURL = resultURL {
-                        // Create bookmark and add to shelf as temporary item
-                        if let bookmark = try? Bookmark(url: resultURL) {
-                            let newItem = ShelfItem(
-                                kind: .file(bookmark: bookmark.data),
-                                isTemporary: true
-                            )
-                            ShelfStateViewModel.shared.add([newItem])
-                        }
-                    }
-                } catch {
-                    print("❌ Failed to create PDF: \(error.localizedDescription)")
-                    await showErrorAlert(title: "PDF Creation Failed", message: error.localizedDescription)
-                }
-            }
-        }
-        
-        @MainActor
-        private func showConvertImageDialog() {
-            let selected = ShelfSelectionModel.shared.selectedItems(in: ShelfStateViewModel.shared.items)
-            let imageURLs = selected.compactMap { $0.fileURL }.filter { ImageProcessingService.shared.isImageFile($0) }
-            
-            guard let imageURL = imageURLs.first else { return }
-            
-            // Create and show conversion options dialog with better layout
-            let alert = NSAlert()
-            alert.messageText = "Convert Image"
-            alert.alertStyle = .informational
-            alert.addButton(withTitle: "Convert")
-            alert.addButton(withTitle: "Cancel")
-            
-            // Create accessory view with better spacing and organization
-            let accessoryView = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 180))
-            accessoryView.wantsLayer = true
-            
-            // MARK: Format Row
-            let formatLabel = NSTextField(labelWithString: "Format:")
-            formatLabel.frame = NSRect(x: 0, y: 145, width: 100, height: 20)
-            formatLabel.font = .systemFont(ofSize: 12, weight: .medium)
-            accessoryView.addSubview(formatLabel)
-            
-            let formatPopup = NSPopUpButton(frame: NSRect(x: 120, y: 140, width: 250, height: 28))
-            formatPopup.addItems(withTitles: ["PNG", "JPEG", "HEIC", "TIFF", "BMP"])
-            formatPopup.selectItem(at: 0)
-            formatPopup.font = .systemFont(ofSize: 12)
-            accessoryView.addSubview(formatPopup)
-            
-            // MARK: Image Size Row
-            let imageSizeLabel = NSTextField(labelWithString: "Image Size:")
-            imageSizeLabel.frame = NSRect(x: 0, y: 105, width: 100, height: 20)
-            imageSizeLabel.font = .systemFont(ofSize: 12, weight: .medium)
-            accessoryView.addSubview(imageSizeLabel)
-            
-            let imageSizePopup = NSPopUpButton(frame: NSRect(x: 120, y: 100, width: 160, height: 28))
-            imageSizePopup.addItems(withTitles: ["Actual Size", "Large", "Medium", "Small", "Custom..."])
-            imageSizePopup.selectItem(at: 0)
-            imageSizePopup.font = .systemFont(ofSize: 12)
-            accessoryView.addSubview(imageSizePopup)
-            
-            // Custom size field (initially hidden)
-            let customSizeField = NSTextField(frame: NSRect(x: 285, y: 103, width: 85, height: 22))
-            customSizeField.placeholderString = "e.g., 1920"
-            customSizeField.font = .systemFont(ofSize: 12)
-            customSizeField.isHidden = true
-            accessoryView.addSubview(customSizeField)
-            
-            // MARK: Preserve Metadata Checkbox
-            let metadataCheckbox = NSButton(checkboxWithTitle: "Preserve Metadata", target: nil, action: nil)
-            metadataCheckbox.frame = NSRect(x: 120, y: 65, width: 200, height: 20)
-            metadataCheckbox.font = .systemFont(ofSize: 12)
-            metadataCheckbox.state = .on
-            accessoryView.addSubview(metadataCheckbox)
-            
-            // MARK: Separator line
-            let separatorLine = NSView(frame: NSRect(x: 0, y: 50, width: 380, height: 1))
-            separatorLine.wantsLayer = true
-            separatorLine.layer?.backgroundColor = NSColor.separatorColor.cgColor
-            accessoryView.addSubview(separatorLine)
-            
-            // MARK: Format-specific options (shown/hidden based on format selection)
-            let qualityRow = NSView(frame: NSRect(x: 0, y: 15, width: 380, height: 30))
-            qualityRow.wantsLayer = true
-            
-            let qualityLabel = NSTextField(labelWithString: "Compression:")
-            qualityLabel.frame = NSRect(x: 0, y: 7, width: 100, height: 20)
-            qualityLabel.font = .systemFont(ofSize: 12, weight: .medium)
-            qualityRow.addSubview(qualityLabel)
-            
-            let qualitySlider = NSSlider(frame: NSRect(x: 120, y: 12, width: 200, height: 20))
-            qualitySlider.minValue = 0.0
-            qualitySlider.maxValue = 1.0
-            qualitySlider.doubleValue = 0.85
-            accessoryView.addSubview(qualitySlider)
-            
-            let qualityValueLabel = NSTextField(labelWithString: "85%")
-            qualityValueLabel.frame = NSRect(x: 325, y: 7, width: 55, height: 20)
-            qualityValueLabel.font = .systemFont(ofSize: 12)
-            qualityValueLabel.alignment = .left
-            accessoryView.addSubview(qualityValueLabel)
-            
-            // Update quality label and hide/show compression row based on format
-            let updateQualityLabel = {
-                let value = Int(qualitySlider.doubleValue * 100)
-                qualityValueLabel.stringValue = "\(value)%"
-            }
-            
-            let updateCompressionVisibility = {
-                let formatIndex = formatPopup.indexOfSelectedItem
-                let showCompression = formatIndex == 1 || formatIndex == 2 // JPEG or HEIC
-                qualitySlider.isHidden = !showCompression
-                qualityValueLabel.isHidden = !showCompression
-                qualityLabel.isHidden = !showCompression
-            }
-            
-            let updateCustomSizeVisibility = {
-                let sizeIndex = imageSizePopup.indexOfSelectedItem
-                customSizeField.isHidden = sizeIndex != 4 // Show only for "Custom..."
-            }
-            
-            // Create a target object to handle slider value changes
-            class SliderHandler: NSObject {
-                let updateLabel: () -> Void
-                let updateVisibility: () -> Void
-                let updateCustomSize: () -> Void
-                init(updateLabel: @escaping () -> Void, updateVisibility: @escaping () -> Void, updateCustomSize: @escaping () -> Void) {
-                    self.updateLabel = updateLabel
-                    self.updateVisibility = updateVisibility
-                    self.updateCustomSize = updateCustomSize
-                }
-                @objc func sliderChanged(_ sender: NSSlider) {
-                    updateLabel()
-                }
-                @objc func formatChanged(_ sender: NSPopUpButton) {
-                    updateVisibility()
-                }
-                @objc func sizeChanged(_ sender: NSPopUpButton) {
-                    updateCustomSize()
-                }
-            }
-            
-            let handler = SliderHandler(updateLabel: updateQualityLabel, updateVisibility: updateCompressionVisibility, updateCustomSize: updateCustomSizeVisibility)
-            qualitySlider.target = handler
-            qualitySlider.action = #selector(SliderHandler.sliderChanged(_:))
-            qualitySlider.isContinuous = true
-            
-            formatPopup.target = handler
-            formatPopup.action = #selector(SliderHandler.formatChanged(_:))
-            
-            imageSizePopup.target = handler
-            imageSizePopup.action = #selector(SliderHandler.sizeChanged(_:))
-            
-            updateCompressionVisibility()
-            updateQualityLabel()
-            updateCustomSizeVisibility()
-            
-            // Keep the handler alive using the `AssociatedObject` helper instead of a magic string key
-            MenuActionTarget.sliderHandlerAssoc[accessoryView] = handler
-            
-            alert.accessoryView = accessoryView
-            
-            let response = alert.runModal()
-            
-            if response == .alertFirstButtonReturn {
-                // Get selected options
-                let formatIndex = formatPopup.indexOfSelectedItem
-                let format: ImageConversionOptions.ImageFormat
-                switch formatIndex {
-                case 0: format = .png
-                case 1: format = .jpeg
-                case 2: format = .heic
-                case 3: format = .tiff
-                case 4: format = .bmp
-                default: format = .png
-                }
-                
-                let quality = qualitySlider.doubleValue
-                
-                // Get max dimension based on image size selection
-                let maxDimension: CGFloat? = {
-                    let sizeIndex = imageSizePopup.indexOfSelectedItem
-                    switch sizeIndex {
-                    case 0: return nil // Actual Size
-                    case 1: return 1280 // Large 
-                    case 2: return 640  // Medium 
-                    case 3: return 320  // Small 
-                    case 4: // Custom (user-specified)
-                        let text = customSizeField.stringValue.trimmingCharacters(in: .whitespaces)
-                        guard !text.isEmpty, let value = Double(text), value > 0 else { return nil }
-                        return CGFloat(value)
-                    default: return nil
-                    }
-                }()
-                
-                let removeMetadata = metadataCheckbox.state == .off // Note: we invert this
-                
-                let options = ImageConversionOptions(
-                    format: format,
-                    compressionQuality: quality,
-                    maxDimension: maxDimension,
-                    removeMetadata: removeMetadata
-                )
-                
-                Task {
-                    do {
-                        let resultURL = try await imageURL.accessSecurityScopedResource { url in
-                            try await ImageProcessingService.shared.convertImage(from: url, options: options)
-                        }
-                        
-                        if let resultURL = resultURL {
-                            // Create bookmark and add to shelf as temporary item
-                            if let bookmark = try? Bookmark(url: resultURL) {
-                                let newItem = ShelfItem(
-                                    kind: .file(bookmark: bookmark.data),
-                                    isTemporary: true
-                                )
-                                ShelfStateViewModel.shared.add([newItem])
-                            }
-                        }
-                    } catch {
-                        print("❌ Failed to convert image: \(error.localizedDescription)")
-                        showErrorAlert(title: "Image Conversion Failed", message: error.localizedDescription)
-                    }
-                }
-            }
-        }
-        
-        @MainActor
-        private func showErrorAlert(title: String, message: String) {
-            let alert = NSAlert()
-            alert.messageText = title
-            alert.informativeText = message
-            alert.alertStyle = .warning
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
-        }
+
     }
 
     // MARK: - Private helpers

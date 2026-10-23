@@ -8,6 +8,7 @@
 import AppKit
 import Combine
 import Foundation
+import BoringCore
 
 extension Notification.Name {
 	static let sharingDidFinish = Notification.Name("com.boringNotch.sharingDidFinish")
@@ -49,9 +50,9 @@ final class SharingStateManager: ObservableObject {
 		if activeSessions > 0 { activeSessions -= 1 }
 	}
 
-	func makeDelegate(onEnd: (() -> Void)? = nil) -> SharingLifecycleDelegate {
+	func makeDelegate(onEnd: (() -> Void)? = nil, onCompletion: ((Bool) -> Void)? = nil) -> SharingLifecycleDelegate {
 		let id = UUID()
-		let delegate = SharingLifecycleDelegate(id: id, onEnd: { [weak self] in
+		let delegate = SharingLifecycleDelegate(id: id, onCompletion: { onCompletion?($0) }, onEnd: { [weak self] in
 			onEnd?()
 			self?.unregisterDelegate(id: id)
 		}, onBegin: { [weak self] in
@@ -68,90 +69,38 @@ final class SharingStateManager: ObservableObject {
 	}
 }
 
-final class SharingLifecycleDelegate: NSObject, NSSharingServiceDelegate, NSSharingServicePickerDelegate {
-	let id: UUID
-	private let onEnd: () -> Void
-	private let onBegin: () -> Void
-	private let onFinish: () -> Void
+@MainActor
+final class SharingLifecycleDelegate: NSObject, NSSharingServiceDelegate, @preconcurrency NSSharingServicePickerDelegate {
+    let id: UUID
+    private let onEnd: () -> Void
+    private let onBegin: () -> Void
+    private let onFinish: () -> Void
+    private let onCompletion: (Bool) -> Void
+    private var lifetime = InteractionLifetime()
 
-	private var pickerActive = false
-	private var serviceInProgress = false
-	private var finished = false
-	private var timeoutTask: Task<Void, Never>?
-
-	init(id: UUID, onEnd: @escaping () -> Void, onBegin: @escaping () -> Void, onFinish: @escaping () -> Void) {
-		self.id = id
-		self.onEnd = onEnd
-		self.onBegin = onBegin
-		self.onFinish = onFinish
-	}
-	
-	deinit {
-		timeoutTask?.cancel()
-	}
-
-	func markPickerBegan() {
-		guard !pickerActive else { return }
-		pickerActive = true
-		onBegin()
-	}
-
-	func markServiceBegan() {
-		guard !serviceInProgress else { return }
-		serviceInProgress = true
-		onBegin()
-		startTimeoutFallback()
-	}
-	
-	private func startTimeoutFallback() {
-		timeoutTask?.cancel()
-		timeoutTask = Task { @MainActor [weak self] in
-			try? await Task.sleep(for: .seconds(2))
-			guard let self = self, !Task.isCancelled else { return }
-			if !self.finished {
-				self.finishIfNeeded()
-			}
-		}
-	}
-
-	private func finishIfNeeded() {
-		guard !finished else { return }
-		finished = true
-		timeoutTask?.cancel()
-		onFinish()
-		onEnd()
-	}
-
-	// MARK: - NSSharingServicePickerDelegate
-
-	func sharingServicePicker(_ sharingServicePicker: NSSharingServicePicker, didChoose service: NSSharingService?) {
-		if service == nil {
-			if pickerActive && !serviceInProgress {
-				finishIfNeeded()
-			}
-			return
-		}
-
-		service?.delegate = self
-		serviceInProgress = true
-		startTimeoutFallback()
-	}
-
-	// MARK: - NSSharingServiceDelegate
-
-	func sharingService(_ sharingService: NSSharingService, willShareItems items: [Any]) {
-		if !pickerActive && !serviceInProgress {
-			onBegin()
-		}
-		serviceInProgress = true
-	}
-
-	func sharingService(_ sharingService: NSSharingService, didShareItems items: [Any]) {
-		finishIfNeeded()
-	}
-
-	func sharingService(_ sharingService: NSSharingService, didFailToShareItems items: [Any], error: Error) {
-		finishIfNeeded()
-	}
+    init(id: UUID, onCompletion: @escaping (Bool) -> Void = { _ in }, onEnd: @escaping () -> Void,
+         onBegin: @escaping () -> Void, onFinish: @escaping () -> Void) {
+        self.id = id
+        self.onCompletion = onCompletion
+        self.onEnd = onEnd
+        self.onBegin = onBegin
+        self.onFinish = onFinish
+    }
+    func markPickerBegan() { if lifetime.beginPicker() { onBegin() } }
+    func markServiceBegan() { if lifetime.beginService() { onBegin() } }
+    func cancel() { finishIfNeeded(success: false) }
+    private func finishIfNeeded(success: Bool) {
+        guard let wasActive = lifetime.finish() else { return }
+        if wasActive { onFinish() }
+        onCompletion(success)
+        onEnd()
+    }
+    func sharingServicePicker(_ picker: NSSharingServicePicker, didChoose service: NSSharingService?) {
+        guard let service else { finishIfNeeded(success: false); return }
+        service.delegate = self
+        markServiceBegan()
+    }
+    func sharingService(_ service: NSSharingService, willShareItems items: [Any]) { markServiceBegan() }
+    func sharingService(_ service: NSSharingService, didShareItems items: [Any]) { finishIfNeeded(success: true) }
+    func sharingService(_ service: NSSharingService, didFailToShareItems items: [Any], error: Error) { finishIfNeeded(success: false) }
 }
-

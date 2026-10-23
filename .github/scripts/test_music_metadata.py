@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Exercise MusicManager's actual state/artwork methods with deterministic image fixtures."""
+"""Link the actual artwork service/Core content reducer with real AppKit fixture images."""
 
 from pathlib import Path
+from media_test_support import core_arguments
 import subprocess
 import tempfile
 
@@ -9,36 +10,19 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def main() -> None:
-    source = (ROOT / "boringNotch/managers/MusicManager.swift").read_text()
-    update = source[
-        source.index("    @MainActor\n    private func updateFromPlaybackState"):
-        source.index("    func toggleFavoriteTrack()")
-    ]
-    artwork = source[
-        source.index("    private func updateArtwork("):
-        source.index("    private func updateIdleState(")
-    ]
-    album = source[
-        source.index("    func updateAlbumArt("):
-        source.index("    // MARK: - Playback Position Estimation")
-    ]
-    color = source[
-        source.index("    func calculateAverageColor()"):
-        source.index("    private func updateSneakPeek()")
-    ]
-    state = (ROOT / "boringNotch/models/PlaybackState.swift").read_text()
-    fixture = (ROOT / "Tests/MusicMetadataRegressionTests.swift").read_text()
-    fixture = fixture.replace("// PRODUCTION_PLAYBACK_STATE", state)
-    fixture = fixture.replace("    // PRODUCTION_METADATA_METHODS", update + artwork + album + color)
+    fixture = "import BoringCore\n" + (ROOT / "Tests/MusicMetadataRegressionTests.swift").read_text()
     with tempfile.TemporaryDirectory(prefix="boring-notch-metadata-tests-") as directory:
         directory = Path(directory)
         swift = directory / "MusicMetadataRegressionTests.swift"
+        domain_arguments = core_arguments(directory)
         executable = directory / "metadata-tests"
-        swift.write_text(fixture)
+        swift.write_text("import BoringCore\n" + fixture)
         subprocess.run([
             "xcrun", "swiftc", "-swift-version", "5", "-parse-as-library",
             "-module-cache-path", str(directory / "ModuleCache"),
-            str(swift), "-o", str(executable),
+            *domain_arguments,
+            str(swift), str(ROOT / "boringNotch/MediaControllers/ArtworkPresentationService.swift"),
+            str(ROOT / "boringNotch/extensions/NSImage+Extensions.swift"), "-o", str(executable),
         ], check=True, timeout=120)
         subprocess.run([str(executable)], check=True, timeout=30)
 

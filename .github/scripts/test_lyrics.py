@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Run production lyrics resolution against deterministic Swift network/AppleScript fixtures.
+"""Link the production lyrics service/providers/Core with deterministic injected IO fixtures.
 
-The UI application has no test target. Compile its actual lyrics methods and Yandex provider
-with small platform fixtures so these regressions run without launching a player or using
-real credentials/network services. No production logic is copied into the fixtures.
+The native SwiftPM suite covers pure parsing/matching/cache algorithms. This platform suite
+retains all 1355 request/cancellation regressions without extracting any methods from source.
 """
 
 from pathlib import Path
+from media_test_support import core_arguments
 import subprocess
 import tempfile
 
@@ -14,29 +14,21 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def main() -> None:
-    source = (ROOT / "boringNotch/managers/MusicManager.swift").read_text()
-    properties = source[
-        source.index("    // Cache of successfully fetched lyrics"):
-        source.index("    @Published var isFlipping:")
-    ]
-    methods = source[
-        source.index("    // MARK: - Lyrics\n"):
-        source.index("    private func triggerFlipAnimation()")
-    ]
-    provider = source[source.index("struct YandexLyricsProvider {"):]
-    fixture = (ROOT / "Tests/LyricsRegressionTests.swift").read_text()
-    fixture = fixture.replace("    // PRODUCTION_LYRICS_PROPERTIES", properties)
-    fixture = fixture.replace("    // PRODUCTION_LYRICS_METHODS", methods)
-    fixture = fixture.replace("// PRODUCTION_YANDEX_PROVIDER", provider)
+    fixture = "import BoringCore\n" + (ROOT / "Tests/LyricsRegressionTests.swift").read_text()
     with tempfile.TemporaryDirectory(prefix="boring-notch-lyrics-tests-") as directory:
         directory = Path(directory)
         swift = directory / "LyricsRegressionTests.swift"
+        domain_arguments = core_arguments(directory)
         executable = directory / "lyrics-tests"
-        swift.write_text(fixture)
+        swift.write_text("import BoringCore\n" + fixture)
         subprocess.run([
             "xcrun", "swiftc", "-swift-version", "5", "-parse-as-library",
             "-module-cache-path", str(directory / "ModuleCache"),
-            str(swift), "-o", str(executable),
+            *domain_arguments,
+            str(swift), str(ROOT / "boringNotch/MediaControllers/LyricsService.swift"),
+            str(ROOT / "boringNotch/MediaControllers/MediaHTTPSession.swift"),
+            str(ROOT / "boringNotch/MediaControllers/LRCLIBClient.swift"),
+            str(ROOT / "boringNotch/MediaControllers/YandexLyricsProvider.swift"), "-o", str(executable),
         ], check=True, timeout=120)
         subprocess.run([str(executable)], check=True, timeout=30)
 

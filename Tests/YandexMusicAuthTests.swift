@@ -73,6 +73,7 @@ private final class FakeLegacyStorage: YandexMusicLegacyTokenStorage {
 }
 
 @main
+@MainActor
 private struct YandexMusicAuthTests {
     static func main() throws {
         var passed = 0

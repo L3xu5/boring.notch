@@ -14,13 +14,10 @@ extension SkyLightOperator {
     func undelegateWindow(_ window: NSWindow) {
         typealias F_SLSRemoveWindowsFromSpaces = @convention(c) (Int32, CFArray, CFArray) -> Int32
         
-        let handler = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/SkyLight", RTLD_NOW)
-        guard let SLSRemoveWindowsFromSpaces = unsafeBitCast(
-            dlsym(handler, "SLSRemoveWindowsFromSpaces"),
-            to: F_SLSRemoveWindowsFromSpaces?.self
-        ) else {
-            return
-        }
+        guard let handler = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/SkyLight", RTLD_NOW) else { return }
+        defer { dlclose(handler) }
+        guard let symbol = dlsym(handler, "SLSRemoveWindowsFromSpaces") else { return }
+        let SLSRemoveWindowsFromSpaces = unsafeBitCast(symbol, to: F_SLSRemoveWindowsFromSpaces.self)
         
         // Remove the window from the SkyLight space
         _ = SLSRemoveWindowsFromSpaces(
@@ -31,7 +28,8 @@ extension SkyLightOperator {
     }
 }
 
-class BoringNotchSkyLightWindow: NSPanel {
+class BoringNotchSkyLightWindow: NSPanel, NotchKeyboardFocusable {
+    var acceptsKeyboardFocus = false
     private var isSkyLightEnabled: Bool = false
     
     override init(
@@ -109,6 +107,6 @@ class BoringNotchSkyLightWindow: NSPanel {
     
     private var observers: Set<AnyCancellable> = []
     
-    override var canBecomeKey: Bool { false }
+    override var canBecomeKey: Bool { acceptsKeyboardFocus }
     override var canBecomeMain: Bool { false }
 }

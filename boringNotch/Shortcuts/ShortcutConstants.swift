@@ -9,12 +9,12 @@ import KeyboardShortcuts
 import SwiftUI
 
 extension KeyboardShortcuts.Name {
-    static let clipboardHistoryPanel = Self("clipboardHistoryPanel", default: .init(.c, modifiers: [.shift, .command]))
-    static let toggleMicrophone = Self("toggleMicrophone", default: .init(.f5, modifiers: [.function]))
-    static let decreaseBacklight = Self("decreaseBacklight", default: .init(.f1, modifiers: [.command]))
-    static let increaseBacklight = Self("increaseBacklight", default: .init(.f2, modifiers: [.command]))
-    static let toggleSneakPeek = Self("toggleSneakPeek", default: .init(.h, modifiers: [.command, .shift]))
-    static let toggleNotchOpen = Self("toggleNotchOpen", default: .init(.i, modifiers: [.command, .shift]))
+    static let clipboardHistoryPanel = Self("clipboardHistoryPanel", initial: .init(.c, modifiers: [.shift, .command]))
+    static let toggleMicrophone = Self("toggleMicrophone", initial: .init(.f5, modifiers: [.function]))
+    static let decreaseBacklight = Self("decreaseBacklight", initial: .init(.f1, modifiers: [.command]))
+    static let increaseBacklight = Self("increaseBacklight", initial: .init(.f2, modifiers: [.command]))
+    static let toggleSneakPeek = Self("toggleSneakPeek", initial: .init(.h, modifiers: [.command, .shift]))
+    static let toggleNotchOpen = Self("toggleNotchOpen", initial: .init(.i, modifiers: [.command, .shift]))
 
     // Media hotkeys that target the selected source directly (e.g. Yandex via Accessibility),
     // so they work even when a browser tab owns the system Now Playing session. No defaults —

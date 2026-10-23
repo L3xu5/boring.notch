@@ -1,15 +1,13 @@
 import Cocoa
 import Defaults
 import Foundation
-import IOKit.ps
 import SwiftUI
 
 /// A view model that manages and monitors the battery status of the device
-class BatteryStatusViewModel: ObservableObject {
+@MainActor
+final class BatteryStatusViewModel: ObservableObject {
 
-    private var wasCharging: Bool = false
-    private var powerSourceChangedCallback: IOPowerSourceCallbackType?
-    private var runLoopSource: Unmanaged<CFRunLoopSource>?
+    private var statusNotificationTask: Task<Void, Never>?
 
     @ObservedObject var coordinator = BoringViewCoordinator.shared
 
@@ -23,7 +21,7 @@ class BatteryStatusViewModel: ObservableObject {
     @Published private(set) var statusText: String = ""
 
     private let managerBattery = BatteryActivityManager.shared
-    private var managerBatteryId: Int?
+    private var managerBatteryId: UUID?
 
     static let shared = BatteryStatusViewModel()
 
@@ -68,17 +66,16 @@ class BatteryStatusViewModel: ObservableObject {
 
         case .lowPowerModeChanged(let isEnabled):
             print("⚡ Low power mode: \(isEnabled ? "Enabled" : "Disabled")")
-            self.notifyImportanChangeStatus()
             withAnimation {
                 self.isInLowPowerMode = isEnabled
                 self.statusText = "Low Power: \(self.isInLowPowerMode ? "On" : "Off")"
             }
+            self.notifyImportanChangeStatus()
 
         case .isChargingChanged(let isCharging):
             print("🔌 Charging: \(isCharging ? "Yes" : "No")")
             print("maxCapacity: \(self.maxCapacity)")
             print("levelBattery: \(self.levelBattery)")
-            self.notifyImportanChangeStatus()
             withAnimation {
                 self.isCharging = isCharging
                 self.statusText =
@@ -86,6 +83,7 @@ class BatteryStatusViewModel: ObservableObject {
                     ? "Charging battery"
                     : (self.levelBattery < self.maxCapacity ? "Not charging" : "Full charge")
             }
+            self.notifyImportanChangeStatus()
 
         case .timeToFullChargeChanged(let time):
             print("🕒 Time to full charge: \(time) minutes")
@@ -121,16 +119,18 @@ class BatteryStatusViewModel: ObservableObject {
     /// Notifies important changes in the battery status with an optional delay
     /// - Parameter delay: The delay before notifying the change, default is 0.0
     private func notifyImportanChangeStatus(delay: Double = 0.0) {
-        Task {
-            try? await Task.sleep(for: .seconds(delay))
-            self.coordinator.toggleExpandingView(status: true, type: .battery)
+        statusNotificationTask?.cancel()
+        statusNotificationTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+            self?.coordinator.toggleExpandingView(status: true, type: .battery)
         }
     }
 
     deinit {
-        print("🔌 Cleaning up battery monitoring...")
-        if let managerBatteryId: Int = managerBatteryId {
-            managerBattery.removeObserver(byId: managerBatteryId)
+        statusNotificationTask?.cancel()
+        if let managerBatteryId {
+            let manager = managerBattery
+            Task { @MainActor in manager.removeObserver(byId: managerBatteryId) }
         }
     }
 

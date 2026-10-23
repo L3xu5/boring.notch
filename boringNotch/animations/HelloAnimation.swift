@@ -97,6 +97,7 @@ struct GlowingSnake<
 }
 
 struct HelloAnimation: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var progress: Double = 0.0
     
     var onFinish: () -> Void
@@ -110,19 +111,21 @@ struct HelloAnimation: View {
             shape: { HelloShape() }
         )
         .task {
-            // Wait for the "opening" animation (notch expansion) to complete before starting the snake
-            try? await Task.sleep(for: .seconds(0.6))
-            
-            withAnimation(
-                .easeInOut(duration: 4.0)
-            ) {
-                progress = 1.0
+            do {
+                if reduceMotion {
+                    progress = 1
+                    try await Task.sleep(for: .milliseconds(500))
+                } else {
+                    try await Task.sleep(for: .milliseconds(600))
+                    guard !Task.isCancelled else { return }
+                    withAnimation(.easeInOut(duration: 4)) { progress = 1 }
+                    try await Task.sleep(for: .seconds(4))
+                }
+                guard !Task.isCancelled else { return }
+                onFinish()
+            } catch {
+                return
             }
-            
-            // Wait for the animation to complete
-            try? await Task.sleep(for: .seconds(4.0))
-            
-            onFinish()
         }
     }
 }

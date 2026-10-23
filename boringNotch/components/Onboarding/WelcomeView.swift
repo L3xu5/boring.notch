@@ -6,7 +6,6 @@
 //
 
 import SwiftUI
-import SwiftUIIntrospect
 
 struct WelcomeView: View {
     var onGetStarted: (() -> Void)? = nil
@@ -58,6 +57,7 @@ struct WelcomeView: View {
                             .padding(.vertical, 6)
                     }
                     .buttonStyle(BorderedProminentButtonStyle())
+                    .keyboardShortcut(.defaultAction)
                 }
                 .padding(.top)
             }

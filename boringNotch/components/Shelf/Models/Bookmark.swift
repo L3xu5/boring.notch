@@ -16,6 +16,7 @@ struct Bookmark: Sendable, Equatable, Codable {
     }
 
     init(url: URL) throws {
+        guard !ShelfStorageEnvironment.isIsolatedPreview else { throw CocoaError(.featureUnsupported) }
         guard url.isFileURL, FileManager.default.fileExists(atPath: url.path) else {
             throw NSError(domain: "Bookmark", code: 1, userInfo: [NSLocalizedDescriptionKey: "Not a valid file URL or file does not exist at \(url.path)"])
         }
@@ -25,15 +26,15 @@ struct Bookmark: Sendable, Equatable, Codable {
                 includingResourceValuesForKeys: nil,
                 relativeTo: nil
             )
-            NSLog("✅ Successfully created bookmark for \(url.path)")
             self.data = bookmark
         } catch {
-            NSLog("❌ Failed to create bookmark for \(url.path): \(error.localizedDescription)")
+            NSLog("Unable to create file bookmark (%ld)", (error as NSError).code)
             throw error
         }
     }
 
     func resolve() -> (url: URL?, refreshedData: Data?) {
+        guard !ShelfStorageEnvironment.isIsolatedPreview else { return (nil, nil) }
         guard !data.isEmpty else { return (nil, nil) }
         var isStale = false
         do {
@@ -44,12 +45,12 @@ struct Bookmark: Sendable, Equatable, Codable {
                 bookmarkDataIsStale: &isStale
             )
             if isStale, let newData = try? url.bookmarkData(options: [.withSecurityScope]) {
-                NSLog("⚠️ Bookmark was stale for \(url.path), refreshed")
+                NSLog("Refreshed a stale file bookmark")
                 return (url, newData)
             }
             return (url, nil)
         } catch {
-            NSLog("❌ Failed to resolve bookmark: \(error.localizedDescription)")
+            NSLog("Unable to resolve file bookmark (%ld)", (error as NSError).code)
             return (nil, nil)
         }
     }

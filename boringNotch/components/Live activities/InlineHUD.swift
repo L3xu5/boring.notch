@@ -79,12 +79,8 @@ struct InlineHUD: View {
                 } else {
                         HStack {
                         DraggableProgressBar(value: $value, onChange: { v in
-                            if type == .volume {
-                                VolumeManager.shared.setAbsolute(Float32(v))
-                            } else if type == .brightness {
-                                BrightnessManager.shared.setAbsolute(value: Float32(v))
-                            }
-                        })
+                            SystemHUDControl.setValue(v, for: type)
+                        }, label: SystemHUDControl.title(for: type))
                         if (type == .volume && value.isZero) {
                             Text("muted")
                                 .font(.caption)

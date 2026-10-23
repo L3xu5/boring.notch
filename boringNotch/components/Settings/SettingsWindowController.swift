@@ -13,10 +13,11 @@ import Sparkle
 class SettingsWindowController: NSWindowController {
     static let shared = SettingsWindowController()
     private var updaterController: SPUStandardUpdaterController?
+    private var hasBeenShown = false
     
     private init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 700, height: 600),
+            contentRect: NSRect(x: 0, y: 0, width: 820, height: 680),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -32,6 +33,7 @@ class SettingsWindowController: NSWindowController {
     }
     
     func setUpdaterController(_ controller: SPUStandardUpdaterController) {
+        guard updaterController !== controller else { return }
         self.updaterController = controller
         // Recreate the content view with the proper updater controller
         setupWindow()
@@ -40,7 +42,7 @@ class SettingsWindowController: NSWindowController {
     private func setupWindow() {
         guard let window = window else { return }
         
-        window.title = "Boring Notch Settings"
+        window.title = NSLocalizedString("Boring Notch Settings", comment: "Settings window title")
         window.titlebarAppearsTransparent = false
         window.titleVisibility = .visible
         window.toolbarStyle = .unified
@@ -56,10 +58,13 @@ class SettingsWindowController: NSWindowController {
         // Configure window to be a standard document-style window
         window.isRestorable = true
         window.identifier = NSUserInterfaceItemIdentifier("BoringNotchSettingsWindow")
+        window.minSize = NSSize(width: 680, height: 560)
+        window.setFrameAutosaveName("BoringNotchSettingsWindow")
         
         // Create the SwiftUI content
         let settingsView = SettingsView(updaterController: updaterController)
         let hostingView = NSHostingView(rootView: settingsView)
+        hostingView.sizingOptions = [.minSize]
         window.contentView = hostingView
         
         // Handle window closing
@@ -67,31 +72,16 @@ class SettingsWindowController: NSWindowController {
     }
     
     func showWindow() {
-        // Set app to regular mode first
-        NSApp.setActivationPolicy(.regular)
-        
-        // If window is already visible, bring it to front properly
-        if window?.isVisible == true {
-            NSApp.activate(ignoringOtherApps: true)
-            window?.orderFrontRegardless()
-            window?.makeKeyAndOrderFront(nil)
-            return
+        if window?.contentView == nil { setupWindow() }
+        guard let window else { return }
+        if !window.isVisible && !hasBeenShown && UserDefaults.standard.string(forKey: "NSWindow Frame BoringNotchSettingsWindow") == nil {
+            window.center()
         }
-        
-        // Show the window with proper ordering
-        window?.orderFrontRegardless()
-        window?.makeKeyAndOrderFront(nil)
-        window?.center()
-        
-        // Activate the app and ensure window gets focus
-        NSApp.activate(ignoringOtherApps: true)
-        
-        // Force window to front after activation
-        DispatchQueue.main.async { [weak self] in
-            self?.window?.makeKeyAndOrderFront(nil)
-        }
+        hasBeenShown = true
+        ApplicationActivationPolicy.present(window)
+        DispatchQueue.main.async { [weak self] in self?.window?.makeKeyAndOrderFront(nil) }
     }
-    
+
     override func close() {
         super.close()
         relinquishFocus()
@@ -99,9 +89,12 @@ class SettingsWindowController: NSWindowController {
     
     private func relinquishFocus() {
         window?.orderOut(nil)
+        // Closing Settings releases its observation tasks, animation previews,
+        // and unsaved token-entry drafts. Navigation is restored from AppStorage.
+        window?.contentView = nil
         
         // Set app back to accessory mode immediately
-        NSApp.setActivationPolicy(.accessory)
+        ApplicationActivationPolicy.restore(excluding: window)
     }
 }
 
@@ -115,8 +108,7 @@ extension SettingsWindowController: NSWindowDelegate {
     }
     
     func windowDidBecomeKey(_ notification: Notification) {
-        // Ensure app is in regular mode when window becomes key
-        NSApp.setActivationPolicy(.regular)
+        // Presentation goes through the shared auxiliary-window activation policy.
     }
     
     func windowDidResignKey(_ notification: Notification) {

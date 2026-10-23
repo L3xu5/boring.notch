@@ -1,30 +1,26 @@
-//
-//  AssociatedObject.swift
-//  boringNotch
-//
-//  Created by Alexander on 2025-10-05.
-//
-
 import Foundation
 import ObjectiveC
 
-
-/// Lightweight helper for Objective-C associated objects.
+/// A stable Objective-C association key. The stored value retains its key token, so a
+/// short-lived helper cannot leave an address that a later helper accidentally reuses.
 public struct AssociatedObject<Value: AnyObject> {
-    private let key: UnsafeRawPointer
-    private let policy: objc_AssociationPolicy
-
-    public init(_ policy: objc_AssociationPolicy = .OBJC_ASSOCIATION_RETAIN_NONATOMIC) {
-        self.key = UnsafeRawPointer(Unmanaged.passUnretained(UniqueKey()).toOpaque())
-        self.policy = policy
+    private final class Key: NSObject {}
+    private final class StoredValue: NSObject {
+        let key: Key
+        let value: Value
+        init(key: Key, value: Value) { self.key = key; self.value = value }
     }
-
-    private final class UniqueKey {}
+    private let key = Key()
+    public init() {}
 
     public subscript<Owner: AnyObject>(_ owner: Owner) -> Value? {
-        get { objc_getAssociatedObject(owner, key) as? Value }
-        nonmutating set { objc_setAssociatedObject(owner, key, newValue, policy) }
+        get {
+            (objc_getAssociatedObject(owner, Unmanaged.passUnretained(key).toOpaque()) as? StoredValue)?.value
+        }
+        nonmutating set {
+            let stored = newValue.map { StoredValue(key: key, value: $0) }
+            objc_setAssociatedObject(owner, Unmanaged.passUnretained(key).toOpaque(), stored,
+                                     .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        }
     }
 }
-
-extension AssociatedObject: @unchecked Sendable where Value: Sendable {}

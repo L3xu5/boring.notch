@@ -1,148 +1,127 @@
-<h1 align="center">
-  <br>
-  🎵 Boring Notch — <span>Yandex Music Edition</span>
-  <br>
-</h1>
+<h1 align="center">🎵 Boring Notch — Yandex Music Edition</h1>
 
 <p align="center">
-  <b>A fork of <a href="https://github.com/TheBoredTeam/boring.notch">boring.notch</a> that turns your MacBook notch into a music control center — now with first-class <b>Yandex Music</b> support.</b>
+  A fork of <a href="https://github.com/TheBoredTeam/boring.notch">boring.notch</a> with native Yandex Music controls, synced lyrics and a configurable MacBook notch.
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/platform-macOS%2014%2B-black" alt="macOS 14+">
+  <img src="https://img.shields.io/badge/architecture-Apple%20Silicon%20%2B%20Intel-blue" alt="Universal macOS app">
   <img src="https://img.shields.io/badge/license-GPLv3-blue" alt="GPLv3">
-  <img src="https://img.shields.io/badge/Yandex%20Music-native-yellow" alt="Yandex Music">
 </p>
 
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/2d5f69c1-6e7b-4bc2-a6f1-bb9e27cf88a8" alt="Demo GIF" />
-</p>
+Version 3 keeps the existing features while rebuilding application, window and service ownership. Each display has its own notch window and presentation state; shared media, shelf, calendar, camera and hardware services have explicit lifetimes.
 
----
+The UI and platform adapters remain native SwiftUI/AppKit. Two local packages separate reusable strict Swift 6 logic in [`BoringCore`](Packages/BoringCore) from the shared Objective-C XPC schema in [`BoringRPC`](Packages/BoringRPC). See [the contributor architecture guide](CONTRIBUTING.md#architecture-and-ownership) for the service boundaries.
 
-## ✨ What this fork adds
+## Features
 
-The upstream app already controls Apple Music, Spotify, YouTube Music and the generic "Now Playing" source. **This fork adds the official Yandex Music desktop app as a native media source** — pick it in onboarding or **Settings → Media Source**.
+- **Music:** Yandex Music, Apple Music, Spotify, the YouTube Music desktop API client and generic macOS Now Playing; artwork, transport, source-dependent favorite/dislike controls and configurable shortcuts.
+- **Lyrics:** optional Yandex account connection, LRCLIB fallback, timing adjustment and a karaoke view with click-to-seek where the source supports seeking.
+- **Shelf:** file and clipboard imports, previews, Quick Look, drag-and-drop, sharing and AirDrop.
+- **Everyday tools:** calendar, camera preview, battery/charging activities, volume and brightness HUDs, menu-bar controls and launch-at-login settings.
+- **Multiple displays:** independent windows, keyboard focus, screen selection, fullscreen handling and sleep/lock cleanup.
 
-| Capability | Status |
-| --- | :---: |
-| 🎼 Now playing — title / artist / album | ✅ |
-| 🖼️ Album artwork | ✅ |
-| ⏱️ Progress bar & synced lyrics | ✅ |
-| ⏯️ Play / Pause / Next / Previous | ✅ |
-| ❤️ Like (*«Мне нравится»*) | ✅ *best-effort* |
-| 👎 Dislike · configurable media hotkeys | ✅ |
-| 🎤 Full-window karaoke lyrics · click to seek | ✅ *seeking depends on the source* |
-| 🔀 Shuffle · 🔁 Repeat | ✅ |
+## Install
 
-Works with the **official Yandex Music app** (`ru.yandex.desktop.music`) — no modified client is needed. Playback controls do not require a Yandex account connection in the notch. Connecting an account is optional and enables lyrics from Yandex's own API; otherwise the app uses LRCLIB.
+Download **`boringNotch.zip`** from [this fork's latest release](https://github.com/L3xu5/boring.notch/releases/latest), unzip it and move **boringNotch.app** to `/Applications`. Releases are universal binaries for **Apple Silicon and Intel**, with **macOS 14 or later** as the runtime minimum.
 
-## 🔧 How it works
+Releases use a stable self-signed certificate and are not notarized by Apple. If macOS quarantines the downloaded app, remove that flag once after checking the download source:
 
-Yandex Music is an Electron app with **no AppleScript dictionary**, so the scripting approach used for Spotify / Apple Music isn't available. The integration uses **two channels**:
+```bash
+xattr -dr com.apple.quarantine /Applications/boringNotch.app
+```
 
-1. **Reading "now playing" — via MediaRemote.**
-   Chromium publishes the track's metadata, artwork and position to the macOS *Now Playing* session. We read that stream (through the bundled [`mediaremote-adapter`](https://github.com/ungive/mediaremote-adapter)) filtered to Yandex's bundle id. Diff updates arrive without an owner id, so the session owner is tracked from full snapshots and diffs are applied to it.
-
-2. **Controlling playback & likes — via the Accessibility API.**
-   Transport commands **press Yandex's own on-screen buttons** instead of sending MediaRemote commands, so they always target Yandex — even when a browser tab currently owns the system media session. The controls are located on the persistent bottom player bar (anchored via the unique *Next / Previous song* buttons), and Chromium's web accessibility tree is enabled with `AXManualAccessibility`. *Like* is the bar's `Like` checkbox; its state is read from `AXValue`.
-
-Playback integration lives in [`YandexMusicController.swift`](boringNotch/MediaControllers/YandexMusicController.swift). Lyrics fetching and caching live in [`MusicManager.swift`](boringNotch/managers/MusicManager.swift); account connection and Accessibility setup are in [`SettingsView.swift`](boringNotch/components/Settings/SettingsView.swift).
-
-## 🚀 Install
-
-1. Download **`boringNotch.zip`** from the [latest release](../../releases/latest) and unzip it.
-2. Move **boringNotch.app** to `/Applications`.
-3. Releases use a stable **self-signed certificate**, without Apple notarization. Clear the quarantine flag once:
-   ```bash
-   xattr -dr com.apple.quarantine /Applications/boringNotch.app
-   ```
-4. Launch it.
-
-## ▶️ Enable Yandex Music
-
-1. In the notch settings (menu-bar star → **Settings → Media Source**) choose **Yandex Music**.
-2. Grant **Accessibility** permission — **System Settings → Privacy & Security → Accessibility** → enable **boringNotch**.
-   *Required for transport, likes and the metadata fallback. System metadata and artwork work without it while Yandex owns the Now Playing session.*
-3. Play something in the Yandex Music app 🎧
-4. Optionally use **Connect…** in the Yandex Music settings to enable lyrics from your account. Lyrics timing can be adjusted with **Lyrics offset**.
-
-Connected account tokens are stored in macOS Keychain. Existing tokens from older builds are migrated automatically; the old preference is removed after a successful Keychain write.
-
-Updates are delivered from this fork through **Check for Updates…**. You can also install with Homebrew:
+Homebrew installation is also available:
 
 ```bash
 brew install --cask l3xu5/boring-notch/boring-notch-yandex
 ```
 
-Physical media keys retain native macOS handling, including Safari and other players. The app only attempts Yandex Play/Pause recovery after an unchanged, inactive foreign session fails to respond, with fresh Yandex playback data. Configurable media shortcuts explicitly control the selected music source.
+Release builds update through this fork's Sparkle feed using **Check for Updates…**. Existing application and signing identities are retained across updates.
 
-## ⚠️ Known limitation
+## Setup and privacy
 
-macOS exposes a **single** system *Now Playing* session. When another app owns it, the Yandex integration reads title, artist and artwork from Yandex's own accessible player instead of retaining the previous track. This does not change which app receives native media controls. Yandex's live position still cannot be read from that session, and its Accessibility tree does not expose a playback slider, so synced lyrics may drift. **For accurate lyrics, keep Yandex Music as the active media session.**
+Choose a music source during onboarding. A fresh installation waits for that choice before starting its player integration. Camera, calendar and account connections remain optional; permissions can be configured later in Settings.
 
-## 🛠️ Building from source
+| Access | Used for |
+| --- | --- |
+| Accessibility | Yandex playback/like/dislike controls, its metadata fallback and enabled system-key integrations. |
+| Automation | Apple Music or Spotify AppleScript controls when those sources are used. |
+| Camera | A visible camera preview; closing the final preview releases capture. |
+| Calendar | Reading the calendars selected for the calendar feature. |
+| Selected files | Shelf imports, previews and sharing actions. |
 
-- **macOS 15.6+** and **Xcode 26+**
-- Clone, then:
-  ```bash
-  open boringNotch.xcodeproj
-  ```
-  Select the **boringNotch** scheme and press **⌘R**.
+The official **Yandex Music desktop app** (`ru.yandex.desktop.music`) needs no modification. In Settings, select **Yandex Music**, grant Accessibility and start playback in that app. Connecting a Yandex account inside the notch is optional: playback controls work independently of it.
 
-Upstream names the built product **Boring Notch.app**. Fork releases package it as **boringNotch.app** to preserve existing installations and Homebrew compatibility.
+With lyrics enabled, track metadata is sent to LRCLIB or, when connected, Yandex's lyrics API. Yandex OAuth credentials are kept in **macOS Keychain**. Older preference-based tokens are removed only after a successful Keychain save; **Disconnect** removes the stored credential. Lyrics use a bounded, account-separated cache. Camera/calendar permissions and account credentials are not required to use the other features.
 
-The Xcode project enables App Sandbox, while fork releases are signed without it so Accessibility can control Yandex Music. For a local build with the same Accessibility behavior:
+Generated files dragged to an external app keep a durable copy so recipients can read the exported URL later. Removing the Shelf row does not delete these copies, and there is no automatic expiry. To review them in Finder, choose **Go → Go to Folder** and enter `~/Library/Application Support/boringNotch/Shelf/OwnedAssets`. Remove only copies you no longer need; deleting a retained copy can break links in the receiving app. Original user files are never deleted by Shelf cleanup.
+
+## Yandex playback and media keys
+
+The integration reads the system Now Playing stream through the bundled [mediaremote-adapter](https://github.com/ungive/mediaremote-adapter). Full snapshots and incremental updates share one owner-aware reducer, including explicit field removals.
+
+Playback, like and dislike commands target Yandex's own accessible player buttons. If Safari or another app owns the system media session, Accessibility supplies Yandex's title and artist; artwork can be loaded using the exact track link. This does not claim the system session or send playback commands to that other app.
+
+Physical media keys always retain native macOS handling. Play/Pause recovery is limited to a proven unresponsive, paused foreign session, followed by fresh Yandex evidence and a final check before an AX action. Active or focused foreign players keep their native behavior. Configurable media shortcuts explicitly control the selected source.
+
+**Position remains a limitation:** when another app owns Now Playing, Yandex's precise live position is unavailable. Seeking, shuffle and repeat depend on Yandex owning the system session, and karaoke timing can drift otherwise. For accurate synced lyrics, keep Yandex as the active Now Playing source. Accessibility matching also depends on the desktop player's UI and may need updates when that UI changes.
+
+## Build and check
+
+Development is tested with **Xcode 26.6**; macOS CI runs on **macOS 26**. The runtime deployment target remains macOS 14. Clone this fork and open the Xcode project:
 
 ```bash
-xcodebuild -project boringNotch.xcodeproj -scheme boringNotch \
-  -configuration Release -destination 'generic/platform=macOS' \
-  -derivedDataPath build -disableAutomaticPackageResolution \
-  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
-codesign --force --deep --timestamp=none --sign - \
-  "build/Build/Products/Release/Boring Notch.app"
+git clone https://github.com/L3xu5/boring.notch.git
+cd boring.notch
+open boringNotch.xcodeproj
 ```
 
-Grant Accessibility to that local app separately. An ad-hoc signature does not preserve the release certificate's identity.
+Select the shared **boringNotch** scheme and run it. Local Debug builds use ad-hoc signing with App Sandbox disabled, matching the native integration model of Release; no Apple Developer team is required. Local builds have their own permission identity. Debug does not start the automatic updater, so a development build is not automatically replaced by a release.
+
+The canonical checks are:
+
+```bash
+python3 .github/scripts/check_project.py                # Both groups, on macOS
+python3 .github/scripts/check_project.py --python-only  # Release/tooling tests; also Linux
+python3 .github/scripts/check_project.py --native-only  # Swift Core and native integration suites
+```
+
+Native checks build the actual Swift 6 Core package once, then reuse fingerprint-verified artifacts for platform fixtures. Tests use injected player/network/storage/camera boundaries instead of controlling real players or changing permissions. See [CONTRIBUTING.md](CONTRIBUTING.md) for architecture, Debug UI snapshots and review guidance.
 
 ## Maintaining this fork
 
-**Build latest** publishes every push to `main`, using the full commit count as `CFBundleVersion`. The marketing version is derived from the project and stamped into both the app and Sparkle feed. Keep `main` history intact so update build numbers continue to increase.
+**Build latest** runs quality checks before building, signing or publishing a `main` commit. The project supplies the marketing version; the complete commit count supplies the monotonic build number. A v3 release therefore has a tag such as `v3.0.0-yandex.N`. Keep published `main` history intact.
 
-Each build creates a new versioned release such as `v2.7.3-yandex.1353`, with `boringNotch.zip` and `appcast.xml`, and marks it as GitHub's latest release. Reruns preserve the assets and notes of an already published version. A version tag must continue to point to the original built commit.
+Each build publishes a versioned release with `boringNotch.zip` and its appcast. The fixed **`latest`** release and rolling ZIP URL remain for existing Sparkle clients and Homebrew. Sparkle appcasts reference immutable, build-specific archives uploaded before the feed; keep those archives available for clients holding older feeds. Published version tags continue to identify their original source commits. Branch builds cannot publish fork releases.
 
-The separate rolling release retains the fixed `latest` tag and `boringNotch.zip` URL for existing Sparkle clients and Homebrew. Its title shows the current build, while the latest-release badge belongs to the versioned release. Sparkle uses an archive unique to each build, uploaded before `appcast.xml`, so clients with an older feed can still download the matching signed archive. Old build archives must remain available. The rolling `latest` tag moves to the built source commit. Manually dispatched builds from other branches cannot publish.
-
-Configure these repository secrets in **Settings → Secrets and variables → Actions**:
+Required Actions secrets:
 
 | Secret | Purpose |
 | --- | --- |
-| `SIGNING_CERT_P12` | Base64-encoded stable self-signed code-signing certificate and private key. |
-| `SIGNING_CERT_PASSWORD` | Password for that P12 file. |
-| `SIGNING_IDENTITY` | Code-signing identity contained in the P12 file. |
-| `SPARKLE_PRIVATE_KEY` | Sparkle Ed25519 private key matching `SUPublicEDKey` in `boringNotch/Info.plist`. |
-| `SYNC_SSH_KEY` | Private SSH key for a write-enabled deploy key installed on this repository. Its pushes can update workflows and trigger the release build. |
+| `SIGNING_CERT_P12` | Base64-encoded stable self-signed certificate and private key. |
+| `SIGNING_CERT_PASSWORD` | Password for that P12. |
+| `SIGNING_IDENTITY` | Identity contained in the P12. |
+| `SPARKLE_PRIVATE_KEY` | Ed25519 key matching `SUPublicEDKey` in `boringNotch/Info.plist`. |
+| `SYNC_SSH_KEY` | Private key for this repository's write-enabled deploy key. |
 
-Keep the existing signing certificate and Sparkle key across updates. Do not replace them as part of routine maintenance.
+Keep the existing signing certificate, Sparkle key, bundle IDs and helper IDs during routine maintenance. Xcode produces **Boring Notch.app**; publication stages it as **boringNotch.app** for installation compatibility.
 
-**Sync with upstream** merges `TheBoredTeam/boring.notch`'s `main` daily at 06:00 UTC. Set up a dedicated SSH key pair for this repository: add its public key in **Settings → Deploy keys** with **Allow write access**, and save its private key as the `SYNC_SSH_KEY` Actions secret. The key grants access only to this repository and can push workflow changes; its pushes trigger **Build latest**. No personal access token is needed.
+The repository-scoped sync deploy key is configured for this fork. **Sync with upstream** merges `TheBoredTeam/boring.notch`'s `main` daily at **06:00 UTC**. Its deploy-key push can update workflow files and trigger **Build latest**. For a new fork, install a dedicated write-enabled deploy key and set `SYNC_SSH_KEY`; the default `GITHUB_TOKEN` cannot provide those push/trigger semantics. Conflicts leave `main` untouched and create a conflict issue.
 
-GitHub's standard `GITHUB_TOKEN` cannot push workflow changes and its pushes do not trigger the release build. Without `SYNC_SSH_KEY`, sync stops with a setup error. Conflicts leave `main` untouched and create an issue. For local merges, enable the README preservation rule once with `git config merge.ours.driver true`.
+If scheduled runs stop, check that **Sync with upstream** is enabled in Actions, then dispatch it manually to inspect its result.
 
-If GitHub disables the schedule after repository inactivity, enable **Sync with upstream** in Actions and run it manually once after configuring the deploy key. Upstream-only release, nightly, Pages, manual-build and PR branch-policy jobs are restricted to the upstream repository; this fork uses **Build latest**.
-
-Run release-script checks with:
+For local upstream merges, enable the README preservation driver once:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .github/scripts/tests -v
-python3 .github/scripts/run_yandex_auth_tests.py  # macOS; uses fake storage
-python3 .github/scripts/test_lyrics.py           # macOS; uses fixture responses
+git config merge.ours.driver true
 ```
 
-## 🙏 Credits & License
+Review fork-specific behavior, signing and update configuration when resolving upstream changes. Upstream release/nightly/Pages and branch-policy jobs are restricted to the upstream repository; this fork uses its own validation, sync and release workflows and does not run Crowdin synchronization.
 
-This is a fork of **[boring.notch](https://github.com/TheBoredTeam/boring.notch)** by [The Bored Team](https://github.com/TheBoredTeam) — all credit for the app itself goes to them. See the upstream README for the full feature set (calendar, shelf/AirDrop, HUD replacement, and more).
+## Credits and license
 
-Licensed under **GNU GPLv3** (see [LICENSE](LICENSE)); this fork keeps the same license. Third-party attributions are in [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES).
+This project is a fork of **[boring.notch](https://github.com/TheBoredTeam/boring.notch)** by **[The Bored Team](https://github.com/TheBoredTeam)**. Their application provides the foundation for the notch, calendar, shelf, HUDs and other features; this fork adds and maintains the Yandex integration and its own changes.
 
-> The Yandex Music integration was added on top of The Bored Team's excellent work.
+Licensed under **GNU GPLv3**: [LICENSE](LICENSE). Dependency and bundled-component notices remain in [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES).

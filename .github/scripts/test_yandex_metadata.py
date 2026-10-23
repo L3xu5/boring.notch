@@ -2,6 +2,7 @@
 """Run the production Yandex controller against JSON-lines adapter/AX fixtures on macOS."""
 
 from pathlib import Path
+from media_test_support import core_arguments
 import plistlib
 import subprocess
 import tempfile
@@ -33,14 +34,18 @@ while (1) { sleep(1); }
         tests = (root / "Tests/YandexMetadataRegressionTests.swift").read_text()
         source = temporary / "YandexMetadataTests.swift"
         source.write_text(controller + "\n" + tests)
-        shared = (root / "boringNotch/MediaControllers/NowPlayingController.swift").read_text()
-        handler = temporary / "PipeHandler.swift"
-        handler.write_text("import Foundation\n" + shared[shared.index("struct NowPlayingUpdate:"):])
+        domain_arguments = core_arguments(temporary)
         executable = contents / "MacOS/YandexMetadataTests"
         subprocess.run([
-            "swiftc", "-swift-version", "5", "-parse-as-library",
+            "xcrun", "swiftc", "-swift-version", "5", "-parse-as-library",
             "-module-cache-path", str(temporary / "ModuleCache"),
-            str(source), str(handler), str(root / "boringNotch/models/PlaybackState.swift"),
+                *domain_arguments,
+            str(source), str(root / "boringNotch/MediaControllers/MediaAdapterSession.swift"),
+            str(root / "boringNotch/MediaControllers/YandexAccessibilityClient.swift"),
+            str(root / "boringNotch/MediaControllers/MediaRemoteCommandClient.swift"),
+            str(root / "boringNotch/MediaControllers/YandexMediaAPIClient.swift"),
+            str(root / "boringNotch/MediaControllers/MediaHTTPSession.swift"),
+            str(root / "boringNotch/managers/ImageService.swift"), str(root / "boringNotch/models/PlaybackState.swift"),
             str(root / "boringNotch/MediaControllers/MediaControllerProtocol.swift"),
             "-o", str(executable),
         ], check=True, cwd=root)

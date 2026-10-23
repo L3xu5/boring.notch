@@ -7,6 +7,7 @@
 
 import AppKit
 import CoreGraphics
+import BoringCore
 
 extension NSScreen {
     /// Returns a persistent UUID for this display
@@ -39,26 +40,18 @@ final class NSScreenUUIDCache {
     static let shared = NSScreenUUIDCache()
     
     private var cache: [String: NSScreen] = [:]
-    private var observer: Any?
+    private var observer: NotificationObservation?
     
     private init() {
         rebuildCache()
         setupObserver()
     }
     
-    deinit {
-        if let observer = observer {
-            NotificationCenter.default.removeObserver(observer)
-        }
-    }
+    deinit { observer?.cancel() }
     
     private func setupObserver() {
-        observer = NotificationCenter.default.addObserver(
-            forName: NSApplication.didChangeScreenParametersNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            self?.rebuildCache()
+        observer = NotificationObservation(name: NSApplication.didChangeScreenParametersNotification, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.rebuildCache() }
         }
     }
     

@@ -77,10 +77,11 @@ struct BatteryView: View {
 }
 
 struct ScaleButtonStyle: ButtonStyle {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .scaleEffect(configuration.isPressed ? 0.95 : 1.0)
-            .animation(.easeInOut(duration: 0.2), value: configuration.isPressed)
+            .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: configuration.isPressed)
     }
 }
 
@@ -169,17 +170,16 @@ struct BatteryMenuView: View {
 /// A view that displays the battery status and allows interaction to show detailed information.
 struct BoringBatteryView: View {
     
-    @State var batteryWidth: CGFloat = 26
+    var batteryWidth: CGFloat = 26
     var isCharging: Bool = false
     var isInLowPowerMode: Bool = false
     var isPluggedIn: Bool = false
     var levelBattery: Float = 0
     var maxCapacity: Float = 0
     var timeToFullCharge: Int = 0
-    @State var isForNotification: Bool = false
+    var isForNotification: Bool = false
     
     @State private var showPopupMenu: Bool = false
-    @State private var isPressed: Bool = false
     @State private var isHoveringButton: Bool = false
     @State private var isHoveringPopover: Bool = false
     @State private var hideTask: Task<Void, Never>? = nil
@@ -188,6 +188,7 @@ struct BoringBatteryView: View {
 
     var body: some View {
         Button(action: {
+            vm.isBatteryPopoverActive = !showPopupMenu
             withAnimation {
                 showPopupMenu.toggle()
             }
@@ -209,6 +210,13 @@ struct BoringBatteryView: View {
             }
         }
         .buttonStyle(ScaleButtonStyle())
+        .accessibilityLabel("Battery information")
+        .accessibilityValue("\(Int(levelBattery.isFinite ? min(max(levelBattery, 0), 100) : 0)) percent")
+        .help("Battery information")
+        .onHover { hovering in
+            isHoveringButton = hovering
+            if hovering { hideTask?.cancel() } else { scheduleHideIfNeeded() }
+        }
         .popover(
             isPresented: $showPopupMenu,
             arrowEdge: .bottom) {
@@ -239,10 +247,12 @@ struct BoringBatteryView: View {
         .onDisappear {
             hideTask?.cancel()
             hideTask = nil
+            vm.isBatteryPopoverActive = false
         }
     }
 
     private func scheduleHideIfNeeded() {
+        guard showPopupMenu else { return }
         if isHoveringButton || isHoveringPopover { return }
         hideTask?.cancel()
         hideTask = Task {

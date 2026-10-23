@@ -9,16 +9,8 @@ import SwiftUI
 import Defaults
 
 struct SystemEventIndicatorModifier: View {
-    @EnvironmentObject var vm: BoringViewModel
     @Binding var eventType: SneakContentType
-    @Binding var value: CGFloat {
-        didSet {
-            DispatchQueue.main.async {
-                self.sendEventBack(value)
-                self.vm.objectWillChange.send()
-            }
-        }
-    }
+    @Binding var value: CGFloat
     @Binding var icon: String
     let showSlider: Bool = false
     var sendEventBack: (CGFloat) -> Void
@@ -59,7 +51,7 @@ struct SystemEventIndicatorModifier: View {
                     EmptyView()
             }
             if (eventType != .mic) {
-                DraggableProgressBar(value: $value)
+                DraggableProgressBar(value: $value, onChange: sendEventBack, label: SystemHUDControl.title(for: eventType))
                 if Defaults[.showClosedNotchHUDPercentage] {
                     Text("\(Int(value * 100))%")
                         .font(.system(size: 12, weight: .medium))
@@ -96,9 +88,11 @@ struct SystemEventIndicatorModifier: View {
 }
 
 struct DraggableProgressBar: View {
-    @EnvironmentObject var vm: BoringViewModel
     @Binding var value: CGFloat
     var onChange: ((CGFloat) -> Void)? = nil
+    var label = "System value"
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @FocusState private var focused: Bool
     
     @State private var isDragging = false
     @State private var dragOffset: CGFloat = 0
@@ -133,26 +127,50 @@ struct DraggableProgressBar: View {
                 .gesture(
                     DragGesture(minimumDistance: 0)
                         .onChanged { gesture in
-                            withAnimation(.smooth(duration: 0.3)) {
+                            withAnimation(reduceMotion ? nil : .smooth(duration: 0.3)) {
                                 isDragging = true
                                 updateValue(gesture: gesture, in: geo)
                             }
                         }
                         .onEnded { _ in
-                            withAnimation(.smooth(duration: 0.3)) {
+                            withAnimation(reduceMotion ? nil : .smooth(duration: 0.3)) {
                                 isDragging = false
                             }
                         }
                 )
             }
             .frame(height: Defaults[.inlineHUD] ? isDragging ? 8 : 5 : isDragging ? 9 : 6)
+            .overlay {
+                if focused { RoundedRectangle(cornerRadius: 4).stroke(Color.effectiveAccent, lineWidth: 2).padding(-3) }
+            }
         }
+        .focusable().focused($focused)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(label)
+        .accessibilityValue("\(Int((value.isFinite ? min(max(value, 0), 1) : 0) * 100)) percent")
+        .accessibilityAdjustableAction { direction in
+            switch direction {
+            case .increment: setValue(value + 0.05)
+            case .decrement: setValue(value - 0.05)
+            @unknown default: break
+            }
+        }
+        .onKeyPress(.rightArrow) { setValue(value + 0.05); return .handled }
+        .onKeyPress(.leftArrow) { setValue(value - 0.05); return .handled }
+        .onKeyPress(.upArrow) { setValue(value + 0.05); return .handled }
+        .onKeyPress(.downArrow) { setValue(value - 0.05); return .handled }
     }
     
     private func updateValue(gesture: DragGesture.Value, in geometry: GeometryProxy) {
+        guard geometry.size.width > 0 else { return }
         let dragPosition = gesture.location.x
         let newValue = dragPosition / geometry.size.width
         
+        setValue(newValue)
+    }
+
+    private func setValue(_ newValue: CGFloat) {
+        guard newValue.isFinite else { return }
         value = max(0, min(newValue, 1))
         onChange?(value)
     }

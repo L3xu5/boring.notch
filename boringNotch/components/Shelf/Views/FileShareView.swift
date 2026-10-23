@@ -6,6 +6,7 @@
 //
 
 import AppKit
+import BoringCore
 import Defaults
 import SwiftUI
 import UniformTypeIdentifiers
@@ -29,7 +30,9 @@ struct FileShareView: View {
             .onDrop(of: [.fileURL, .url, .utf8PlainText, .plainText, .data, .image], isTargeted: $vm.dropZoneTargeting) { providers in
                 interactionNonce = .init()
                 vm.dropEvent = true
-                Task { await handleDrop(providers) }
+                let receiver = ShelfDragExportRegistry.claimReceiver()
+                SharingStateManager.shared.beginInteraction()
+                Task { await handleDrop(providers, receiver: receiver) }
                 return true
             }
             .onTapGesture {
@@ -107,10 +110,12 @@ struct FileShareView: View {
 
     // MARK: - Actions
 
-    private func handleDrop(_ providers: [NSItemProvider]) async {
+    private func handleDrop(_ providers: [NSItemProvider], receiver: AssetExportReceiver?) async {
         isProcessing = true
-        defer { isProcessing = false }
-        await quickShare.shareDroppedFiles(providers, using: selectedProvider, from: hostView)
+        defer { isProcessing = false; SharingStateManager.shared.endInteraction() }
+        await quickShare.shareDroppedFiles(providers, using: selectedProvider, from: hostView) { success in
+            Task { await receiver?.finish(success: success) }
+        }
     }
     
     private func handleClick() async {

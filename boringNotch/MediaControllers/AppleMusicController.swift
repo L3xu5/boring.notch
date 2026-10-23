@@ -29,10 +29,16 @@ class AppleMusicController: MediaControllerProtocol {
     }
 
     private var notificationTask: Task<Void, Never>?
+    private var applicationObserver: MediaApplicationObserver?
+    private var refreshID = UUID()
+    private var stopped = false
     
     // MARK: - Initialization
     init() {
         setupPlaybackStateChangeObserver()
+        applicationObserver = MediaApplicationObserver(bundleIdentifier: "com.apple.Music") { [weak self] in
+            Task { @MainActor [weak self] in await self?.updatePlaybackInfo() }
+        }
         Task {
             if isActive() {
                 await updatePlaybackInfo()
@@ -56,6 +62,12 @@ class AppleMusicController: MediaControllerProtocol {
         notificationTask?.cancel()
     }
     
+    func stop() {
+        stopped = true; refreshID = UUID()
+        notificationTask?.cancel(); notificationTask = nil
+        applicationObserver?.stop(); applicationObserver = nil
+    }
+
     // MARK: - Protocol Implementation
     func play() async {
         await executeCommand("play")
@@ -119,7 +131,7 @@ class AppleMusicController: MediaControllerProtocol {
         let script = """
         tell application \"Music\"
             try
-                set favorited of current track to " + (favorite ? "true" : "false") + "
+                set favorited of current track to \(favorite ? "true" : "false")
             end try
         end tell
         """
@@ -129,7 +141,14 @@ class AppleMusicController: MediaControllerProtocol {
     }
     
     func updatePlaybackInfo() async {
+        guard !stopped, !Task.isCancelled else { return }
+        guard isActive() else {
+            playbackState = PlaybackState(bundleIdentifier: "com.apple.Music")
+            return
+        }
+        let request = UUID(); refreshID = request
         guard let descriptor = try? await fetchPlaybackInfoAsync() else { return }
+        guard !stopped, !Task.isCancelled, refreshID == request else { return }
         guard descriptor.numberOfItems >= 11 else { return }
         var updatedState = self.playbackState
         

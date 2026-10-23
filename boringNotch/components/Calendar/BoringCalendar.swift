@@ -172,15 +172,13 @@ struct WheelPicker: View {
     }
 
     private func dateToString(for date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "E"
-        return formatter.string(from: date)
+        date.formatted(.dateTime.weekday(.abbreviated))
     }
 }
 
 struct CalendarView: View {
     @EnvironmentObject var vm: BoringViewModel
-    @ObservedObject private var calendarManager = CalendarManager.shared
+    @StateObject private var calendarManager = CalendarManager()
     @State private var selectedDate = Date()
 
     var body: some View {
@@ -220,7 +218,7 @@ struct CalendarView: View {
                 EmptyEventsView(selectedDate: selectedDate)
                 Spacer(minLength: 0)
             } else {
-                EventListView(events: calendarManager.events)
+                EventListView(events: calendarManager.events, calendarManager: calendarManager)
             }
         }
         .listRowBackground(Color.clear)
@@ -265,8 +263,8 @@ struct EmptyEventsView: View {
 
 struct EventListView: View {
     @Environment(\.openURL) private var openURL
-    @ObservedObject private var calendarManager = CalendarManager.shared
     let events: [EventModel]
+    @ObservedObject var calendarManager: CalendarManager
     @Default(.autoScrollToNextEvent) private var autoScrollToNextEvent
     @Default(.showFullEventTitles) private var showFullEventTitles
 
@@ -291,6 +289,7 @@ struct EventListView: View {
     }
 
     private func scrollToRelevantEvent(proxy: ScrollViewProxy) {
+        guard autoScrollToNextEvent else { return }
         let now = Date()
         // Determine a single target using preferred search order:
         // 1) first non-all-day upcoming/in-progress event
@@ -303,7 +302,7 @@ struct EventListView: View {
 
         Task { @MainActor in
             withTransaction(Transaction(animation: nil)) {
-                proxy.scrollTo(target.id, anchor: .top)
+                proxy.scrollTo(target.occurrenceID, anchor: .top)
             }
         }
     }
@@ -311,7 +310,7 @@ struct EventListView: View {
     var body: some View {
         ScrollViewReader { proxy in
             List {
-                ForEach(filteredEvents) { event in
+                ForEach(filteredEvents, id: \.occurrenceID) { event in
                     Button(action: {
                         if let url = event.calendarAppURL() {
                             openURL(url)
@@ -319,7 +318,7 @@ struct EventListView: View {
                     }) {
                         eventRow(event)
                     }
-                    .id(event.id)
+                    .id(event.occurrenceID)
                     .padding(.leading, -5)
                     .buttonStyle(PlainButtonStyle())
                     .listRowSeparator(.automatic)

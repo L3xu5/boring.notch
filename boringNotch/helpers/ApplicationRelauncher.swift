@@ -1,26 +1,21 @@
-//
-//  ApplicationRelauncher.swift
-//  boringNotch
-//
-//  Created by Corentin132 on 03/10/2025.
-//
-
 import AppKit
 
+@MainActor
 enum ApplicationRelauncher {
     static func restart() {
-        guard let bundleIdentifier = Bundle.main.bundleIdentifier else { return }
-
-        let workspace = NSWorkspace.shared
-
-        guard let appURL = workspace.urlForApplication(withBundleIdentifier: bundleIdentifier)
-        else { return }
-
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.createsNewApplicationInstance = true
-
-        workspace.openApplication(at: appURL, configuration: configuration, completionHandler: nil)
-
-        NSApplication.shared.terminate(nil)
+        configuration.activates = false
+        // Relaunch this exact bundle, even when a development build shares its identifier
+        // with the installed release. Keep the current app alive if launching fails.
+        NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: configuration) { _, error in
+            Task { @MainActor in
+                if let error {
+                    NSApp.presentError(error)
+                } else {
+                    NSApp.terminate(nil)
+                }
+            }
+        }
     }
 }

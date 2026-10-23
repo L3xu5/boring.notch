@@ -40,19 +40,26 @@ struct MusicControllerSelectionView: View {
             ScrollView {
                 VStack(spacing: 12) {
                     ForEach(availableMediaControllers) { controller in
+                        Button {
+                            self.selectedMediaController = controller
+                        } label: {
                         ControllerOptionView(
                             controller: controller,
                             isSelected: self.selectedMediaController == controller
                         )
-                        .onTapGesture {
-                            self.selectedMediaController = controller
                         }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(controller.rawValue)
+                        .accessibilityHint(controller.description)
+                        .accessibilityValue(self.selectedMediaController == controller ? "Selected" : "")
                     }
                 }
                 .padding()
             }
-            //Disable scroll if there are 4 or fewer to avoid unnecessary scroll behavior
-            .scrollDisabled(availableMediaControllers.count <= 4)
+            if selectedMediaController == .youtubeMusic {
+                Link("Set up the YouTube Music client", destination: URL(string: "https://github.com/pear-devs/pear-desktop")!)
+                    .font(.callout)
+            }
 
 //            Spacer()
 
@@ -67,8 +74,14 @@ struct MusicControllerSelectionView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
                 .padding(.bottom, 24)
+                 .keyboardShortcut(.defaultAction)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onAppear {
+            if !availableMediaControllers.contains(selectedMediaController), let first = availableMediaControllers.first {
+                selectedMediaController = first
+            }
+        }
         .background(
             VisualEffectView(material: .underWindowBackground, blendingMode: .behindWindow)
                 .ignoresSafeArea()
@@ -96,11 +109,6 @@ struct ControllerOptionView: View {
                     .font(.subheadline)
                     .foregroundColor(.secondary)
                 
-                if controller == .youtubeMusic, let url = URL(string: "https://github.com/pear-devs/pear-desktop") {
-                    Link("View on GitHub: pear-devs/pear-desktop", destination: url)
-                        .font(.subheadline)
-                        .padding(.top, 2)
-                }
             }
             
             Spacer()
@@ -131,7 +139,7 @@ extension MediaControllerType {
         case .youtubeMusic:
             return "Requires a third-party client with API plugin enabled."
         case .yandexMusic:
-            return "Connects to the official Yandex Music app. Playback and track info work out of the box; \"like\" is best-effort via Accessibility."
+            return "Works with the official Yandex Music app. Accessibility enables playback controls; connecting an account for lyrics is optional."
         }
     }
 }

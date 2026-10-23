@@ -1,6 +1,18 @@
 import Combine
+import BoringCore
 import Foundation
 import Security
+
+enum MediaExecutionMode {
+    static var isIsolatedPreview: Bool {
+        #if DEBUG
+        return MediaStartupPolicy.isIsolatedPreview(debugBuild: true, bundleIdentifier: Bundle.main.bundleIdentifier,
+                                                   arguments: CommandLine.arguments)
+        #else
+        return false
+        #endif
+    }
+}
 
 protocol YandexMusicTokenStorage {
     func read() throws -> String?
@@ -78,9 +90,14 @@ enum YandexMusicTokenError: LocalizedError {
 
 /// The legacy preference is removed only after a token is confirmed in secure storage.
 /// Injected storage keeps migration and failure handling testable without using a real Keychain.
+@MainActor
 final class YandexMusicTokenStore: ObservableObject {
-    static let shared = YandexMusicTokenStore(storage: YandexMusicKeychainStorage(),
-                                            legacyStorage: YandexMusicLegacyDefaults())
+    static let shared: YandexMusicTokenStore = {
+        if MediaExecutionMode.isIsolatedPreview {
+            return YandexMusicTokenStore(storage: PreviewTokenStorage(), legacyStorage: PreviewLegacyStorage())
+        }
+        return YandexMusicTokenStore(storage: YandexMusicKeychainStorage(), legacyStorage: YandexMusicLegacyDefaults())
+    }()
 
     @Published private(set) var token = ""
     @Published private(set) var errorMessage: String?
@@ -141,10 +158,21 @@ final class YandexMusicTokenStore: ObservableObject {
         }
     }
 
-    static func isValidToken(_ value: String) -> Bool {
+    nonisolated static func isValidToken(_ value: String) -> Bool {
         !value.isEmpty && value.utf8.count <= 8192
             && value.rangeOfCharacter(from: .whitespacesAndNewlines.union(.controlCharacters)) == nil
     }
+}
+
+private final class PreviewTokenStorage: YandexMusicTokenStorage {
+    private var token: String?
+    func read() -> String? { token }
+    func save(_ token: String) { self.token = token }
+    func delete() { token = nil }
+}
+private struct PreviewLegacyStorage: YandexMusicLegacyTokenStorage {
+    func read() -> String? { nil }
+    func delete() {}
 }
 
 enum YandexMusicOAuthError: LocalizedError {

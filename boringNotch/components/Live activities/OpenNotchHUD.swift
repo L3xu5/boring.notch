@@ -9,7 +9,6 @@ import SwiftUI
 import Defaults
 
 struct OpenNotchHUD: View {
-    @EnvironmentObject var vm: BoringViewModel
     @Binding var type: SneakContentType
     @Binding var value: CGFloat
     @Binding var icon: String
@@ -50,7 +49,7 @@ struct OpenNotchHUD: View {
             if type != .mic {
                 DraggableProgressBar(value: $value, onChange: { newVal in
                      updateSystemValue(newVal)
-                })
+                }, label: SystemHUDControl.title(for: type))
                 .frame(width: showPercentage ? 65 : 108) // Fixed width for consistency
             } else {
                 Text(value > 0 ? "Unmuted" : "Muted")
@@ -87,14 +86,7 @@ struct OpenNotchHUD: View {
     }
     
     func updateSystemValue(_ newVal: CGFloat) {
-        switch type {
-        case .volume:
-            VolumeManager.shared.setAbsolute(Float32(newVal))
-        case .brightness:
-            BrightnessManager.shared.setAbsolute(value: Float32(newVal))
-        default:
-            break
-        }
+        SystemHUDControl.setValue(newVal, for: type)
     }
 }
 

@@ -9,6 +9,28 @@ private struct YandexMetadataFailure: Error, CustomStringConvertible {
     let description: String
 }
 
+private actor DelayedYandexAX: YandexAccessibilityProviding {
+    private var actions: [YandexPlayerAction] = []
+    private var actionWaiters: [CheckedContinuation<Bool, Never>] = []
+    private var favoriteWaiters: [CheckedContinuation<Bool?, Never>] = []
+    var pendingActions: Int { actionWaiters.count }
+    var pendingFavorites: Int { favoriteWaiters.count }
+    var performedCount: Int { actions.count }
+    func read(processIdentifier: pid_t) -> YandexAccessibilityMetadata? { nil }
+    func perform(_ action: YandexPlayerAction, processIdentifier: pid_t,
+                 isCurrent: @escaping @Sendable () -> Bool) async -> Bool {
+        let success = await withCheckedContinuation { actionWaiters.append($0) }
+        guard success, !Task.isCancelled, isCurrent() else { return false }
+        actions.append(action)
+        return true
+    }
+    func favoriteState(processIdentifier: pid_t) async -> Bool? {
+        await withCheckedContinuation { favoriteWaiters.append($0) }
+    }
+    func finishAction(_ result: Bool) { actionWaiters.removeFirst().resume(returning: result) }
+    func finishFavorite(_ result: Bool?) { favoriteWaiters.removeFirst().resume(returning: result) }
+}
+
 private final class YandexMetadataURLProtocol: URLProtocol {
     static var requests: [URLRequest] = []
     static var respond: ((URLRequest) -> (URL, Int, Data))?
@@ -47,6 +69,7 @@ private extension YandexMusicController {
         let data = try JSONSerialization.data(withJSONObject: ["diff": diff, "payload": payload])
         await handleAdapterUpdate(try JSONDecoder().decode(YandexNowPlayingUpdate.self, from: data))
     }
+    @MainActor func metadataTestRefreshFavorite() async { await refreshFavoriteState() }
     static func metadataTestFetchArtwork(_ node: YandexAccessibilityNode, token: String,
                                          session: URLSession) async -> Data? {
         guard let metadata = YandexAccessibilityMetadata(root: node) else { return nil }
@@ -68,6 +91,108 @@ private struct YandexMetadataRegressionTests {
         while !condition() {
             guard Date() < deadline else { throw YandexMetadataFailure(description: message) }
             try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+    @MainActor
+    private static func waitForAX(_ message: String, condition: () async -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(2)
+        while !(await condition()) {
+            guard Date() < deadline else { throw YandexMetadataFailure(description: message) }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
+    @MainActor
+    private static func delayedAXLifecycle() async throws {
+        for result in [false, true] {
+            let client = DelayedYandexAX()
+            var unavailable = 0
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: { unavailable += 1 }, startMonitoring: false)!
+            let operation = Task { await controller.play() }
+            try await waitForAX("transport did not enter injected AX") { await client.pendingActions == 1 }
+            controller.stop()
+            await client.finishAction(result)
+            await operation.value
+            let effects = await client.performedCount
+            try expect(effects == 0 && unavailable == 0 && !controller.playbackState.isPlaying,
+                       "Stopped source performed AX/launch/prompt/optimistic effects after an awaited result")
+            passed += 1
+            print("PASS delayed AX transport after stop (result \(result))")
+        }
+        do {
+            let client = DelayedYandexAX()
+            var unavailable = 0
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: { unavailable += 1 }, startMonitoring: false)!
+            let operation = Task { await controller.togglePlay() }
+            try await waitForAX("cancelled transport did not enter AX") { await client.pendingActions == 1 }
+            operation.cancel()
+            await client.finishAction(true)
+            await operation.value
+            let effects = await client.performedCount
+            try expect(effects == 0 && unavailable == 0 && !controller.playbackState.isPlaying,
+                       "Cancelled source command still changed playback or requested a fallback")
+            controller.stop()
+            passed += 1
+            print("PASS cancelled AX transport has no side effects")
+        }
+        for settingFavorite in [false, true] {
+            let client = DelayedYandexAX()
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await controller.metadataTestUpdate(["bundleIdentifier": "ru.yandex.desktop.music", "title": "Before", "artist": "Artist"], diff: false)
+            let operation = Task {
+                if settingFavorite { await controller.setFavorite(true) }
+                else { await controller.metadataTestRefreshFavorite() }
+            }
+            try await waitForAX("favorite did not enter injected AX") { await client.pendingFavorites == 1 }
+            try await controller.metadataTestUpdate(["title": "After", "artist": "New artist"])
+            await client.finishFavorite(!settingFavorite)
+            await operation.value
+            let effects = await client.performedCount
+            try expect(effects == 0 && controller.playbackState.title == "After" && !controller.playbackState.isFavorite,
+                       "A previous track's late favorite read changed the new track or pressed its like button")
+            controller.stop()
+            try await controller.metadataTestUpdate(["title": "Queued after stop"])
+            try expect(controller.playbackState.title == "After", "Stopped source accepted an already-queued adapter callback")
+            passed += 1
+            print("PASS stale favorite read and queued metadata after stop (set \(settingFavorite))")
+        }
+        do {
+            let client = DelayedYandexAX()
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await controller.metadataTestUpdate(["bundleIdentifier": "ru.yandex.desktop.music", "title": "Before", "artist": "Artist"], diff: false)
+            let operation = Task { await controller.setFavorite(true) }
+            try await waitForAX("favorite read did not start") { await client.pendingFavorites == 1 }
+            await client.finishFavorite(false)
+            try await waitForAX("like press did not enter AX") { await client.pendingActions == 1 }
+            try await controller.metadataTestUpdate(["title": "After"])
+            await client.finishAction(true)
+            await operation.value
+            let effects = await client.performedCount
+            try expect(effects == 0 && !controller.playbackState.isFavorite, "A like lookup already in flight pressed the next track's control")
+            controller.stop()
+            passed += 1
+            print("PASS favorite action validates track ticket at the side effect")
+        }
+        do {
+            let client = DelayedYandexAX()
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await controller.metadataTestUpdate(["bundleIdentifier": "ru.yandex.desktop.music", "title": "Track", "playing": true], diff: false)
+            let operation = Task { await controller.togglePlay() }
+            try await waitForAX("toggle did not enter AX") { await client.pendingActions == 1 }
+            try await controller.metadataTestUpdate(["playing": false])
+            await client.finishAction(true)
+            await operation.value
+            let effects = await client.performedCount
+            try expect(effects == 0 && !controller.playbackState.isPlaying,
+                       "A stale AX toggle resumed playback after a newer native pause")
+            controller.stop()
+            passed += 1
+            print("PASS newer native transport observation cancels an unaccepted AX toggle")
         }
     }
 
@@ -122,6 +247,7 @@ private struct YandexMetadataRegressionTests {
 
     @MainActor
     static func main() async throws {
+        try await delayedAXLifecycle()
         try await stream("parent owner survives helper-only diff", [
             update(["parentApplicationBundleIdentifier": "ru.yandex.desktop.music", "bundleIdentifier": "ru.yandex.helper.1",
                     "title": "Old title", "artist": "Old artist"], diff: false),
@@ -299,6 +425,6 @@ private struct YandexMetadataRegressionTests {
         try expect(cancelledResult == nil && YandexMetadataURLProtocol.requests.isEmpty, "Cancelled image request still loaded data")
         passed += 1
         print("PASS anonymous lookup, redirected image rejection and request cancellation")
-        print("\(passed) Yandex metadata checks passed; playback controls were never invoked.")
+        print("\(passed) Yandex metadata/lifecycle checks passed; real player controls were never invoked.")
     }
 }

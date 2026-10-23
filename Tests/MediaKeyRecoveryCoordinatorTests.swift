@@ -1,7 +1,7 @@
 import Foundation
 
-// Platform and player fixtures only. The coordinator's properties and methods
-// below are inserted directly from MusicManager.swift by the test runner.
+// Links the real coordinator and Core policy. Fixtures supply only player observations,
+// selected-source state and command effects; recovery logic is never copied into this file.
 enum FixtureMediaController { case yandexMusic, spotify }
 
 enum Defaults {
@@ -31,6 +31,7 @@ final class YandexMusicController {
     var afterRefresh: (() -> Void)?
     var refreshCount = 0
     var toggleCount = 0
+    var acceptToggle = true
 
     func refreshAccessibilityMetadata() async {
         refreshCount += 1
@@ -38,22 +39,35 @@ final class YandexMusicController {
         afterRefresh?()
     }
 
-    func togglePlay() async {
+    func togglePlayWithReceipt() async -> Bool {
         toggleCount += 1
+        guard acceptToggle else { return false }
         accessibilityIsPlaying = accessibilityIsPlaying.map { !$0 }
         accessibilityMetadataLastReadAt = Date()
+        return true
     }
 }
 
+@MainActor
 final class MusicManager {
     var activeController: AnyObject?
-    // PRODUCTION_RECOVERY_PROPERTIES
-
-    init(controller: YandexMusicController) { activeController = controller }
-
-    func cancelForTest() { cancelMediaKeyRecovery() }
-
-    // PRODUCTION_RECOVERY_METHODS
+    private var coordinator: MediaKeyRecoveryCoordinator!
+    init(controller: YandexMusicController) {
+        activeController = controller
+        coordinator = MediaKeyRecoveryCoordinator(snapshot: { [weak controller] in
+            .init(systemOwner: controller?.systemMediaOwnerBundleIdentifier,
+                  systemIsPlaying: controller?.systemMediaIsPlaying, foreignActivity: controller?.lastForeignMediaActivity,
+                  yandexIsPlaying: controller?.accessibilityIsPlaying,
+                  accessibilityObservedAt: controller?.accessibilityMetadataLastReadAt,
+                  foregroundApp: NSWorkspace.shared.frontmostApplication?.bundleIdentifier, capturedAt: Date())
+        }, refresh: { [weak controller] in await controller?.refreshAccessibilityMetadata() },
+           toggle: { [weak controller] in await controller?.togglePlayWithReceipt() ?? false }, isActive: { [weak self, weak controller] in
+            guard let self, let controller else { return false }
+            return self.activeController === controller && Defaults[.mediaController] == .yandexMusic
+        })
+    }
+    func cancelForTest() { coordinator.stop() }
+    func recoverUnresponsiveSystemPlayPause() { coordinator.handlePlayPause() }
 }
 
 @main
@@ -173,6 +187,22 @@ struct MediaKeyRecoveryCoordinatorTests {
             await wait(1450)
             require(controller.toggleCount == 0 && controller.refreshCount == 0,
                     "rapid double presses cancel the first fallback and do not arm another")
+            manager.cancelForTest()
+        }
+
+        do {
+            let (manager, controller) = fixture()
+            controller.acceptToggle = false
+            manager.recoverUnresponsiveSystemPlayPause()
+            await wait()
+            require(controller.toggleCount == 1, "the first proven candidate reaches the controller")
+            controller.accessibilityIsPlaying = false
+            controller.accessibilityMetadataLastReadAt = Date()
+            await wait(1500)
+            controller.acceptToggle = true
+            manager.recoverUnresponsiveSystemPlayPause()
+            await wait()
+            require(controller.toggleCount == 1, "a dropped AX command must not fabricate recent-recovery proof for paused background Yandex")
             manager.cancelForTest()
         }
 

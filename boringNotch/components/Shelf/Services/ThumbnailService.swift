@@ -1,98 +1,85 @@
-//
-//  ThumbnailService.swift
-//  boringNotch
-//
-//  Created by Alexander on 2025-10-07.
-//
-
 import Foundation
 import AppKit
 import QuickLookThumbnailing
-import UniformTypeIdentifiers
+import BoringCore
+
+private struct ThumbnailKey: Hashable, Sendable {
+    let path: String
+    let modified: Date?
+    let fileSize: Int?
+    let width: Double
+    let height: Double
+    let scale: Double
+}
+private final class ThumbnailImage: @unchecked Sendable {
+    let image: NSImage
+    init(_ image: NSImage) { self.image = image }
+}
+private final class ThumbnailGeneration: @unchecked Sendable {
+    let request: QLThumbnailGenerator.Request
+    let generator = QLThumbnailGenerator.shared
+    init(_ request: QLThumbnailGenerator.Request) { self.request = request }
+    func cancel() { generator.cancel(request) }
+}
 
 actor ThumbnailService {
     static let shared = ThumbnailService()
+    private var cache = CostBoundedCache<ThumbnailKey, ThumbnailImage>(maximumCost: 32 * 1024 * 1024)
+    private var pending: [ThumbnailKey: (id: UUID, task: Task<ThumbnailImage?, Never>)] = [:]
+    private var generation: UInt64 = 0
 
-    private var cache: [String: NSImage] = [:]
-    private var pendingRequests: [String: Task<NSImage?, Never>] = [:]
-    private let thumbnailGenerator = QLThumbnailGenerator.shared
-
-    private init() {}
-    
     func thumbnail(for url: URL, size: CGSize) async -> NSImage? {
-        let cacheKey = "\(url.path)_\(size.width)x\(size.height)"
-        
-        if let cached = cache[cacheKey] {
-            return cached
-        }
-        
-        if let pending = pendingRequests[cacheKey] {
-            return await pending.value
-        }
-        
-        let task = Task<NSImage?, Never> {
-            let thumbnail = await generateQuickLookThumbnail(for: url, size: size)
-            if let thumbnail = thumbnail {
-                cache[cacheKey] = thumbnail
+        guard !ShelfStorageEnvironment.isIsolatedPreview else { return nil }
+        let scale = await MainActor.run { NSScreen.main?.backingScaleFactor ?? 2 }
+        let values = url.accessSecurityScopedResource { try? $0.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]) }
+        let key = ThumbnailKey(path: url.standardizedFileURL.path, modified: values?.contentModificationDate,
+                               fileSize: values?.fileSize, width: size.width, height: size.height, scale: scale)
+        if let value = cache.value(forKey: key) { return value.image }
+        if let request = pending[key] { return await request.task.value?.image }
+        let id = UUID()
+        let epoch = generation
+        let task = Task {
+            let image = await generate(for: url, size: size, scale: scale)
+            if !Task.isCancelled, epoch == generation, let image {
+                let cost = max(1, Int(size.width * scale) * Int(size.height * scale) * 4)
+                cache.insert(image, forKey: key, cost: cost)
             }
-            pendingRequests[cacheKey] = nil
-            return thumbnail
+            if pending[key]?.id == id { pending[key] = nil }
+            return image
         }
-        
-        pendingRequests[cacheKey] = task
-        return await task.value
+        pending[key] = (id, task)
+        return await task.value?.image
     }
-    
     func clearCache() {
+        generation &+= 1
+        pending.values.forEach { $0.task.cancel() }
+        pending.removeAll()
         cache.removeAll()
     }
-    
     func clearCache(for url: URL) {
-        cache = cache.filter { !$0.key.starts(with: url.path) }
+        generation &+= 1
+        let path = url.standardizedFileURL.path
+        for key in cache.keys where key.path == path { cache.removeValue(forKey: key) }
+        for key in pending.keys.filter({ $0.path == path }) { pending.removeValue(forKey: key)?.task.cancel() }
     }
-    
-    // MARK: - Private Methods
-    
-    private func generateQuickLookThumbnail(for url: URL, size: CGSize) async -> NSImage? {
-        let scale = await MainActor.run { NSScreen.main?.backingScaleFactor ?? 2.0 }
-        
-        return await url.accessSecurityScopedResource { scopedURL in
-            NSLog("🔐 ThumbnailService: obtaining security scope for \(scopedURL.path)")
-            let request = QLThumbnailGenerator.Request(
-                fileAt: scopedURL,
-                size: size,
-                scale: scale,
-                representationTypes: .all
-            )
+    private func generate(for url: URL, size: CGSize, scale: Double) async -> ThumbnailImage? {
+        await url.accessSecurityScopedResource { scoped in
+            let request = QLThumbnailGenerator.Request(fileAt: scoped, size: size, scale: scale, representationTypes: .all)
             request.iconMode = true
-
-            return await withCheckedContinuation { (continuation: CheckedContinuation<NSImage?, Never>) in
-                thumbnailGenerator.generateBestRepresentation(for: request) { representation, error in
-                    if let rep = representation {
-                        NSLog("🔍 ThumbnailService: generated thumbnail for \(scopedURL.path)")
-                        continuation.resume(returning: rep.nsImage)
-                    } else {
-                        if let err = error { 
-                            NSLog("⚠️ ThumbnailService: thumbnail error for \(scopedURL.path): \(err.localizedDescription)") 
-                        }
-                        continuation.resume(returning: nil)
+            let operation = ThumbnailGeneration(request)
+            let result = CallbackResult<ThumbnailImage?>()
+            return await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    result.install(continuation)
+                    guard !Task.isCancelled else { result.cancel(returning: nil); return }
+                    operation.generator.generateBestRepresentation(for: request) { representation, _ in
+                        let image = representation.map { ThumbnailImage(NSImage(cgImage: $0.cgImage,
+                            size: NSSize(width: $0.cgImage.width, height: $0.cgImage.height))) }
+                        result.resume(returning: image)
                     }
+                    result.onCancel { operation.cancel() }
                 }
-            }
+            } onCancel: { result.cancel(returning: nil) }
         }
-    }
-}
-
-// MARK: - Extensions
-
-extension QLThumbnailRepresentation {
-    var nsImage: NSImage {
-        return NSImage(cgImage: self.cgImage, size: self.cgImage.size)
-    }
-}
-
-extension CGImage {
-    var size: NSSize {
-        return NSSize(width: self.width, height: self.height)
     }
 }

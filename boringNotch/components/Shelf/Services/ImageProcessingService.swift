@@ -8,6 +8,7 @@
 import Foundation
 import AppKit
 import CoreImage
+import CoreImage.CIFilterBuiltins
 import CoreGraphics
 import Vision
 import PDFKit
@@ -15,8 +16,8 @@ import UniformTypeIdentifiers
 import ImageIO
 
 /// Options for image conversion
-struct ImageConversionOptions {
-    enum ImageFormat {
+struct ImageConversionOptions: Sendable {
+    enum ImageFormat: Sendable {
         case png, jpeg, heic, tiff, bmp
         
         var utType: UTType {
@@ -47,17 +48,17 @@ struct ImageConversionOptions {
 }
 
 /// Service for processing images (background removal, conversion, PDF creation)
-@MainActor
-final class ImageProcessingService {
+actor ImageProcessingService {
     static let shared = ImageProcessingService()
     
     private init() {}
-    private let ciContext = CIContext(options: nil)
+    private lazy var ciContext = CIContext(options: nil)
     
     // MARK: - Remove Background
     
     /// Removes the background from an image using Vision framework
     func removeBackground(from url: URL) async throws -> URL? {
+        try Task.checkCancellation()
         guard let inputImage = NSImage(contentsOf: url) else {
             throw ImageProcessingError.invalidImage
         }
@@ -70,6 +71,7 @@ final class ImageProcessingService {
         let handler = VNImageRequestHandler(cgImage: cgImage)
         
         try handler.perform([request])
+        try Task.checkCancellation()
         
         guard let result = request.results?.first else {
             throw ImageProcessingError.backgroundRemovalFailed
@@ -91,6 +93,7 @@ final class ImageProcessingService {
             throw ImageProcessingError.saveFailed
         }
         
+        try Task.checkCancellation()
         guard let tempURL = await TemporaryFileStorageService.shared.createTempFile(
             for: .data(finalData, suggestedName: newName)
         ) else {
@@ -113,8 +116,7 @@ final class ImageProcessingService {
             throw ImageProcessingError.backgroundRemovalFailed
         }
         
-        let context = CIContext()
-        guard let result = context.createCGImage(output, from: output.extent) else {
+        guard let result = ciContext.createCGImage(output, from: output.extent) else {
             throw ImageProcessingError.backgroundRemovalFailed
         }
         
@@ -125,6 +127,7 @@ final class ImageProcessingService {
     
     /// Converts an image with specified options
     func convertImage(from url: URL, options: ImageConversionOptions) async throws -> URL? {
+        try Task.checkCancellation()
         guard var inputImage = NSImage(contentsOf: url) else {
             throw ImageProcessingError.invalidImage
         }
@@ -157,6 +160,7 @@ final class ImageProcessingService {
         let originalName = url.deletingPathExtension().lastPathComponent
         let newName = "\(originalName)_converted.\(options.format.fileExtension)"
         
+        try Task.checkCancellation()
         guard let tempURL = await TemporaryFileStorageService.shared.createTempFile(
             for: .data(data, suggestedName: newName)
         ) else {
@@ -193,12 +197,11 @@ final class ImageProcessingService {
                 return nil
             }
             let ciImage = CIImage(cgImage: cgImage)
-            let context = CIContext()
             let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
             let options: [CIImageRepresentationOption: Any] = [
                 CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): quality
             ]
-            return try? context.heifRepresentation(of: ciImage, format: .RGBA8, colorSpace: colorSpace, options: options)
+            return ciContext.heifRepresentation(of: ciImage, format: .RGBA8, colorSpace: colorSpace, options: options)
         }
     }
     
@@ -248,14 +251,15 @@ final class ImageProcessingService {
         
         let pdfDocument = PDFDocument()
         
-        for (index, url) in imageURLs.enumerated() {
+        for url in imageURLs {
+            try Task.checkCancellation()
             guard let image = NSImage(contentsOf: url) else {
                 continue
             }
             
             let pdfPage = PDFPage(image: image)
             if let page = pdfPage {
-                pdfDocument.insert(page, at: index)
+                pdfDocument.insert(page, at: pdfDocument.pageCount)
             }
         }
         
@@ -271,6 +275,7 @@ final class ImageProcessingService {
             throw ImageProcessingError.pdfCreationFailed
         }
         
+        try Task.checkCancellation()
         guard let tempURL = await TemporaryFileStorageService.shared.createTempFile(
             for: .data(pdfData, suggestedName: pdfName)
         ) else {
@@ -283,11 +288,8 @@ final class ImageProcessingService {
     // MARK: - Helper Methods
     
     /// Checks if a URL is an image file
-    func isImageFile(_ url: URL) -> Bool {
-        guard let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType else {
-            return false
-        }
-        return contentType.conforms(to: .image)
+    nonisolated func isImageFile(_ url: URL) -> Bool {
+        UTType(filenameExtension: url.pathExtension)?.conforms(to: .image) ?? false
     }
 }
 

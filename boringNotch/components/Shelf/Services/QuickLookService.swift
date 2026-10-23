@@ -9,6 +9,7 @@ import Foundation
 import UniformTypeIdentifiers
 import SwiftUI
 import QuickLookUI
+import QuickLook
 import AppKit
 
 @MainActor
@@ -20,39 +21,39 @@ final class QuickLookService: ObservableObject {
 
     private var previewPanel: QLPreviewPanel?
     private var dataSource: QuickLookDataSource?
-    private var accessingURLs: [URL] = []
+    private var resources: SharingSessionResources?
+    private var requestID = UUID()
     private var previewPanelObserver: Any?
 
     func show(urls: [URL], selectFirst: Bool = true, slideshow: Bool = false) {
-        guard !urls.isEmpty else { return }
-        stopAccessingCurrentURLs()
-        accessingURLs = urls.filter { url in
-            if url.isFileURL {
-                return url.startAccessingSecurityScopedResource()
+        guard !ShelfStorageEnvironment.isIsolatedPreview, !urls.isEmpty else { return }
+        let id = UUID()
+        requestID = id
+        Task { @MainActor in
+            let resources = await SharingSessionResources.acquire(fileURLs: urls.filter(\.isFileURL))
+            guard requestID == id else { resources.finish(); return }
+            self.resources?.finish()
+            if let old = previewPanel {
+                NotificationCenter.default.removeObserver(self, name: NSWindow.willCloseNotification, object: old)
             }
-            return true
+            self.resources = resources
+            self.urls = urls
+            self.isQuickLookOpen = true
+            if selectFirst { self.selectedURL = urls.first }
+            let panel = QLPreviewPanel.shared()
+            previewPanel = panel
+            NotificationCenter.default.addObserver(self, selector: #selector(previewPanelWillClose(_:)),
+                name: NSWindow.willCloseNotification, object: panel)
         }
-        self.urls = accessingURLs
-        self.isQuickLookOpen = true
-        if selectFirst {
-            self.selectedURL = accessingURLs.first
-        }
-        // Observe the shared Quick Look preview panel closing so we can relinquish security scope
-        let panel = QLPreviewPanel.shared()
-        // Remove any existing observer for previous panel
-        if let prev = previewPanel {
-            NotificationCenter.default.removeObserver(self, name: NSWindow.willCloseNotification, object: prev)
-        }
-        previewPanel = panel
-        NotificationCenter.default.addObserver(self, selector: #selector(previewPanelWillClose(_:)), name: NSWindow.willCloseNotification, object: panel)
     }
 
     func hide() {
+        let panel = previewPanel
         stopAccessingCurrentURLs()
         selectedURL = nil
         urls.removeAll()
         isQuickLookOpen = false
-        if let panel = previewPanel, panel.isVisible {
+        if let panel, panel.isVisible {
             panel.orderOut(nil)
         }
         if let panel = previewPanel {
@@ -62,11 +63,9 @@ final class QuickLookService: ObservableObject {
     }
     
     private func stopAccessingCurrentURLs() {
-        NSLog("Stopping access to \(accessingURLs.count) URLs")
-        for url in accessingURLs where url.isFileURL {
-            url.stopAccessingSecurityScopedResource()
-        }
-        accessingURLs.removeAll()
+        requestID = UUID()
+        resources?.finish()
+        resources = nil
         // If Quick Look panel was closed externally, also remove observer and clear reference
         if let panel = previewPanel {
             NotificationCenter.default.removeObserver(self, name: NSWindow.willCloseNotification, object: panel)
@@ -87,16 +86,7 @@ final class QuickLookService: ObservableObject {
 extension QuickLookService {
     @objc private func previewPanelWillClose(_ notification: Notification) {
         guard let panel = notification.object as? QLPreviewPanel, panel === previewPanel else { return }
-        // Ensure cleanup happens on main actor
-        Task { @MainActor in
-            stopAccessingCurrentURLs()
-            selectedURL = nil
-            urls.removeAll()
-            isQuickLookOpen = false
-            // Remove observer and clear reference
-            NotificationCenter.default.removeObserver(self, name: NSWindow.willCloseNotification, object: panel)
-            previewPanel = nil
-        }
+        hide()
     }
 }
 
@@ -106,6 +96,9 @@ struct QuickLookPresenter: ViewModifier {
     func body(content: Content) -> some View {
         content
             .quickLookPreview($service.selectedURL, in: service.urls)
+            .onChange(of: service.selectedURL) { _, url in
+                if url == nil && service.isQuickLookOpen { service.hide() }
+            }
     }
 }
 

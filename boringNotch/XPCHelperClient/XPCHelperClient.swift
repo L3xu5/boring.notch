@@ -1,250 +1,113 @@
 import Foundation
 import Cocoa
-import AsyncXPCConnection
+import ApplicationServices
+import BoringCore
 
+/// UI authorization belongs to this process. Only hardware calls cross the embedded XPC
+/// boundary, with one connection epoch and an explicit deadline for every request.
+@MainActor
 final class XPCHelperClient: NSObject {
-    nonisolated static let shared = XPCHelperClient()
-    
-    private let serviceName = "theboringteam.boringnotch.BoringNotchXPCHelper"
-    
-    private var remoteService: RemoteXPCService<BoringNotchXPCHelperProtocol>?
+    static let shared = XPCHelperClient()
     private var connection: NSXPCConnection?
+    private var epoch = ConnectionEpoch()
     private var lastKnownAuthorization: Bool?
     private var monitoringTask: Task<Void, Never>?
-    
-    deinit {
-        connection?.invalidate()
-        stopMonitoringAccessibilityAuthorization()
+    private enum RequestError: Error, Sendable { case unavailable, timeout, cancelled }
+
+    private func ensureConnection() -> (NSXPCConnection, UUID) {
+        if let connection, let id = epoch.current { return (connection, id) }
+        let id = epoch.begin()
+        let connection = NSXPCConnection(serviceName: "theboringteam.boringnotch.BoringNotchXPCHelper")
+        connection.remoteObjectInterface = NSXPCInterface(with: BoringNotchXPCHelperProtocol.self)
+        connection.interruptionHandler = { [weak self] in Task { @MainActor in self?.invalidate(id) } }
+        connection.invalidationHandler = { [weak self] in Task { @MainActor in self?.invalidate(id) } }
+        connection.resume()
+        self.connection = connection
+        return (connection, id)
     }
-    
-    // MARK: - Connection Management (Main Actor Isolated)
-    
-    @MainActor
-    private func ensureRemoteService() -> RemoteXPCService<BoringNotchXPCHelperProtocol> {
-        if let existing = remoteService {
-            return existing
+    private func invalidate(_ id: UUID) {
+        guard epoch.invalidate(id) else { return }
+        let old = connection
+        connection = nil
+        old?.interruptionHandler = nil
+        old?.invalidationHandler = nil
+        old?.invalidate()
+    }
+    private func request<Value: Sendable>(
+        _ invoke: (any BoringNotchXPCHelperProtocol, @escaping @Sendable (Value) -> Void) -> Void
+    ) async throws -> Value {
+        let (connection, id) = ensureConnection()
+        let result = CallbackResult<Result<Value, RequestError>>()
+        let deadline = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(2)) } catch { return }
+            result.resume(returning: .failure(.timeout))
+            self?.invalidate(id)
         }
-        
-        let conn = NSXPCConnection(serviceName: serviceName)
-        
-        conn.interruptionHandler = { [weak self] in
-            Task { @MainActor in
-                self?.connection = nil
-                self?.remoteService = nil
+        let response = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                result.install(continuation)
+                guard !Task.isCancelled else { result.cancel(returning: .failure(.cancelled)); return }
+                guard let proxy = connection.remoteObjectProxyWithErrorHandler({ [weak self] _ in
+                    result.resume(returning: .failure(.unavailable))
+                    Task { @MainActor in self?.invalidate(id) }
+                }) as? any BoringNotchXPCHelperProtocol else {
+                    result.resume(returning: .failure(.unavailable)); return
+                }
+                invoke(proxy) { result.resume(returning: .success($0)) }
             }
-        }
-        
-        conn.invalidationHandler = { [weak self] in
-            Task { @MainActor in
-                self?.connection = nil
-                self?.remoteService = nil
-            }
-        }
-        
-        conn.resume()
-        
-        let service = RemoteXPCService<BoringNotchXPCHelperProtocol>(
-            connection: conn,
-            remoteInterface: BoringNotchXPCHelperProtocol.self
-        )
-        
-        connection = conn
-        remoteService = service
-        return service
+        } onCancel: { result.cancel(returning: .failure(.cancelled)) }
+        deadline.cancel()
+        return try response.get()
     }
-    
-    @MainActor
-    private func getRemoteService() -> RemoteXPCService<BoringNotchXPCHelperProtocol>? {
-        remoteService
-    }
-    
-    @MainActor
     private func notifyAuthorizationChange(_ granted: Bool) {
         guard lastKnownAuthorization != granted else { return }
         lastKnownAuthorization = granted
-        NotificationCenter.default.post(
-            name: .accessibilityAuthorizationChanged,
-            object: nil,
-            userInfo: ["granted": granted]
-        )
+        NotificationCenter.default.post(name: .accessibilityAuthorizationChanged, object: nil, userInfo: ["granted": granted])
     }
-
-    // MARK: - Monitoring
-    nonisolated func startMonitoringAccessibilityAuthorization(every interval: TimeInterval = 3.0) {
-        // Ensure only one monitor exists
+    func requestAccessibilityAuthorization() {
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        notifyAuthorizationChange(AXIsProcessTrustedWithOptions(options))
+    }
+    func isAccessibilityAuthorized() async -> Bool {
+        let granted = AXIsProcessTrusted()
+        notifyAuthorizationChange(granted)
+        return granted
+    }
+    func ensureAccessibilityAuthorization(promptIfNeeded: Bool) async -> Bool {
+        if promptIfNeeded && !AXIsProcessTrusted() { requestAccessibilityAuthorization() }
+        return await isAccessibilityAuthorized()
+    }
+    func startMonitoringAccessibilityAuthorization(every interval: TimeInterval = 3) {
         stopMonitoringAccessibilityAuthorization()
-        monitoringTask = Task.detached { [weak self] in
-            guard let self = self else { return }
+        monitoringTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
-                // Call the helper method periodically which will notify on change
+                guard let self else { return }
                 _ = await self.isAccessibilityAuthorized()
-                do {
-                    try await Task.sleep(for: .seconds(interval))
-                } catch { break }
+                do { try await Task.sleep(for: .seconds(max(0.5, interval))) } catch { return }
             }
         }
     }
-
-    nonisolated func stopMonitoringAccessibilityAuthorization() {
-        monitoringTask?.cancel()
-        monitoringTask = nil
+    func stopMonitoringAccessibilityAuthorization() { monitoringTask?.cancel(); monitoringTask = nil }
+    var isMonitoring: Bool { monitoringTask != nil }
+    func isKeyboardBrightnessAvailable() async -> Bool { (try? await request { $0.isKeyboardBrightnessAvailable(with: $1) }) ?? false }
+    func currentKeyboardBrightness() async -> Float? {
+        try? await request { service, reply in service.currentKeyboardBrightness { reply($0?.floatValue) } }
     }
-
-    // Expose whether the client is actively monitoring (useful for tests/debug)
-    var isMonitoring: Bool {
-        return monitoringTask != nil
+    func setKeyboardBrightness(_ value: Float) async -> Bool {
+        guard value.isFinite else { return false }
+        return (try? await request { $0.setKeyboardBrightness(min(1, max(0, value)), with: $1) }) ?? false
     }
-    
-    // MARK: - Accessibility
-    
-    nonisolated func requestAccessibilityAuthorization() {
-        Task {
-            let service = await MainActor.run {
-                ensureRemoteService()
-            }
-            try? await service.withService { service in
-                service.requestAccessibilityAuthorization()
-            }
-        }
+    func isScreenBrightnessAvailable() async -> Bool { (try? await request { $0.isScreenBrightnessAvailable(with: $1) }) ?? false }
+    func currentScreenBrightness() async -> Float? {
+        try? await request { service, reply in service.currentScreenBrightness { reply($0?.floatValue) } }
     }
-    
-    nonisolated func isAccessibilityAuthorized() async -> Bool {
-        do {
-            let service = await MainActor.run {
-                ensureRemoteService()
-            }
-            let result: Bool = try await service.withContinuation { service, continuation in
-                service.isAccessibilityAuthorized { authorized in
-                    continuation.resume(returning: authorized)
-                }
-            }
-            await MainActor.run {
-                notifyAuthorizationChange(result)
-            }
-            return result
-        } catch {
-            return false
-        }
+    func setScreenBrightness(_ value: Float) async -> Bool {
+        guard value.isFinite else { return false }
+        return (try? await request { $0.setScreenBrightness(min(1, max(0, value)), with: $1) }) ?? false
     }
-    
-    nonisolated func ensureAccessibilityAuthorization(promptIfNeeded: Bool) async -> Bool {
-        do {
-            let service = await MainActor.run {
-                ensureRemoteService()
-            }
-            let result: Bool = try await service.withContinuation { service, continuation in
-                service.ensureAccessibilityAuthorization(promptIfNeeded) { authorized in
-                    continuation.resume(returning: authorized)
-                }
-            }
-            await MainActor.run {
-                notifyAuthorizationChange(result)
-            }
-            return result
-        } catch {
-            return false
-        }
-    }
-    
-    // MARK: - Keyboard Brightness
-    
-    nonisolated func isKeyboardBrightnessAvailable() async -> Bool {
-        do {
-            let service = await MainActor.run {
-                ensureRemoteService()
-            }
-            return try await service.withContinuation { service, continuation in
-                service.isKeyboardBrightnessAvailable { available in
-                    continuation.resume(returning: available)
-                }
-            }
-        } catch {
-            return false
-        }
-    }
-    
-    nonisolated func currentKeyboardBrightness() async -> Float? {
-        do {
-            let service = await MainActor.run {
-                ensureRemoteService()
-            }
-            let result: NSNumber? = try await service.withContinuation { service, continuation in
-                service.currentKeyboardBrightness { value in
-                    continuation.resume(returning: value)
-                }
-            }
-            return result?.floatValue
-        } catch {
-            return nil
-        }
-    }
-    
-    nonisolated func setKeyboardBrightness(_ value: Float) async -> Bool {
-        do {
-            let service = await MainActor.run {
-                ensureRemoteService()
-            }
-            return try await service.withContinuation { service, continuation in
-                service.setKeyboardBrightness(value) { success in
-                    continuation.resume(returning: success)
-                }
-            }
-        } catch {
-            return false
-        }
-    }
-    
-    // MARK: - Screen Brightness
-    
-    nonisolated func isScreenBrightnessAvailable() async -> Bool {
-        do {
-            let service = await MainActor.run {
-                ensureRemoteService()
-            }
-            return try await service.withContinuation { service, continuation in
-                service.isScreenBrightnessAvailable { available in
-                    continuation.resume(returning: available)
-                }
-            }
-        } catch {
-            return false
-        }
-    }
-    
-    nonisolated func currentScreenBrightness() async -> Float? {
-        do {
-            let service = await MainActor.run {
-                ensureRemoteService()
-            }
-            let result: NSNumber? = try await service.withContinuation { service, continuation in
-                service.currentScreenBrightness { value in
-                    continuation.resume(returning: value)
-                }
-            }
-            return result?.floatValue
-        } catch {
-            return nil
-        }
-    }
-    
-    nonisolated func setScreenBrightness(_ value: Float) async -> Bool {
-        do {
-            let service = await MainActor.run {
-                ensureRemoteService()
-            }
-            return try await service.withContinuation { service, continuation in
-                service.setScreenBrightness(value) { success in
-                    continuation.resume(returning: success)
-                }
-            }
-        } catch {
-            return false
-        }
-    }
+    deinit { monitoringTask?.cancel(); connection?.invalidate() }
 }
 
 extension Notification.Name {
     static let accessibilityAuthorizationChanged = Notification.Name("accessibilityAuthorizationChanged")
 }
-
-

@@ -8,7 +8,8 @@
 
 import Cocoa
 
-struct CalendarModel: Equatable {
+// NSColor is immutable; this DTO carries no EventKit store or mutable calendar object.
+struct CalendarModel: Equatable, @unchecked Sendable {
     let id: String
     let account: String
     let title: String

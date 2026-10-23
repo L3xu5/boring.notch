@@ -49,6 +49,9 @@ jobs:
         with:
           xcode-version: '26.6'
 
+      - name: Verify Core, native integrations and publication behavior
+        run: python3 .github/scripts/check_project.py
+
       - name: Compute and stamp version
         id: ver
         run: |

@@ -7,7 +7,12 @@
 
 import Cocoa
 
-class BoringNotchWindow: NSPanel {
+protocol NotchKeyboardFocusable: AnyObject {
+    var acceptsKeyboardFocus: Bool { get set }
+}
+
+class BoringNotchWindow: NSPanel, NotchKeyboardFocusable {
+    var acceptsKeyboardFocus = false
     override init(
         contentRect: NSRect,
         styleMask: NSWindow.StyleMask,
@@ -41,7 +46,7 @@ class BoringNotchWindow: NSPanel {
     }
     
     override var canBecomeKey: Bool {
-        false
+        acceptsKeyboardFocus
     }
     
     override var canBecomeMain: Bool {

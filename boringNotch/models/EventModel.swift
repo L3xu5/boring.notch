@@ -8,8 +8,9 @@
 //
 
 import Foundation
+import BoringCore
 
-struct EventModel: Equatable, Identifiable {
+struct EventModel: Equatable, Identifiable, Sendable {
     let id: String
     let start: Date
     let end: Date
@@ -26,7 +27,7 @@ struct EventModel: Equatable, Identifiable {
     let priority: Priority?
 }
 
-enum AttendanceStatus: Comparable {
+enum AttendanceStatus: Comparable, Sendable {
     case accepted
     case maybe
     case pending
@@ -48,13 +49,13 @@ enum AttendanceStatus: Comparable {
     }
 }
 
-enum EventType: Equatable {
+enum EventType: Equatable, Sendable {
     case event(AttendanceStatus)
     case birthday
     case reminder(completed: Bool)
 }
 
-enum EventStatus: Equatable {
+enum EventStatus: Equatable, Sendable {
     case upcoming
     case inProgress
     case ended
@@ -68,6 +69,10 @@ extension EventType {
 
 extension EventModel {
     
+    var occurrenceID: CalendarOccurrenceID {
+        CalendarOccurrenceID(sourceIdentifier: id, occurrenceStart: type.isReminder ? nil : start)
+    }
+
     var eventStatus: EventStatus {
         if start > Date() {
             return .upcoming
@@ -84,7 +89,7 @@ extension EventModel {
 
     func calendarAppURL() -> URL? {
 
-        guard let id = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else {
+        guard let id = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed.subtracting(CharacterSet(charactersIn: "/"))) else {
             return nil
         }
 
@@ -95,6 +100,8 @@ extension EventModel {
         let date: String
         if hasRecurrenceRules {
             let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.calendar = Calendar(identifier: .gregorian)
             formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ssZ"
             if !isAllDay {
                 formatter.timeZone = .init(secondsFromGMT: 0)
@@ -111,14 +118,14 @@ extension EventModel {
     }
 }
 
-struct Participant: Hashable {
+struct Participant: Hashable, Sendable {
     let name: String
     let status: AttendanceStatus
     let isOrganizer: Bool
     let isCurrentUser: Bool
 }
 
-enum Priority {
+enum Priority: Sendable {
     case high
     case medium
     case low

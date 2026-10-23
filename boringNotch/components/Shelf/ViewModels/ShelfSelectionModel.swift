@@ -75,6 +75,11 @@ final class ShelfSelectionModel: ObservableObject {
         }
     }
 
+    func reconcile(with allItems: [ShelfItem]) {
+        selectedIDs.formIntersection(Set(allItems.map(\.id)))
+        ensureValidAnchor(in: allItems)
+    }
+
     @Published private(set) var isDragging: Bool = false
 
     func beginDrag() {

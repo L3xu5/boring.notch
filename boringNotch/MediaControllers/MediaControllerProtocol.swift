@@ -5,16 +5,20 @@
 //  Created by Alexander on 2025-03-29.
 //
 
+import BoringCore
 import Foundation
 import AppKit
 import Combine
 
+@MainActor
 protocol MediaControllerProtocol: ObservableObject {
     var playbackStatePublisher: AnyPublisher<PlaybackState, Never> { get }
+    var capabilities: MediaCapabilities { get }
     var supportsVolumeControl: Bool { get }
     var supportsFavorite: Bool { get }
     var supportsDislike: Bool { get }
 
+    func stop()
     func setFavorite(_ favorite: Bool) async
     func dislike() async
     func play() async
@@ -31,6 +35,10 @@ protocol MediaControllerProtocol: ObservableObject {
 }
 
 extension MediaControllerProtocol {
+    var capabilities: MediaCapabilities {
+        .init(volume: supportsVolumeControl, favorite: supportsFavorite, dislike: supportsDislike)
+    }
+    func stop() {}
     // Most sources have no dedicated dislike; default to just removing the like.
     var supportsDislike: Bool { false }
     func dislike() async { await setFavorite(false) }

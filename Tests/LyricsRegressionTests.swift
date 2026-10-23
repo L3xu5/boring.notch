@@ -1,8 +1,8 @@
 import Foundation
 import CryptoKit
 
-// This fixture receives the actual production code from test_lyrics.py. It substitutes only
-// application state, AppleScript and URL loading; matching and request handling stay unchanged.
+// Links the real LyricsService, HTTP providers and Swift 6 Core module. Only preferences,
+// native-lyrics results and URL loading are injected; no production algorithms are copied.
 let temporaryDirectory = FileManager.default.temporaryDirectory
     .appendingPathComponent("boring-notch-lyrics-fixtures-" + UUID().uuidString)
 
@@ -103,45 +103,54 @@ final class FixtureURLProtocol: URLProtocol {
     override func stopLoading() { delivery?.cancel() }
 }
 
-class MusicManager {
+@MainActor
+final class MusicManager {
     var songTitle = "Song"
     var artistName = "Artist"
     var album = ""
     var songDuration = 200.0
     var bundleIdentifier: String? = "com.apple.Music"
-    var isFetchingLyrics = false
-    var currentLyrics = ""
-    var syncedLyrics: [(time: Double, text: String)] = []
-    // PRODUCTION_LYRICS_PROPERTIES
-    // PRODUCTION_LYRICS_METHODS
+    private var lastRequest: LyricsRequest?
+    private let service: LyricsService
+    init() {
+        service = LyricsService(cache: LyricsCache(fileURL: temporaryDirectory.appendingPathComponent(UUID().uuidString + ".json")), session: .shared, nativeLyrics: {
+            guard NSRunningApplication.isRunning else { return nil }
+            return try await AppleScriptHelper.execute("")?.stringValue
+        })
+    }
+    var currentLyrics: String { service.document.plain }
+    var syncedLyrics: [LyricsLine] { service.document.synced }
+    var isFetchingLyrics: Bool { service.isFetching }
+    func request(title: String = "Song", bundle: String? = "com.apple.Music") {
+        songTitle = title; bundleIdentifier = bundle
+        let request = LyricsRequest(source: Defaults.source.rawValue, bundleIdentifier: bundle, title: title,
+                                    artist: artistName, album: album, duration: songDuration, nativeTrackID: nil,
+                                    yandexToken: Defaults.source == .yandexMusic ? YandexMusicTokenStore.shared.token : "")
+        lastRequest = request
+        service.request(request, enabled: Defaults.enabled)
+    }
+    func reloadLyricsForCurrentTrack() {
+        if let lastRequest { service.request(lastRequest, enabled: Defaults.enabled, force: true) }
+    }
+    func match(_ items: [[String: Any]], duration: Double) -> String? {
+        guard let data = try? JSONSerialization.data(withJSONObject: items),
+              let candidates = try? JSONDecoder().decode([LyricsMatchCandidate].self, from: data) else { return nil }
+        return LyricsRecordingMatcher.best(candidates, duration: duration)?.id
+    }
+    func cacheKey(album: String = "Album", bundle: String? = "player", token: String = "") -> String {
+        LyricsService.cacheKey(.init(source: Defaults.source.rawValue, bundleIdentifier: bundle, title: "Song",
+                                    artist: "Artist", album: album, duration: 200, nativeTrackID: nil, yandexToken: token))
+    }
+    var cacheCount: Int { service.positiveCacheCount }
+    func retryNow() { service.retryNow() }
+    func stop() { service.stop(clear: true) }
 }
-
-// PRODUCTION_YANDEX_PROVIDER
 
 extension YandexLyricsProvider {
     func encodedQueryValue(_ value: String) -> String? { queryValue(value) }
     func matchesArtist(_ names: [String], target: String) -> Bool {
         artistsMatch(["artists": names.map { ["name": $0] }], target)
     }
-}
-
-extension MusicManager {
-    @MainActor func request(title: String = "Song", bundle: String? = "com.apple.Music") {
-        songTitle = title
-        bundleIdentifier = bundle
-        fetchLyricsIfAvailable(bundleIdentifier: bundle, title: title, artist: artistName,
-                               album: album, duration: songDuration)
-    }
-    func match(_ items: [[String: Any]], duration: Double) -> String? {
-        bestLyricsMatch(items, duration: duration)?["id"] as? String
-    }
-    func cacheKey(album: String = "Album", bundle: String? = "player", token: String = "") -> String {
-        lyricsKey("Song", "Artist", album: album, duration: 200,
-                  bundleIdentifier: bundle, yandexToken: token)
-    }
-    var cacheCount: Int { lyricsCache.count }
-    func retryNow() { lyricsRetryAfter = .distantPast }
-    func stop() { cancelLyricsFetch(); lyricsSaveTask?.cancel() }
 }
 
 struct TestFailure: Error, CustomStringConvertible { let description: String }
@@ -165,12 +174,13 @@ func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
         try durationMatching()
         try cachePartitioning()
         try await yandexMatching()
+        try await exactNativeIdentifier()
         try await specialQueryCharacters()
         try await sameTrackReload()
         try await disableDuringNativeFetch()
         try await staleWebFetch()
         try await negativeResultsRetry()
-        print("8 lyrics regression scenarios passed")
+        print("9 lyrics regression scenarios passed (actual service and Core module)")
     }
 
     @MainActor static func durationMatching() throws {
@@ -204,7 +214,7 @@ func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
     }
 
     @MainActor static func yandexMatching() async throws {
-        let provider = YandexLyricsProvider(token: "fixture")
+        let provider = YandexLyricsProvider(session: .shared, token: "fixture")
         try expect(provider.matchesArtist(["Artist", "Guest"], target: "Artist featuring Guest"), "A featured performer was not normalized")
         try expect(provider.matchesArtist(["Artist", "Guest"], target: "Artist feat. Guest"), "A feat. performer was not normalized")
         try expect(!provider.matchesArtist(["Artist", "Other"], target: "Artist feat. Guest"), "A different collaboration was accepted")
@@ -224,17 +234,30 @@ func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
             }
             return .init(text: "[00:01.00]" + request.url!.deletingPathExtension().lastPathComponent)
         }
-        let result = await YandexLyricsProvider(token: "fixture").fetchLRC(title: "Sóng", artist: "Artist", album: "", duration: 200)
+        let result = await YandexLyricsProvider(session: .shared, token: "fixture").fetchLRC(title: "Sóng", artist: "Artist", album: "", duration: 200)
         guard case .lrc(let lyrics) = result else { throw TestFailure(description: "Yandex exact match was not found") }
         try expect(lyrics.contains("same-master"), "Yandex selected empty/substring/wrong-artist title or lost synced same-master preference")
-        let unrelated = await YandexLyricsProvider(token: "fixture").fetchLRC(title: "Song", artist: "Another Performer", album: "", duration: 200)
+        let unrelated = await YandexLyricsProvider(session: .shared, token: "fixture").fetchLRC(title: "Song", artist: "Another Performer", album: "", duration: 200)
         guard case .notFound = unrelated else { throw TestFailure(description: "Different performer was accepted") }
+    }
+
+    @MainActor static func exactNativeIdentifier() async throws {
+        FixtureNetwork.reset { request in
+            if request.url!.path == "/tracks/123/lyrics" {
+                return .init(json: ["result": ["downloadUrl": "https://fixture.invalid/exact.lrc"]])
+            }
+            return .init(text: "[00:01.00]Exact recording")
+        }
+        let result = await YandexLyricsProvider(session: .shared, token: "fixture").fetchLRC(title: "Ambiguous title", artist: "Artist", album: "Album", duration: 0, nativeTrackID: "123")
+        guard case .lrc(let text) = result else { throw TestFailure(description: "Exact source ID was not used") }
+        try expect(text.contains("Exact recording"), "Exact-id request lost lyrics")
+        try expect(!FixtureNetwork.requests.contains { $0.path == "/search" }, "A known exact recording was replaced with text search")
     }
 
     @MainActor static func specialQueryCharacters() async throws {
         let title = "Rock & Roll + Forever"
         let artist = "A + B"
-        let provider = YandexLyricsProvider(token: "fixture")
+        let provider = YandexLyricsProvider(session: .shared, token: "fixture")
         try expect(provider.encodedQueryValue("+/=&") == "%2B%2F%3D%26", "HMAC/query delimiters were not encoded")
         FixtureNetwork.reset { request in
             let components = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!

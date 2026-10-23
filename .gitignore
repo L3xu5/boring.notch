@@ -1,11 +1,9 @@
 # Xcode
 *.xcuserstate
 *.xcuserdata
-*.xcscheme
 *.xcuserdatad
 *.pbxuser
 *.xccheckout
-*.xcscheme
 *.xcplayground
 *.xcuserdatad
 *.xctest
@@ -45,7 +43,6 @@ __pycache__/
 
 # User-specific files
 *.xcuserdatad/
-*.xcscheme
 *.xcodeproj/xcuserdata
 *.xcodeproj/project.xcuserdata
 
@@ -59,3 +56,5 @@ __pycache__/
 sparkle_key
 cert.p12
 *.keychain-db
+
+# Shared project schemes are versioned; user schemes remain covered by xcuserdata.

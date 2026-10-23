@@ -8,19 +8,26 @@
 //
 
 import Foundation
+import BoringCore
 @preconcurrency import EventKit
 
-protocol CalendarServiceProviding {
+protocol CalendarServiceProviding: Sendable {
     func requestAccess(to type: EKEntityType) async throws -> Bool
     func calendars() async -> [CalendarModel]
     func events(from start: Date, to end: Date, calendars: [String]) async -> [EventModel]
+    func setReminderCompleted(reminderID: String, completed: Bool) async
 }
 
-class CalendarService: CalendarServiceProviding {
-    private let store = EKEventStore()
+actor CalendarService: CalendarServiceProviding {
+    static let shared = CalendarService()
+    private let store: EKEventStore?
+    init(storeFactory: @Sendable () -> EKEventStore = { EKEventStore() }) {
+        // The exact Debug preview must not even construct EventKit's live store.
+        store = ShelfStorageEnvironment.isIsolatedPreview ? nil : storeFactory()
+    }
     
-    @MainActor
     func requestAccess(to type: EKEntityType) async throws -> Bool {
+        guard let store, !ShelfStorageEnvironment.isIsolatedPreview else { return false }
         if #available(macOS 14.0, *) {
             switch type {
             case .event:
@@ -36,6 +43,7 @@ class CalendarService: CalendarServiceProviding {
     }
     
     private func hasAccess(to entityType: EKEntityType) -> Bool {
+        guard !ShelfStorageEnvironment.isIsolatedPreview else { return false }
         let status = EKEventStore.authorizationStatus(for: entityType)
         if #available(macOS 14.0, *) {
             return status == .fullAccess
@@ -45,6 +53,7 @@ class CalendarService: CalendarServiceProviding {
     }
     
     func calendars() async -> [CalendarModel] {
+        guard let store, !ShelfStorageEnvironment.isIsolatedPreview else { return [] }
         var calendars: [EKCalendar] = []
         
         for type in [EKEntityType.event, .reminder] where hasAccess(to: type) {
@@ -55,59 +64,53 @@ class CalendarService: CalendarServiceProviding {
     }
     
     func events(from start: Date, to end: Date, calendars ids: [String]) async -> [EventModel] {
-        let allCalendars = await self.calendars()
-        let filteredCalendars = allCalendars.filter { ids.isEmpty || ids.contains($0.id) }
-        let ekCalendars = filteredCalendars.compactMap { calendarModel in
-            store.calendars(for: .event).first { $0.calendarIdentifier == calendarModel.id } ??
-            store.calendars(for: .reminder).first { $0.calendarIdentifier == calendarModel.id }
-        }
-        
+        guard let store, !ShelfStorageEnvironment.isIsolatedPreview, !Task.isCancelled, !ids.isEmpty else { return [] }
+        let eventCalendars = hasAccess(to: .event) ? store.calendars(for: .event).filter { ids.contains($0.calendarIdentifier) } : []
+        let reminderCalendars = hasAccess(to: .reminder) ? store.calendars(for: .reminder).filter { ids.contains($0.calendarIdentifier) } : []
+
         var events: [EventModel] = []
         
         // Fetch regular events
-        if hasAccess(to: .event) {
-            let eventCalendars = ekCalendars.filter { store.calendars(for: .event).contains($0) }
+        if hasAccess(to: .event), !eventCalendars.isEmpty {
             let predicate = store.predicateForEvents(withStart: start, end: end, calendars: eventCalendars)
             let ekEvents = store.events(matching: predicate)
             events.append(contentsOf: ekEvents.compactMap { EventModel(from: $0) })
         }
         
         // Fetch reminders
-        if hasAccess(to: .reminder) {
-            let reminderCalendars = ekCalendars.filter { store.calendars(for: .reminder).contains($0) }
+        if hasAccess(to: .reminder), !reminderCalendars.isEmpty {
             events.append(contentsOf: await fetchReminders(from: start, to: end, calendars: reminderCalendars))
         }
         
+        guard !Task.isCancelled else { return [] }
         return events.sorted { $0.start < $1.start }
     }
     
     private func fetchReminders(from start: Date, to end: Date, calendars: [EKCalendar]) async -> [EventModel] {
-        return await withCheckedContinuation { continuation in
-            // Create predicate for reminders with due dates in the specified range
-            let predicate = store.predicateForReminders(in: calendars)
-            
-            store.fetchReminders(matching: predicate) { reminders in
-                
-                let filteredReminders = (reminders ?? []).filter { reminder in
-                    // Check if reminder has a due date within our range
-                    guard let dueDate = reminder.dueDateComponents?.date else {
-                        return false
+        let result = CallbackResult<[EventModel]>()
+        guard let store else { return [] }
+        let query = CalendarQuery(start: start, end: end, calendarIDs: [])
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                result.install(continuation)
+                guard !Task.isCancelled else { result.cancel(returning: []); return }
+                let predicate = store.predicateForReminders(in: calendars)
+                let token = store.fetchReminders(matching: predicate) { reminders in
+                    let events = (reminders ?? []).compactMap { reminder -> EventModel? in
+                        guard let components = reminder.dueDateComponents,
+                              let date = CalendarQuery.date(from: components), query.contains(date) else { return nil }
+                        return EventModel(from: reminder)
                     }
-                    
-                    return dueDate >= start && dueDate <= end
+                    result.resume(returning: events)
                 }
-                
-                // Convert to EventModel
-                let eventModels = filteredReminders.compactMap { reminder in
-                    EventModel(from: reminder)
-                }
-                
-                continuation.resume(returning: eventModels)
+                let cancellation = EventKitFetchCancellation(store: store, token: token)
+                result.onCancel { cancellation.cancel() }
             }
-        }
+        } onCancel: { result.cancel(returning: []) }
     }
-    
+
     func setReminderCompleted(reminderID: String, completed: Bool) async {
+        guard let store, !ShelfStorageEnvironment.isIsolatedPreview else { return }
         guard let reminder = store.calendarItem(withIdentifier: reminderID) as? EKReminder else { return }
         reminder.isCompleted = completed
         do {
@@ -158,7 +161,7 @@ extension EventModel {
     init?(from reminder: EKReminder) {
         guard let calendar = reminder.calendar,
               let dueDateComponents = reminder.dueDateComponents,
-              let date = Calendar.current.date(from: dueDateComponents)
+              let date = CalendarQuery.date(from: dueDateComponents)
         else { return nil }
         
         self.init(
@@ -280,4 +283,13 @@ private extension Calendar {
     func endOfDay(for date: Date) -> Date {
         dateInterval(of: .day, for: date)?.end ?? date
     }
+}
+
+/// EventKit's opaque fetch token is valid only for cancellation on its originating store.
+/// No model or mutable EventKit record is shared through this wrapper.
+private final class EventKitFetchCancellation: @unchecked Sendable {
+    let store: EKEventStore
+    let token: Any
+    init(store: EKEventStore, token: Any) { self.store = store; self.token = token }
+    func cancel() { store.cancelFetchRequest(token) }
 }

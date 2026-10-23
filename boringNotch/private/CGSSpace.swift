@@ -12,34 +12,48 @@
 import AppKit
 
 /// Small Spaces API wrapper.
+@MainActor
 public final class CGSSpace {
-    private let identifier: CGSSpaceID
+    private var identifier: CGSSpaceID?
 
     public var windows: Set<NSWindow> = [] {
         didSet {
+            guard let identifier else { return }
             let remove = oldValue.subtracting(self.windows)
             let add = self.windows.subtracting(oldValue)
 
             CGSRemoveWindowsFromSpaces(_CGSDefaultConnection(),
                                        remove.map { $0.windowNumber } as NSArray,
-                                       [self.identifier])
+                                       [identifier])
             CGSAddWindowsToSpaces(_CGSDefaultConnection(),
                                   add.map { $0.windowNumber } as NSArray,
-                                  [self.identifier])
+                                  [identifier])
         }
     }
 
     /// Initialized `CGSSpace`s *MUST* be de-initialized upon app exit!
     public init(level: Int = 0) {
         let flag = 0x1 // this value MUST be 1, otherwise, Finder decides to draw desktop icons
-        self.identifier = CGSSpaceCreate(_CGSDefaultConnection(), flag, nil)
-        CGSSpaceSetAbsoluteLevel(_CGSDefaultConnection(), self.identifier, level)
-        CGSShowSpaces(_CGSDefaultConnection(), [self.identifier])
+        let identifier = CGSSpaceCreate(_CGSDefaultConnection(), flag, nil)
+        self.identifier = identifier == 0 ? nil : identifier
+        guard identifier != 0 else { return }
+        CGSSpaceSetAbsoluteLevel(_CGSDefaultConnection(), identifier, level)
+        CGSShowSpaces(_CGSDefaultConnection(), [identifier])
+    }
+
+    public func destroy() {
+        guard let identifier else { return }
+        self.identifier = nil
+        windows.removeAll()
+        CGSHideSpaces(_CGSDefaultConnection(), [identifier])
+        CGSSpaceDestroy(_CGSDefaultConnection(), identifier)
     }
 
     deinit {
-        CGSHideSpaces(_CGSDefaultConnection(), [self.identifier])
-        CGSSpaceDestroy(_CGSDefaultConnection(), self.identifier)
+        if let identifier {
+            CGSHideSpaces(_CGSDefaultConnection(), [identifier])
+            CGSSpaceDestroy(_CGSDefaultConnection(), identifier)
+        }
     }
 }
 
