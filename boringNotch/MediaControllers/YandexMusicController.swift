@@ -10,10 +10,9 @@
 //  playback rate) to the system MediaRemote session via Chromium's MediaSession bridge.
 //
 //  This controller therefore reuses the MediaRemote adapter stream (like
-//  NowPlayingController) but filters it down to the Yandex Music bundle id, and issues
-//  transport commands through MediaRemote. "Like"/"favorite" is not expressible over
-//  MediaRemote, so it is attempted best-effort through the Accessibility API by pressing
-//  the heart button inside the app window.
+//  NowPlayingController) but filters it down to the Yandex Music bundle id. Transport,
+//  like and dislike controls use Accessibility to press Yandex's own player buttons,
+//  so commands target Yandex even when another app owns the system media session.
 //
 
 import AppKit
@@ -106,7 +105,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         MRMediaRemoteSetRepeatModeFunction = unsafeBitCast(
             setRepeatPointer, to: (@convention(c) (Int) -> Void).self)
 
-        Task { await setupNowPlayingObserver() }
+        Task { @MainActor [weak self] in await self?.setupNowPlayingObserver() }
 
         // When Yandex Music quits, the adapter stops reporting for it but the last state would
         // otherwise linger as "playing"; flip it to stopped so the notch goes idle.
@@ -134,6 +133,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         if let terminationObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(terminationObserver)
         }
+        let streamTask = self.streamTask
         streamTask?.cancel()
 
         // Tear the adapter subprocess/pipe down OFF the calling thread — waitUntilExit() would
@@ -142,11 +142,18 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         let process = self.process
         let pipeHandler = self.pipeHandler
         Task.detached {
-            await pipeHandler?.close()
+            // Let a pending read finish with EOF before closing its reader. Closing the handler
+            // first removes the readability callback and can leave that read suspended forever.
+            if let pipeHandler {
+                let pipe = await pipeHandler.getPipe()
+                try? pipe.fileHandleForWriting.close()
+            }
             if let process, process.isRunning {
                 process.terminate()
                 process.waitUntilExit()
             }
+            await streamTask?.value
+            await pipeHandler?.close()
         }
 
         self.process = nil
@@ -320,7 +327,9 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     }
 
     // MARK: - Adapter stream setup
+    @MainActor
     private func setupNowPlayingObserver() async {
+        guard !Task.isCancelled else { return }
         let process = Process()
         guard
             let scriptURL = Bundle.main.url(forResource: "mediaremote-adapter", withExtension: "pl"),
@@ -335,6 +344,10 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
 
         let pipeHandler = JSONLinesPipeHandler()
         process.standardOutput = await pipeHandler.getPipe()
+        guard !Task.isCancelled else {
+            await pipeHandler.close()
+            return
+        }
 
         self.process = process
         self.pipeHandler = pipeHandler
@@ -342,28 +355,33 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         do {
             try process.run()
             streamTask = Task { [weak self] in
-                await self?.processJSONStream()
-                // The stream ended (subprocess died / pipe closed). If the controller is still
-                // alive (i.e. this wasn't a deinit/source-switch), relaunch it.
-                await self?.streamEnded()
+                guard !Task.isCancelled else { return }
+                // Capture the handler directly: an instance method would retain the controller
+                // for the entire stream, preventing deinit when the media source changes.
+                await pipeHandler.readJSONLines(as: NowPlayingUpdate.self) { [weak self] update in
+                    guard !Task.isCancelled else { return }
+                    await self?.handleAdapterUpdate(update)
+                }
+                guard !Task.isCancelled, let delay = self?.streamEnded() else { return }
+                // Sleep without holding the controller, so a source switch can cancel a pending
+                // restart as well as an active stream.
+                do {
+                    try await Task.sleep(for: .seconds(delay))
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled else { return }
+                await self?.setupNowPlayingObserver()
             }
         } catch {
             assertionFailure("Failed to launch mediaremote-adapter.pl: \(error)")
         }
     }
 
-    private func processJSONStream() async {
-        guard let pipeHandler = self.pipeHandler else { return }
-
-        await pipeHandler.readJSONLines(as: NowPlayingUpdate.self) { [weak self] update in
-            await self?.handleAdapterUpdate(update)
-        }
-    }
-
     /// Watchdog: restarts the adapter subprocess (with capped exponential backoff) when its
     /// stream ends unexpectedly, so a crashed perl process doesn't freeze the notch forever.
     @MainActor
-    private func streamEnded() async {
+    private func streamEnded() -> TimeInterval {
         // Tear down the dead process/pipe off the main thread.
         let oldProcess = process
         let oldHandler = pipeHandler
@@ -371,14 +389,16 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         pipeHandler = nil
         Task.detached {
             await oldHandler?.close()
-            if let oldProcess, oldProcess.isRunning { oldProcess.terminate() }
+            if let oldProcess, oldProcess.isRunning {
+                oldProcess.terminate()
+                oldProcess.waitUntilExit()
+            }
         }
 
         restartAttempts = min(restartAttempts + 1, 6)
         let delay = min(pow(2.0, Double(restartAttempts)), 30) // 2, 4, 8, 16, 30, 30…s
         NSLog("[YandexMusic] Adapter stream ended; restarting in \(Int(delay))s.")
-        try? await Task.sleep(for: .seconds(delay))
-        await setupNowPlayingObserver()
+        return delay
     }
 
     // MARK: - Update handling

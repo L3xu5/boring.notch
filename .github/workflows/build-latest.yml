@@ -1,10 +1,7 @@
 name: Build latest
 
-# Builds the app on every push to main (including automatic upstream syncs), signs it with
-# the fork's Sparkle EdDSA key, and republishes both the app and a Sparkle appcast as the
-# rolling "latest" release. The app therefore self-updates in place (Check for Updates), and
-# the Homebrew cask installs the same current build — no manual version bumps either way.
-
+# SYNC_TOKEN pushes from sync-upstream trigger this workflow just like manual pushes.
+# Keep the installed bundle name and rolling ZIP URL compatible with the Homebrew cask.
 on:
   push:
     branches: [main]
@@ -12,44 +9,89 @@ on:
 
 concurrency:
   group: build-latest
-  cancel-in-progress: true
+  # Never interrupt publication between uploading an archive and its signed appcast.
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build:
+    if: github.repository == 'L3xu5/boring.notch' && github.ref == 'refs/heads/main'
     runs-on: macos-latest
     steps:
+      - name: Check signing configuration
+        env:
+          SIGNING_CERT_P12: ${{ secrets.SIGNING_CERT_P12 }}
+          SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+          SIGNING_IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          for required in SIGNING_CERT_P12 SIGNING_CERT_PASSWORD SIGNING_IDENTITY SPARKLE_PRIVATE_KEY; do
+            if [[ -z "${!required}" ]]; then
+              echo "::error::Missing repository secret: $required. See README.md for release setup."
+              exit 1
+            fi
+          done
+
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0 # full history so the commit count can be the build number
+          fetch-depth: 0 # The commit count is the fork's monotonic build number.
 
       - name: Select Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: latest-stable
 
-      - name: Compute version
+      - name: Compute and stamp version
         id: ver
         run: |
-          BUILD=$(git rev-list --count HEAD)
+          set -euo pipefail
+          BUILD="$(git rev-list --count HEAD)"
+          BASE_VERSION="$(python3 - <<'PY'
+          import re
+          from pathlib import Path
+          text = Path('boringNotch.xcodeproj/project.pbxproj').read_text()
+          versions = set(re.findall(r'MARKETING_VERSION = "?([^";]+)"?;', text))
+          if len(versions) != 1:
+              raise SystemExit('Expected one marketing version across app and helper configurations')
+          print(versions.pop())
+          PY
+          )"
+          SHORT="${BASE_VERSION}-yandex.${BUILD}"
+          python3 .github/scripts/stamp_version.py \
+            --pbxproj boringNotch.xcodeproj/project.pbxproj \
+            --version "$SHORT" --build-number "$BUILD"
           echo "build=$BUILD" >> "$GITHUB_OUTPUT"
-          echo "short=2.7.3-yandex.$BUILD" >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+          echo "archive=boringNotch-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.zip" >> "$GITHUB_OUTPUT"
 
-      - name: Build (Release, unsigned, versioned)
+      - name: Build Release
         run: |
-          set -o pipefail
+          set -euo pipefail
           xcodebuild \
             -project boringNotch.xcodeproj \
             -scheme boringNotch \
             -configuration Release \
             -destination 'generic/platform=macOS' \
             -derivedDataPath build \
-            CURRENT_PROJECT_VERSION=${{ steps.ver.outputs.build }} \
+            -disableAutomaticPackageResolution \
+            ONLY_ACTIVE_ARCH=NO \
             CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
             build
+
+      - name: Stage app with the compatible bundle name
+        run: |
+          # Upstream names its product "Boring Notch.app". Keep boringNotch.app for
+          # existing installations and the Homebrew cask without renaming the XPC helper.
+          mkdir -p dist
+          ditto "build/Build/Products/Release/Boring Notch.app" "dist/boringNotch.app"
 
       - name: Codesign with stable self-signed identity
         env:
@@ -58,77 +100,88 @@ jobs:
           IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
         run: |
           set -euo pipefail
-          APP="build/Build/Products/Release/boringNotch.app"
+          APP="dist/boringNotch.app"
           KEYCHAIN="$RUNNER_TEMP/sign.keychain-db"
           KCPW="$(openssl rand -hex 12)"
-          trap 'rm -f "$RUNNER_TEMP/cert.p12"' EXIT   # ensure the key material is removed even on failure
-          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          cleanup() {
+            rm -f "$RUNNER_TEMP/cert.p12"
+            security delete-keychain "$KEYCHAIN" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          printf '%s' "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           security create-keychain -p "$KCPW" "$KEYCHAIN"
           security set-keychain-settings -lut 21600 "$KEYCHAIN"
           security unlock-keychain -p "$KCPW" "$KEYCHAIN"
           security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PW" -T /usr/bin/codesign -A
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCPW" "$KEYCHAIN" >/dev/null
-          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
-          rm -f "$RUNNER_TEMP/cert.p12"
-          # Sign WITHOUT the App Sandbox entitlement (like the working unsigned build) so the
-          # Accessibility control of Yandex Music keeps working. The stable certificate gives a
-          # stable designated requirement, so the TCC (Accessibility) grant survives updates.
+          # The runner is disposable; keep its login keychain in the search list too.
+          security list-keychains -d user -s "$KEYCHAIN" "$HOME/Library/Keychains/login.keychain-db"
+          # Omit App Sandbox so Accessibility control works. Preserve this identity
+          # between builds so macOS Accessibility grants survive Sparkle updates.
           codesign --force --deep --timestamp=none -s "$IDENTITY" --keychain "$KEYCHAIN" "$APP"
           codesign --verify --deep --strict "$APP"
-          echo "Designated requirement:"; codesign -d -r- "$APP" 2>&1 | grep -i "designated =>" || true
 
       - name: Package app
-        run: ditto -c -k --keepParent "build/Build/Products/Release/boringNotch.app" boringNotch.zip
+        run: ditto -c -k --keepParent "dist/boringNotch.app" boringNotch.zip
 
-      - name: Sign update & generate appcast
+      - name: Sign update and generate appcast
         env:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          ARCHIVE: ${{ steps.ver.outputs.archive }}
         run: |
           set -euo pipefail
-          SIGN="$(find build/SourcePackages/artifacts -name sign_update -type f -not -path '*old_dsa*' | head -1)"
-          trap 'rm -f sparkle_key' EXIT   # ensure the private key is removed even on failure
-          printf '%s' "$SPARKLE_PRIVATE_KEY" > sparkle_key
-          SIGINFO="$("$SIGN" boringNotch.zip -f sparkle_key | grep -oE 'sparkle:edSignature="[^"]+" length="[0-9]+"')"
-          rm -f sparkle_key
-          BUILD='${{ steps.ver.outputs.build }}'
-          SHORT='${{ steps.ver.outputs.short }}'
-          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/latest/boringNotch.zip"
-          DATE="$(date -u '+%a, %d %b %Y %H:%M:%S +0000')"
-          {
-            echo '<?xml version="1.0" encoding="utf-8"?>'
-            echo '<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">'
-            echo '  <channel>'
-            echo '    <title>Boring Notch — Yandex Music Edition</title>'
-            echo "    <link>${URL}</link>"
-            echo '    <description>Rolling builds of the Yandex Music fork.</description>'
-            echo '    <item>'
-            echo "      <title>Build ${BUILD}</title>"
-            echo "      <pubDate>${DATE}</pubDate>"
-            echo "      <sparkle:version>${BUILD}</sparkle:version>"
-            echo "      <sparkle:shortVersionString>${SHORT}</sparkle:shortVersionString>"
-            echo '      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>'
-            echo "      <enclosure url=\"${URL}\" ${SIGINFO} type=\"application/octet-stream\" />"
-            echo '    </item>'
-            echo '  </channel>'
-            echo '</rss>'
-          } > appcast.xml
-          echo "Generated appcast for build ${BUILD}"
+          SIGN="build/SourcePackages/artifacts/sparkle/Sparkle/bin/sign_update"
+          test -x "$SIGN"
+          KEY_FILE="$RUNNER_TEMP/sparkle-key"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          umask 077
+          printf '%s' "$SPARKLE_PRIVATE_KEY" > "$KEY_FILE"
+          SIGINFO="$("$SIGN" boringNotch.zip -f "$KEY_FILE")"
+          cp boringNotch.zip "$ARCHIVE"
+          # Each appcast points at an immutable archive. Older feeds remain valid
+          # while the compatible rolling ZIP and the new feed are being uploaded.
+          python3 .github/scripts/create_fork_appcast.py \
+            --app dist/boringNotch.app --archive "$ARCHIVE" \
+            --download-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/latest/${ARCHIVE}" \
+            --signature "$SIGINFO" --output appcast.xml
 
-      - name: Publish rolling 'latest' release
+      - name: Publish rolling latest release
         env:
           GH_TOKEN: ${{ github.token }}
+          ARCHIVE: ${{ steps.ver.outputs.archive }}
+          BUILD: ${{ steps.ver.outputs.build }}
+          SHORT: ${{ steps.ver.outputs.short }}
         run: |
-          notes="Auto-built from \`main\` (${GITHUB_SHA::7}), build ${{ steps.ver.outputs.build }}.
-
-          The app self-updates in place via Sparkle (Settings → Check for Updates). It can also
-          be installed with Homebrew:
-          \`\`\`bash
-          brew install --cask l3xu5/boring-notch/boring-notch-yandex
-          \`\`\`"
-          # Update in place (no delete) so the appcast/enclosure never 404s mid-publish.
-          if gh release view latest >/dev/null 2>&1; then
-            gh release edit latest --title "Latest build" --notes "$notes" >/dev/null
-          else
-            gh release create latest --title "Latest build" --notes "$notes" --target "$GITHUB_SHA"
+          set -euo pipefail
+          # A queued/manual run must never replace a newer main build.
+          CURRENT_HEAD="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          if [[ "$CURRENT_HEAD" != "$GITHUB_SHA" ]]; then
+            echo "Skipping publication: main advanced beyond ${GITHUB_SHA}." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
-          gh release upload latest boringNotch.zip appcast.xml --clobber
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          Auto-built from \`main\` (${GITHUB_SHA::7}), version ${SHORT}, build ${BUILD}.
+
+          The app self-updates via Sparkle (Settings → Check for Updates).
+          Homebrew: \`brew install --cask l3xu5/boring-notch/boring-notch-yandex\`.
+          EOF
+          if ! gh release view latest >/dev/null 2>&1; then
+            gh release create latest --draft --title "Latest build" \
+              --notes-file "$RUNNER_TEMP/release-notes.md" --target "$GITHUB_SHA"
+          fi
+          gh release upload latest "$ARCHIVE"
+          gh release upload latest boringNotch.zip --clobber
+          # Publish the feed last; its archive already exists and is never overwritten
+          # by another build, including reruns. Keep old archives for older feeds.
+          gh release upload latest appcast.xml --clobber
+          # A new draft release may not create its tag until publication.
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/latest" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/latest" \
+              -f sha="$GITHUB_SHA" -F force=true >/dev/null
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref=refs/tags/latest -f sha="$GITHUB_SHA" >/dev/null
+          fi
+          gh release edit latest --draft=false --latest --title "Latest build" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
+          echo "Published ${SHORT} (${GITHUB_SHA})." >> "$GITHUB_STEP_SUMMARY"

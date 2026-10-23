@@ -27,6 +27,7 @@ permissions:
 jobs:
   authorize:
     name: Authorize manual build
+    if: ${{ github.repository == 'TheBoredTeam/boring.notch' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

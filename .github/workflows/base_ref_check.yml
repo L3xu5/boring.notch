@@ -9,7 +9,7 @@ permissions: {}
 jobs:
   validate:
     name: Fork PR target check
-    if: ${{ github.event.pull_request.head.repo.fork == true }}
+    if: ${{ github.repository == 'TheBoredTeam/boring.notch' && github.event.pull_request.head.repo.fork == true }}
     runs-on: ubuntu-latest
     permissions:
       pull-requests: read

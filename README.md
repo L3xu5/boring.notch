@@ -31,9 +31,11 @@ The upstream app already controls Apple Music, Spotify, YouTube Music and the ge
 | ⏱️ Progress bar & synced lyrics | ✅ |
 | ⏯️ Play / Pause / Next / Previous | ✅ |
 | ❤️ Like (*«Мне нравится»*) | ✅ *best-effort* |
+| 👎 Dislike · configurable media hotkeys | ✅ |
+| 🎤 Full-window karaoke lyrics · click to seek | ✅ *seeking depends on the source* |
 | 🔀 Shuffle · 🔁 Repeat | ✅ |
 
-Works with the **official Yandex Music app** (`ru.yandex.desktop.music`) — nothing extra to install, no modified client, no login inside the notch.
+Works with the **official Yandex Music app** (`ru.yandex.desktop.music`) — no modified client is needed. Playback controls do not require a Yandex account connection in the notch. Connecting an account is optional and enables lyrics from Yandex's own API; otherwise the app uses LRCLIB.
 
 ## 🔧 How it works
 
@@ -45,13 +47,13 @@ Yandex Music is an Electron app with **no AppleScript dictionary**, so the scrip
 2. **Controlling playback & likes — via the Accessibility API.**
    Transport commands **press Yandex's own on-screen buttons** instead of sending MediaRemote commands, so they always target Yandex — even when a browser tab currently owns the system media session. The controls are located on the persistent bottom player bar (anchored via the unique *Next / Previous song* buttons), and Chromium's web accessibility tree is enabled with `AXManualAccessibility`. *Like* is the bar's `Like` checkbox; its state is read from `AXValue`.
 
-The whole integration lives in one file: [`YandexMusicController.swift`](boringNotch/MediaControllers/YandexMusicController.swift).
+Playback integration lives in [`YandexMusicController.swift`](boringNotch/MediaControllers/YandexMusicController.swift). Lyrics fetching and caching live in [`MusicManager.swift`](boringNotch/managers/MusicManager.swift); account connection and Accessibility setup are in [`SettingsView.swift`](boringNotch/components/Settings/SettingsView.swift).
 
 ## 🚀 Install
 
 1. Download **`boringNotch.zip`** from the [latest release](../../releases/latest) and unzip it.
 2. Move **boringNotch.app** to `/Applications`.
-3. This build is **unsigned**, so clear the quarantine flag once:
+3. Releases use a stable **self-signed certificate**, without Apple notarization. Clear the quarantine flag once:
    ```bash
    xattr -dr com.apple.quarantine /Applications/boringNotch.app
    ```
@@ -63,6 +65,13 @@ The whole integration lives in one file: [`YandexMusicController.swift`](boringN
 2. Grant **Accessibility** permission — **System Settings → Privacy & Security → Accessibility** → enable **boringNotch**.
    *Required for transport and likes. Metadata & artwork work without it.*
 3. Play something in the Yandex Music app 🎧
+4. Optionally use **Connect…** in the Yandex Music settings to enable lyrics from your account. Lyrics timing can be adjusted with **Lyrics offset**.
+
+Updates are delivered from this fork through **Check for Updates…**. You can also install with Homebrew:
+
+```bash
+brew install --cask l3xu5/boring-notch/boring-notch-yandex
+```
 
 ## ⚠️ Known limitation
 
@@ -76,6 +85,49 @@ macOS exposes a **single** system *Now Playing* session. If another app (e.g. a 
   open boringNotch.xcodeproj
   ```
   Select the **boringNotch** scheme and press **⌘R**.
+
+Upstream names the built product **Boring Notch.app**. Fork releases package it as **boringNotch.app** to preserve existing installations and Homebrew compatibility.
+
+The Xcode project enables App Sandbox, while fork releases are signed without it so Accessibility can control Yandex Music. For a local build with the same Accessibility behavior:
+
+```bash
+xcodebuild -project boringNotch.xcodeproj -scheme boringNotch \
+  -configuration Release -destination 'generic/platform=macOS' \
+  -derivedDataPath build -disableAutomaticPackageResolution \
+  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+codesign --force --deep --timestamp=none --sign - \
+  "build/Build/Products/Release/Boring Notch.app"
+```
+
+Grant Accessibility to that local app separately. An ad-hoc signature does not preserve the release certificate's identity.
+
+## Maintaining this fork
+
+**Build latest** publishes every push to `main`, using the full commit count as `CFBundleVersion`. The marketing version is derived from the project and stamped into both the app and Sparkle feed. Keep `main` history intact so update build numbers continue to increase.
+
+The rolling release retains `boringNotch.zip` for direct downloads and Homebrew. Sparkle uses an archive unique to each build, uploaded before `appcast.xml`, so clients with an older feed can still download the matching signed archive. Old build archives must remain available. The `latest` tag moves to the built source commit. Manually dispatched builds from other branches cannot publish.
+
+Configure these repository secrets in **Settings → Secrets and variables → Actions**:
+
+| Secret | Purpose |
+| --- | --- |
+| `SIGNING_CERT_P12` | Base64-encoded stable self-signed code-signing certificate and private key. |
+| `SIGNING_CERT_PASSWORD` | Password for that P12 file. |
+| `SIGNING_IDENTITY` | Code-signing identity contained in the P12 file. |
+| `SPARKLE_PRIVATE_KEY` | Sparkle Ed25519 private key matching `SUPublicEDKey` in `boringNotch/Info.plist`. |
+| `SYNC_TOKEN` | Token for this repository with permission to push code and modify workflows. Use a classic PAT with `repo` and `workflow` scopes, or a fine-grained PAT with **Contents: Read and write** and **Workflows: Read and write**. Its pushes trigger the release workflow. |
+
+Keep the existing signing certificate and Sparkle key across updates. Do not replace them as part of routine maintenance.
+
+**Sync with upstream** merges `TheBoredTeam/boring.notch`'s `main` daily at 06:00 UTC. GitHub's standard `GITHUB_TOKEN` cannot push workflow changes and its pushes do not trigger the release build. Without `SYNC_TOKEN`, sync stops with a setup error. Conflicts leave `main` untouched and create an issue. For local merges, enable the README preservation rule once with `git config merge.ours.driver true`.
+
+If GitHub disables the schedule after repository inactivity, enable **Sync with upstream** in Actions and run it manually once after configuring the token. Upstream-only release, nightly, Pages, manual-build and PR branch-policy jobs are restricted to the upstream repository; this fork uses **Build latest**.
+
+Run release-script checks with:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .github/scripts/tests -v
+```
 
 ## 🙏 Credits & License
 

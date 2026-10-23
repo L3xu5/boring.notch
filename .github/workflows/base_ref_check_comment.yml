@@ -9,7 +9,7 @@ permissions: {}
 jobs:
   comment:
     name: Sync PR target guidance comment
-    if: ${{ github.event.pull_request.head.repo.fork == true }}
+    if: ${{ github.repository == 'TheBoredTeam/boring.notch' && github.event.pull_request.head.repo.fork == true }}
     runs-on: ubuntu-latest
     permissions:
       issues: write
