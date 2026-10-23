@@ -67,6 +67,8 @@ Playback integration lives in [`YandexMusicController.swift`](boringNotch/MediaC
 3. Play something in the Yandex Music app 🎧
 4. Optionally use **Connect…** in the Yandex Music settings to enable lyrics from your account. Lyrics timing can be adjusted with **Lyrics offset**.
 
+Connected account tokens are stored in macOS Keychain. Existing tokens from older builds are migrated automatically; the old preference is removed after a successful Keychain write.
+
 Updates are delivered from this fork through **Check for Updates…**. You can also install with Homebrew:
 
 ```bash
@@ -115,18 +117,22 @@ Configure these repository secrets in **Settings → Secrets and variables → A
 | `SIGNING_CERT_PASSWORD` | Password for that P12 file. |
 | `SIGNING_IDENTITY` | Code-signing identity contained in the P12 file. |
 | `SPARKLE_PRIVATE_KEY` | Sparkle Ed25519 private key matching `SUPublicEDKey` in `boringNotch/Info.plist`. |
-| `SYNC_TOKEN` | Token for this repository with permission to push code and modify workflows. Use a classic PAT with `repo` and `workflow` scopes, or a fine-grained PAT with **Contents: Read and write** and **Workflows: Read and write**. Its pushes trigger the release workflow. |
+| `SYNC_SSH_KEY` | Private SSH key for a write-enabled deploy key installed on this repository. Its pushes can update workflows and trigger the release build. |
 
 Keep the existing signing certificate and Sparkle key across updates. Do not replace them as part of routine maintenance.
 
-**Sync with upstream** merges `TheBoredTeam/boring.notch`'s `main` daily at 06:00 UTC. GitHub's standard `GITHUB_TOKEN` cannot push workflow changes and its pushes do not trigger the release build. Without `SYNC_TOKEN`, sync stops with a setup error. Conflicts leave `main` untouched and create an issue. For local merges, enable the README preservation rule once with `git config merge.ours.driver true`.
+**Sync with upstream** merges `TheBoredTeam/boring.notch`'s `main` daily at 06:00 UTC. Set up a dedicated SSH key pair for this repository: add its public key in **Settings → Deploy keys** with **Allow write access**, and save its private key as the `SYNC_SSH_KEY` Actions secret. The key grants access only to this repository and can push workflow changes; its pushes trigger **Build latest**. No personal access token is needed.
 
-If GitHub disables the schedule after repository inactivity, enable **Sync with upstream** in Actions and run it manually once after configuring the token. Upstream-only release, nightly, Pages, manual-build and PR branch-policy jobs are restricted to the upstream repository; this fork uses **Build latest**.
+GitHub's standard `GITHUB_TOKEN` cannot push workflow changes and its pushes do not trigger the release build. Without `SYNC_SSH_KEY`, sync stops with a setup error. Conflicts leave `main` untouched and create an issue. For local merges, enable the README preservation rule once with `git config merge.ours.driver true`.
+
+If GitHub disables the schedule after repository inactivity, enable **Sync with upstream** in Actions and run it manually once after configuring the deploy key. Upstream-only release, nightly, Pages, manual-build and PR branch-policy jobs are restricted to the upstream repository; this fork uses **Build latest**.
 
 Run release-script checks with:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .github/scripts/tests -v
+python3 .github/scripts/run_yandex_auth_tests.py  # macOS; uses fake storage
+python3 .github/scripts/test_lyrics.py           # macOS; uses fixture responses
 ```
 
 ## 🙏 Credits & License

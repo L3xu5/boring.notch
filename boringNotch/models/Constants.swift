@@ -133,9 +133,7 @@ extension Defaults.Keys {
     // Optional manual fine-tune for synced-lyrics timing (default 0 — the fetcher matches the
     // recording by duration, so no offset should normally be needed). Positive = later.
     static let lyricsOffset = Key<Double>("lyricsOffset", default: 0.0)
-    // Yandex Music OAuth token — when set, lyrics come from Yandex's own API (perfectly synced
-    // to the exact recording) instead of LRCLIB. Stored locally only.
-    static let yandexMusicToken = Key<String>("yandexMusicToken", default: "")
+    // Yandex Music OAuth credentials live in YandexMusicTokenStore (Keychain).
     static let musicControlSlots = Key<[MusicControlButton]>(
         "musicControlSlots",
         default: MusicControlButton.defaultLayout

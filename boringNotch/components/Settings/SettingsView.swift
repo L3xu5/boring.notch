@@ -1835,33 +1835,47 @@ func warningBadge(_ text: String, _ description: String) -> some View {
 /// Connect a Yandex Music account (OAuth token) so lyrics come from Yandex's own API — synced
 /// exactly to the playing recording (LRCLIB often lacks the right timing for a given edit).
 struct YandexTokenSettingsView: View {
-    @Default(.yandexMusicToken) private var token
+    @ObservedObject private var tokenStore = YandexMusicTokenStore.shared
     @State private var draft = ""
     @State private var showManual = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
-                Image(systemName: token.isEmpty ? "quote.bubble" : "checkmark.seal.fill")
-                    .foregroundStyle(token.isEmpty ? Color.secondary : Color.green)
+                Image(systemName: tokenStore.isConnected ? "checkmark.seal.fill" : "quote.bubble")
+                    .foregroundStyle(tokenStore.isConnected ? Color.green : Color.secondary)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Perfectly-synced lyrics (Yandex account)")
-                    Text(token.isEmpty
+                    Text(!tokenStore.isConnected
                          ? "Optional — connect your account for lyrics synced to the exact recording."
                          : "Connected. Lyrics come straight from Yandex, in sync with the audio.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                if token.isEmpty {
+                if !tokenStore.isConnected {
                     Button("Connect…") { YandexAuthWindowController.shared.present() }
                         .buttonStyle(.borderedProminent)
                 } else {
-                    Button("Disconnect") { token = ""; draft = "" }
+                    Button("Disconnect") {
+                        do {
+                            try tokenStore.disconnect()
+                            draft = ""
+                        } catch {
+                            // The store publishes a safe, actionable error and preserves the token.
+                        }
+                    }
                 }
             }
 
-            if token.isEmpty {
+            if let error = tokenStore.errorMessage {
+                HStack {
+                    Text(error).font(.caption).foregroundStyle(.red)
+                    Button("Retry") { tokenStore.reload() }
+                }
+            }
+
+            if !tokenStore.isConnected {
                 Button(showManual ? "Hide manual entry" : "Enter a token manually instead") {
                     withAnimation { showManual.toggle() }
                 }
@@ -1873,28 +1887,28 @@ struct YandexTokenSettingsView: View {
                         SecureField("Paste OAuth token", text: $draft)
                             .textFieldStyle(.roundedBorder)
                         Button("Save") {
-                            token = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-                            draft = ""
+                            do {
+                                try tokenStore.save(token: draft)
+                                draft = ""
+                            } catch {
+                                // Keep the draft so a failed Keychain write can be retried.
+                            }
                         }
                         .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
                 }
             }
         }
-        .onChange(of: token) { _, _ in
-            MusicManager.shared.reloadLyricsForCurrentTrack()
-        }
     }
 }
 
 /// Popup window that signs the user into Yandex in an embedded web view and captures the OAuth
 /// token from the redirect (`https://music.yandex.ru/#access_token=…`) automatically.
-final class YandexAuthWindowController: NSObject, WKNavigationDelegate {
+final class YandexAuthWindowController: NSObject, WKNavigationDelegate, NSWindowDelegate {
     static let shared = YandexAuthWindowController()
     private var window: NSWindow?
-
-    private let authURL = URL(string:
-        "https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b39c32c41195d&force_confirm=yes")!
+    private var pendingState: String?
+    private var isShowingError = false
 
     func present() {
         if let window {
@@ -1902,6 +1916,14 @@ final class YandexAuthWindowController: NSObject, WKNavigationDelegate {
             NSApp.activate(ignoringOtherApps: true)
             return
         }
+        let state: String
+        do {
+            state = try YandexMusicOAuth.makeState()
+        } catch {
+            showError(YandexMusicOAuthError.stateGeneration.localizedDescription)
+            return
+        }
+        pendingState = state
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .nonPersistent() // fresh session so the user can pick the account
         let webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 460, height: 640), configuration: config)
@@ -1916,31 +1938,54 @@ final class YandexAuthWindowController: NSObject, WKNavigationDelegate {
         w.center()
         w.isReleasedWhenClosed = false
         w.level = .floating
+        w.delegate = self
         window = w
         w.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        webView.load(URLRequest(url: authURL))
+        webView.load(URLRequest(url: YandexMusicOAuth.authorizationURL(state: state)))
     }
 
-    /// Extracts `access_token` from an OAuth redirect URL; saves it and closes on success.
+    /// Accept only a response to this sign-in session at the client's registered callback.
     @discardableResult
     private func captureToken(from url: URL?) -> Bool {
-        guard let url else { return false }
-        let fragment = url.fragment ?? url.absoluteString.components(separatedBy: "#").dropFirst().joined(separator: "#")
-        guard fragment.contains("access_token=") else { return false }
-        for pair in fragment.components(separatedBy: "&") {
-            let kv = pair.components(separatedBy: "=")
-            guard kv.count == 2, kv[0] == "access_token", !kv[1].isEmpty else { continue }
-            let token = kv[1].removingPercentEncoding ?? kv[1]
-            DispatchQueue.main.async {
-                Defaults[.yandexMusicToken] = token
-                MusicManager.shared.reloadLyricsForCurrentTrack()
-                self.window?.close()
-                self.window = nil
-            }
-            return true
+        guard window != nil, let url,
+              YandexMusicOAuth.isCallbackURL(url) || YandexMusicOAuth.hasResponseParameters(url) else {
+            return false
         }
-        return false
+        do {
+            guard let pendingState else { throw YandexMusicOAuthError.invalidCallback }
+            let token = try YandexMusicOAuth.token(from: url, expectedState: pendingState)
+            try YandexMusicTokenStore.shared.save(token: token)
+            self.pendingState = nil
+            window?.close()
+        } catch let error as YandexMusicOAuthError {
+            showError(error.localizedDescription)
+        } catch {
+            showError(YandexMusicTokenError.secureStorage.localizedDescription)
+        }
+        return true
+    }
+
+    private func showError(_ message: String) {
+        guard !isShowingError else { return }
+        let alert = NSAlert()
+        alert.messageText = "Could not connect Yandex Music"
+        alert.informativeText = message
+        if let window {
+            isShowingError = true
+            alert.beginSheetModal(for: window) { [weak self] _ in self?.isShowingError = false }
+        } else {
+            alert.runModal()
+        }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        let webView = window?.contentView as? WKWebView
+        webView?.stopLoading()
+        webView?.navigationDelegate = nil
+        pendingState = nil
+        window = nil
+        isShowingError = false
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,

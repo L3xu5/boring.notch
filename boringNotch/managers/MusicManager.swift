@@ -65,6 +65,9 @@ class MusicManager: ObservableObject {
     // The track key we last kicked off (or served) a lyrics fetch for. Used to ignore repeated
     // same-track content changes (e.g. artwork arriving late) so the loader isn't restarted.
     private var lastLyricsKey: String = ""
+    private var lyricsFetchTask: Task<Void, Never>?
+    private var lyricsRequestID = UUID()
+    private var lyricsRetryAfter: Date?
 
     // On-disk persistence of the lyrics cache, so lyrics survive relaunches instead of re-hitting
     // lrclib (slow on some networks) every time.
@@ -75,9 +78,9 @@ class MusicManager: ObservableObject {
     }
     // The filename carries a schema/logic version: bump it whenever the lyric-resolution logic
     // changes so entries cached by the old (possibly wrong) logic are dropped instead of shadowing
-    // the improved result. (v2: exact-edition Yandex resolution.)
-    private static let lyricsCacheURL = temporaryDirectory.appendingPathComponent("boringNotch-lyrics-cache-v3.json")
-    private static let legacyLyricsCacheURLs = ["boringNotch-lyrics-cache.json", "boringNotch-lyrics-cache-v2.json"]
+    // the improved result. (v4: provider/account/album keys and bounded duration matching.)
+    private static let lyricsCacheURL = temporaryDirectory.appendingPathComponent("boringNotch-lyrics-cache-v4.json")
+    private static let legacyLyricsCacheURLs = ["boringNotch-lyrics-cache.json", "boringNotch-lyrics-cache-v2.json", "boringNotch-lyrics-cache-v3.json"]
         .map { temporaryDirectory.appendingPathComponent($0) }
     private var lyricsSaveTask: Task<Void, Never>?
 
@@ -113,10 +116,22 @@ class MusicManager: ObservableObject {
                         self.lastLyricsKey = ""
                         self.fetchLyricsIfAvailable(bundleIdentifier: self.bundleIdentifier, title: self.songTitle, artist: self.artistName, album: self.album, duration: self.songDuration)
                     } else {
+                        self.cancelLyricsFetch()
                         self.isFetchingLyrics = false
                         self.currentLyrics = ""
                         self.syncedLyrics = []
                     }
+                }
+            }
+            .store(in: &cancellables)
+
+        YandexMusicTokenStore.shared.$token
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] _ in
+                Task { @MainActor in
+                    guard let self, Defaults[.mediaController] == .yandexMusic else { return }
+                    self.reloadLyricsForCurrentTrack()
                 }
             }
             .store(in: &cancellables)
@@ -142,6 +157,8 @@ class MusicManager: ObservableObject {
     
     public func destroy() {
         debounceIdleTask?.cancel()
+        cancelLyricsFetch()
+        lyricsSaveTask?.cancel()
         cancellables.removeAll()
         controllerCancellables.removeAll()
         flipWorkItem?.cancel()
@@ -153,6 +170,7 @@ class MusicManager: ObservableObject {
 
     // MARK: - Setup Methods
     private func createController(for type: MediaControllerType) -> (any MediaControllerProtocol)? {
+        cancelLyricsFetch()
         // Cleanup previous controller
         if activeController != nil {
             controllerCancellables.removeAll()
@@ -394,52 +412,70 @@ class MusicManager: ObservableObject {
     }
 
     // MARK: - Lyrics
+    /// Cancel before clearing the key: a reload of the same recording must invalidate its
+    /// previous request too, even if an AppleScript/network operation ignores cancellation.
+    private func cancelLyricsFetch() {
+        lyricsFetchTask?.cancel()
+        lyricsFetchTask = nil
+        lyricsRequestID = UUID()
+        lyricsRetryAfter = nil
+        lastLyricsKey = ""
+    }
+
+    private func isCurrentLyricsRequest(_ requestID: UUID, key: String) -> Bool {
+        !Task.isCancelled && Defaults[.enableLyrics]
+            && requestID == lyricsRequestID && key == lastLyricsKey
+    }
+
     /// Forces a fresh lyrics fetch for the current track (e.g. after connecting a Yandex token),
     /// bypassing the dedup and any cached entry.
+    @MainActor
     func reloadLyricsForCurrentTrack() {
-        let key = lyricsKey(songTitle, artistName, songDuration)
+        let token = Defaults[.mediaController] == .yandexMusic ? YandexMusicTokenStore.shared.token : ""
+        let key = lyricsKey(songTitle, artistName, album: album, duration: songDuration,
+                            bundleIdentifier: bundleIdentifier, yandexToken: token)
         lyricsCache[key] = nil
-        lastLyricsKey = ""
+        cancelLyricsFetch()
         fetchLyricsIfAvailable(bundleIdentifier: bundleIdentifier, title: songTitle, artist: artistName, album: album, duration: songDuration)
     }
 
+    @MainActor
     private func fetchLyricsIfAvailable(bundleIdentifier: String?, title: String, artist: String, album: String = "", duration: Double = 0) {
-        guard Defaults[.enableLyrics], !title.isEmpty else {
-            DispatchQueue.main.async {
-                self.isFetchingLyrics = false
-                self.currentLyrics = ""
-            }
+        guard Defaults[.enableLyrics], !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            cancelLyricsFetch()
+            isFetchingLyrics = false
+            currentLyrics = ""
+            syncedLyrics = []
             return
         }
 
-        let key = lyricsKey(title, artist, duration)
-        // Fast path: nothing relevant changed (called on every update) — already fetched/serving
-        // this exact track+duration, so do nothing.
-        if key == lastLyricsKey { return }
+        let yandexToken = Defaults[.mediaController] == .yandexMusic ? YandexMusicTokenStore.shared.token : ""
+        let key = lyricsKey(title, artist, album: album, duration: duration,
+                            bundleIdentifier: bundleIdentifier, yandexToken: yandexToken)
+        if key == lastLyricsKey {
+            // Misses are retried after a short backoff; they are never persisted indefinitely.
+            guard let retryAfter = lyricsRetryAfter, Date() >= retryAfter else { return }
+        }
+        cancelLyricsFetch()
         lastLyricsKey = key
+        let requestID = lyricsRequestID
 
-        // Serve a resolved result (positive or negative) from cache instead of re-hitting the
-        // network (also survives relaunch via the on-disk cache).
         if let cached = lyricsCache[key] {
-            DispatchQueue.main.async {
-                self.isFetchingLyrics = false
-                self.currentLyrics = cached.plain
-                self.syncedLyrics = cached.synced
-            }
+            isFetchingLyrics = false
+            currentLyrics = cached.plain
+            syncedLyrics = cached.synced
             return
         }
 
-        // Prefer native Apple Music lyrics when available
-        if let bundleIdentifier = bundleIdentifier, bundleIdentifier.contains("com.apple.Music") {
-            Task { @MainActor in
-                let runningApps = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Music")
-                guard !runningApps.isEmpty else {
-                    await self.fetchLyricsFromWeb(title: title, artist: artist, album: album, duration: duration)
-                    return
-                }
-
-                self.isFetchingLyrics = true
-                self.currentLyrics = ""
+        isFetchingLyrics = true
+        currentLyrics = ""
+        syncedLyrics = []
+        lyricsFetchTask = Task { @MainActor [weak self] in
+            guard let self, self.isCurrentLyricsRequest(requestID, key: key) else { return }
+            // Prefer native Apple Music lyrics when available. Its AppleScript may complete
+            // after cancellation, so apply the same request identity check as web providers.
+            if bundleIdentifier == "com.apple.Music",
+               !NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Music").isEmpty {
                 do {
                     let script = """
                     tell application \"Music\"
@@ -463,23 +499,23 @@ class MusicManager: ObservableObject {
                         end if
                     end tell
                     """
-                    if let result = try await AppleScriptHelper.execute(script), let lyricsString = result.stringValue, !lyricsString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        self.currentLyrics = lyricsString.trimmingCharacters(in: .whitespacesAndNewlines)
-                        self.isFetchingLyrics = false
+                    let result = try await AppleScriptHelper.execute(script)
+                    guard self.isCurrentLyricsRequest(requestID, key: key) else { return }
+                    if let lyrics = result?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !lyrics.isEmpty {
+                        self.currentLyrics = lyrics
                         self.syncedLyrics = []
+                        self.isFetchingLyrics = false
+                        self.lyricsCache[key] = (plain: lyrics, synced: [])
+                        self.scheduleLyricsCacheSave()
                         return
                     }
                 } catch {
-                    // fall through to web lookup
+                    guard self.isCurrentLyricsRequest(requestID, key: key) else { return }
                 }
-                await self.fetchLyricsFromWeb(title: title, artist: artist, album: album, duration: duration)
             }
-        } else {
-            Task { @MainActor in
-                self.isFetchingLyrics = true
-                self.currentLyrics = ""
-                await self.fetchLyricsFromWeb(title: title, artist: artist, album: album, duration: duration)
-            }
+            guard self.isCurrentLyricsRequest(requestID, key: key) else { return }
+            await self.fetchLyricsFromWeb(title: title, artist: artist, album: album, duration: duration,
+                                         key: key, requestID: requestID, yandexToken: yandexToken)
         }
     }
 
@@ -489,10 +525,18 @@ class MusicManager: ObservableObject {
             .replacingOccurrences(of: "\u{FFFD}", with: "")
     }
 
-    private func lyricsKey(_ title: String, _ artist: String, _ duration: Double = 0) -> String {
-        // Duration is part of the key so a fetch that ran before the duration was known (and thus
-        // fell back to a wrong-length /search result) doesn't shadow the accurate /get result.
-        (normalizedQuery(title) + "|" + normalizedQuery(artist) + "|" + String(Int(duration.rounded()))).lowercased()
+    private func lyricsKey(_ title: String, _ artist: String, album: String, duration: Double,
+                           bundleIdentifier: String?, yandexToken: String) -> String {
+        // Keep providers, albums and connected accounts separate without putting an OAuth
+        // credential into the persistent cache. A token change also invalidates in-flight work.
+        let account = yandexToken.isEmpty ? "public" : SHA256.hash(data: Data(yandexToken.utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        let provider = yandexToken.isEmpty ? "lrclib" : "yandex+lrclib"
+        let seconds = duration.isFinite && duration > 0 ? duration.rounded() : 0
+        let components = [Defaults[.mediaController].rawValue, bundleIdentifier ?? "", provider,
+                          account, normalizedQuery(title), normalizedQuery(artist),
+                          normalizedQuery(album), String(seconds)]
+        return components.joined(separator: "\u{1F}").lowercased()
     }
 
     private func loadLyricsCache() {
@@ -500,7 +544,7 @@ class MusicManager: ObservableObject {
         for legacy in Self.legacyLyricsCacheURLs { try? FileManager.default.removeItem(at: legacy) }
         guard let data = try? Data(contentsOf: Self.lyricsCacheURL),
               let dto = try? JSONDecoder().decode([String: LyricsCacheEntry].self, from: data) else { return }
-        lyricsCache = dto.mapValues { entry in
+        lyricsCache = dto.filter { !$0.value.plain.isEmpty || !$0.value.synced.isEmpty }.mapValues { entry in
             (plain: entry.plain, synced: entry.synced.map { (time: $0.time, text: $0.text) })
         }
     }
@@ -520,75 +564,66 @@ class MusicManager: ObservableObject {
     }
 
     @MainActor
-    private func fetchLyricsFromWeb(title: String, artist: String, album: String = "", duration: Double = 0) async {
-        let key = lyricsKey(title, artist, duration)
-
-        // Only apply results if this is still the current track — a fetch started for an earlier
-        // (or transient startup) track must not overwrite the one now playing.
+    private func fetchLyricsFromWeb(title: String, artist: String, album: String = "", duration: Double = 0,
+                                    key: String, requestID: UUID, yandexToken: String) async {
+        func isCurrent() -> Bool { isCurrentLyricsRequest(requestID, key: key) }
         func apply(_ parsed: (plain: String, synced: [(time: Double, text: String)])) {
-            guard key == lastLyricsKey else { return }
-            self.currentLyrics = parsed.plain
-            self.syncedLyrics = parsed.synced
-            self.isFetchingLyrics = false
-            self.lyricsCache[key] = (plain: parsed.plain, synced: parsed.synced)
-            self.scheduleLyricsCacheSave()
-        }
-        func finishEmpty(cache: Bool) {
-            guard key == lastLyricsKey else { return }
-            self.currentLyrics = ""
-            self.syncedLyrics = []
-            self.isFetchingLyrics = false
-            if cache {
-                self.lyricsCache[key] = (plain: "", synced: [])
-                self.scheduleLyricsCacheSave()
-            } else {
-                // Retryable (network) failure — clear the dedup key so the next content change for
-                // this same track can try again instead of being suppressed forever.
-                lastLyricsKey = ""
+            guard isCurrent() else { return }
+            currentLyrics = parsed.plain
+            syncedLyrics = parsed.synced
+            isFetchingLyrics = false
+            if !parsed.plain.isEmpty || !parsed.synced.isEmpty {
+                lyricsCache[key] = parsed
+                scheduleLyricsCacheSave()
             }
         }
+        func finishEmpty(retryDelay: TimeInterval) {
+            guard isCurrent() else { return }
+            currentLyrics = ""
+            syncedLyrics = []
+            isFetchingLyrics = false
+            lyricsRetryAfter = Date().addingTimeInterval(retryDelay)
+        }
 
-        // 0) Yandex's own lyrics (perfectly synced to the exact recording) when the source is
-        //    Yandex Music and a token is configured. LRCLIB is only a fallback.
-        let yandexToken = Defaults[.yandexMusicToken]
-        if Defaults[.mediaController] == .yandexMusic, !yandexToken.isEmpty {
-            switch await YandexLyricsProvider(token: yandexToken).fetchLRC(title: title, artist: artist, album: album, duration: duration) {
-            case .lrc(let text):
+        guard isCurrent() else { return }
+        // Yandex's own lyrics are preferred, with LRCLIB as a fallback. The credential and
+        // request identity are captured together so a changed account cannot share a result.
+        if !yandexToken.isEmpty {
+            let result = await YandexLyricsProvider(token: yandexToken)
+                .fetchLRC(title: title, artist: artist, album: album, duration: duration)
+            guard isCurrent() else { return }
+            if case .lrc(let text) = result {
                 let synced = parseLRC(text)
                 if !synced.isEmpty {
                     apply((plain: synced.map { $0.text }.joined(separator: "\n"), synced: synced))
                     return
                 }
-            case .notFound, .failed:
-                break // fall through to LRCLIB
             }
         }
 
-        // 1) Exact-recording match via /get (matches by duration → correct timing). Accept it only
-        //    if it actually has lyrics: an exact match can be an instrumental/lyric-less entry, in
-        //    which case we still fall through to /search for a version that has them.
-        if duration > 0, !album.isEmpty,
-           let item = await lrclibGet(track: title, artist: artist, album: album, duration: Int(duration.rounded())) {
-            let parsed = parseLyricsItem(item)
-            if !parsed.plain.isEmpty || !parsed.synced.isEmpty {
-                apply(parsed)
-                return
+        if duration.isFinite, duration > 0, !album.isEmpty {
+            let item = await lrclibGet(track: title, artist: artist, album: album, duration: Int(duration.rounded()))
+            guard isCurrent() else { return }
+            if let item {
+                let parsed = parseLyricsItem(item)
+                if !parsed.plain.isEmpty || !parsed.synced.isEmpty {
+                    apply(parsed)
+                    return
+                }
             }
         }
 
-        // 2) Fallback: /search, then pick the result that actually has lyrics whose duration is
-        //    CLOSEST to the track (preferring synced), instead of blindly taking the first.
-        if let items = await lrclibSearch(track: title, artist: artist) {
+        let items = await lrclibSearch(track: title, artist: artist)
+        guard isCurrent() else { return }
+        if let items {
             guard let best = bestLyricsMatch(items, duration: duration) else {
-                finishEmpty(cache: true)   // authoritative "no lyrics for this track"
+                finishEmpty(retryDelay: 60)
                 return
             }
             apply(parseLyricsItem(best))
-            return
+        } else {
+            finishEmpty(retryDelay: 15)
         }
-
-        // Network failed entirely (timeouts): stop the spinner, don't cache (allow a later retry).
-        finishEmpty(cache: false)
     }
 
     /// Bounded, timed GET. Returns the body on HTTP 200, nil on 404 or after retries fail — so a
@@ -597,6 +632,7 @@ class MusicManager: ObservableObject {
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10)
         request.setValue("boring.notch (github.com/L3xu5/boring.notch)", forHTTPHeaderField: "User-Agent")
         for attempt in 0..<2 {
+            guard !Task.isCancelled else { return nil }
             do {
                 let (data, response) = try await URLSession.shared.data(for: request)
                 guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
@@ -604,7 +640,11 @@ class MusicManager: ObservableObject {
                 guard http.statusCode == 200 else { throw URLError(.badServerResponse) }
                 return data
             } catch {
-                if attempt < 1 { try? await Task.sleep(for: .milliseconds(400)) }
+                guard !Task.isCancelled, (error as? URLError)?.code != .cancelled else { return nil }
+                if attempt < 1 {
+                    do { try await Task.sleep(for: .milliseconds(400)) }
+                    catch { return nil }
+                }
             }
         }
         return nil
@@ -634,18 +674,23 @@ class MusicManager: ObservableObject {
         return (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]
     }
 
-    /// Picks the best search result: prefer entries with synced lyrics, then the one whose
-    /// duration is closest to the actual track (so timings match this recording).
+    /// Restrict search results to this recording's duration before preferring synced lyrics.
     private func bestLyricsMatch(_ items: [[String: Any]], duration: Double) -> [String: Any]? {
-        func dur(_ i: [String: Any]) -> Double { (i["duration"] as? NSNumber)?.doubleValue ?? 0 }
-        func hasSynced(_ i: [String: Any]) -> Bool { !(((i["syncedLyrics"] as? String) ?? "").isEmpty) }
-        func hasAny(_ i: [String: Any]) -> Bool { hasSynced(i) || !(((i["plainLyrics"] as? String) ?? "").isEmpty) }
-        // Consider only results that actually carry lyrics; prefer synced, then closest duration.
-        let withLyrics = items.filter(hasAny)
-        guard !withLyrics.isEmpty else { return nil }
-        let synced = withLyrics.filter(hasSynced)
-        let pool = synced.isEmpty ? withLyrics : synced
-        guard duration > 0 else { return pool.first }
+        func dur(_ item: [String: Any]) -> Double { (item["duration"] as? NSNumber)?.doubleValue ?? 0 }
+        func hasSynced(_ item: [String: Any]) -> Bool {
+            !((item["syncedLyrics"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        func hasAny(_ item: [String: Any]) -> Bool {
+            hasSynced(item) || !((item["plainLyrics"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        let knownDuration = duration.isFinite && duration > 0
+        let matching = items.filter { item in
+            hasAny(item) && (!knownDuration || (dur(item) > 0 && abs(dur(item) - duration) <= 5))
+        }
+        guard !matching.isEmpty else { return nil }
+        let synced = matching.filter(hasSynced)
+        let pool = synced.isEmpty ? matching : synced
+        guard knownDuration else { return pool.first }
         return pool.min { abs(dur($0) - duration) < abs(dur($1) - duration) }
     }
 
@@ -954,10 +999,11 @@ struct YandexLyricsProvider {
 
     /// Returns the raw LRC text for the exact playing recording, or a status for the caller.
     func fetchLRC(title: String, artist: String, album: String, duration: Double) async -> Result {
-        guard !token.isEmpty else { return .failed }
+        guard !Task.isCancelled, !token.isEmpty else { return .failed }
         guard let best = await resolveTrack(title: title, artist: artist, album: album, duration: duration) else {
             return .notFound
         }
+        guard !Task.isCancelled else { return .failed }
         // Synced lyrics are only correct for the *exact* recording. If the best match carries no
         // synced lyrics (e.g. a live take), don't fetch — it would 404, and any other edition's LRC
         // would drift. Report notFound so the caller falls back to LRCLIB instead.
@@ -1010,13 +1056,41 @@ struct YandexLyricsProvider {
     }
     private func titleMatches(_ candidate: String, _ target: String) -> Bool {
         let c = norm(candidate), t = norm(target)
-        guard !t.isEmpty else { return false }
-        return c == t || c.contains(t) || t.contains(c)
+        return !c.isEmpty && !t.isEmpty && c == t
+    }
+
+    private func artistsMatch(_ track: [String: Any], _ target: String) -> Bool {
+        let targetName = norm(target)
+        guard !targetName.isEmpty,
+              let artists = track["artists"] as? [[String: Any]] else { return false }
+        let names = Set(artists.compactMap { $0["name"] as? String }.map(norm).filter { !$0.isEmpty })
+        // Metadata may name only the main performer, or list collaborators with separators.
+        // Match full names, never substrings (e.g. "Queen" must not match "Queensrÿche").
+        if names.contains(targetName) { return true }
+        let separated = target.replacingOccurrences(
+            of: #"(?i)\s*(?:[,;&×]|\bfeaturing\b|\bfeat\.?(?=\s|$)|\bft\.?(?=\s|$)|\band\b)\s*"#,
+            with: "\n", options: .regularExpression)
+        let targetNames = Set(separated.components(separatedBy: "\n").map(norm).filter { !$0.isEmpty })
+        return targetNames.count > 1 && targetNames == names
+    }
+
+    private func trackMatches(_ track: [String: Any], title: String, artist: String) -> Bool {
+        let baseTitle = track["title"] as? String ?? ""
+        let version = track["version"] as? String ?? ""
+        let matchesTitle = titleMatches(baseTitle, title)
+            || (!baseTitle.isEmpty && !version.isEmpty && titleMatches(baseTitle + " " + version, title))
+        return matchesTitle && artistsMatch(track, artist)
+    }
+
+    private func queryValue(_ value: String) -> String? {
+        value.addingPercentEncoding(withAllowedCharacters:
+            CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"))
     }
 
     private func get(_ path: String) async -> [String: Any]? {
-        guard let url = URL(string: "\(base)\(path)"),
+        guard !Task.isCancelled, let url = URL(string: "\(base)\(path)"),
               let (data, resp) = try? await URLSession.shared.data(for: authorized(url)),
+              !Task.isCancelled,
               (resp as? HTTPURLResponse)?.statusCode == 200,
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         return json
@@ -1029,15 +1103,16 @@ struct YandexLyricsProvider {
 
     /// The best-matching recording plus whether it carries synced lyrics; nil if nothing matches.
     private func resolveTrack(title: String, artist: String, album: String, duration: Double) async -> Candidate? {
-        let targetMs = duration * 1000
+        let targetMs = duration.isFinite && duration > 0 ? duration * 1000 : 0
         var seen = Set<String>()
         var candidates: [Candidate] = []
         func add(_ list: [Candidate]) { for c in list where seen.insert(c.id).inserted { candidates.append(c) } }
 
         // Album pins editions that text search misses; search adds the popular synced copies.
         if !album.isEmpty, targetMs > 0 { add(await albumCandidates(title: title, artist: artist, album: album)) }
+        guard !Task.isCancelled else { return nil }
         add(await searchCandidates(title: title, artist: artist))
-        guard !candidates.isEmpty else { return nil }
+        guard !Task.isCancelled, !candidates.isEmpty else { return nil }
 
         let pool: [Candidate]
         if targetMs > 0 {
@@ -1061,14 +1136,14 @@ struct YandexLyricsProvider {
     }
 
     private func albumCandidates(title: String, artist: String, album: String) async -> [Candidate] {
-        guard let q = "\(album) \(artist)".addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+        guard let q = queryValue("\(album) \(artist)"),
               let json = await get("/search?text=\(q)&type=album&page=0&nocorrect=false"),
               let result = json["result"] as? [String: Any],
               let albums = (result["albums"] as? [String: Any])?["results"] as? [[String: Any]] else { return [] }
         // Choose the album whose title best matches the now-playing album.
         let target = norm(album)
         let scored = albums.compactMap { a -> (id: String, score: Int)? in
-            guard let id = idOf(a) else { return nil }
+            guard let id = idOf(a), artistsMatch(a, artist) else { return nil }
             let at = norm(a["title"] as? String ?? "")
             let score = at == target ? 2 : ((at.contains(target) || target.contains(at)) && !at.isEmpty ? 1 : 0)
             return (id, score)
@@ -1078,29 +1153,31 @@ struct YandexLyricsProvider {
               let ar = aj["result"] as? [String: Any],
               let volumes = ar["volumes"] as? [[[String: Any]]] else { return [] }
         return volumes.flatMap { $0 }
-            .filter { titleMatches($0["title"] as? String ?? "", title) }
+            .filter { trackMatches($0, title: title, artist: artist) }
             .compactMap(candidate)
     }
 
     private func searchCandidates(title: String, artist: String) async -> [Candidate] {
-        guard let q = "\(title) \(artist)".addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+        guard let q = queryValue("\(title) \(artist)"),
               let json = await get("/search?text=\(q)&type=track&page=0&nocorrect=false"),
               let result = json["result"] as? [String: Any],
               let results = (result["tracks"] as? [String: Any])?["results"] as? [[String: Any]] else { return [] }
-        // Only ever keep a title match — never let duration alone pull in a different song.
+        // Both title and performer must match; duration alone cannot identify a recording.
         return results
-            .filter { titleMatches($0["title"] as? String ?? "", title) }
+            .filter { trackMatches($0, title: title, artist: artist) }
             .compactMap(candidate)
     }
 
     private func lyrics(trackId: String) async -> Result {
+        guard !Task.isCancelled else { return .failed }
         let ts = Int(Date().timeIntervalSince1970)
         let mac = HMAC<SHA256>.authenticationCode(
             for: Data("\(trackId)\(ts)".utf8), using: SymmetricKey(data: Data(signSecret.utf8)))
         let sign = Data(mac).base64EncodedString()
-        guard let signEnc = sign.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+        guard let signEnc = queryValue(sign),
               let url = URL(string: "\(base)/tracks/\(trackId)/lyrics?format=LRC&timeStamp=\(ts)&sign=\(signEnc)"),
-              let (data, resp) = try? await URLSession.shared.data(for: authorized(url)) else { return .failed }
+              let (data, resp) = try? await URLSession.shared.data(for: authorized(url)),
+              !Task.isCancelled else { return .failed }
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
         if code == 404 { return .notFound }   // no lyrics for this track
         guard code == 200,
@@ -1108,7 +1185,9 @@ struct YandexLyricsProvider {
               let result = json["result"] as? [String: Any],
               let dl = result["downloadUrl"] as? String,
               let dlURL = URL(string: dl),
+              !Task.isCancelled,
               let (lrcData, lrcResp) = try? await URLSession.shared.data(from: dlURL),
+              !Task.isCancelled,
               (lrcResp as? HTTPURLResponse)?.statusCode == 200,
               let text = String(data: lrcData, encoding: .utf8), !text.isEmpty else { return .failed }
         return .lrc(text)

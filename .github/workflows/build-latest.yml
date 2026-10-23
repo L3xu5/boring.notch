@@ -1,6 +1,6 @@
 name: Build latest
 
-# SYNC_TOKEN pushes from sync-upstream trigger this workflow just like manual pushes.
+# SSH deploy-key pushes from sync-upstream trigger this workflow like manual pushes.
 # Keep the installed bundle name and rolling ZIP URL compatible with the Homebrew cask.
 on:
   push:
@@ -22,7 +22,7 @@ defaults:
 jobs:
   build:
     if: github.repository == 'L3xu5/boring.notch' && github.ref == 'refs/heads/main'
-    runs-on: macos-latest
+    runs-on: macos-26
     steps:
       - name: Check signing configuration
         env:
@@ -47,7 +47,7 @@ jobs:
       - name: Select Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: latest-stable
+          xcode-version: '26.6'
 
       - name: Compute and stamp version
         id: ver

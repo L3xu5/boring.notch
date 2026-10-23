@@ -23,12 +23,12 @@ jobs:
     if: github.repository == 'L3xu5/boring.notch'
     runs-on: ubuntu-latest
     steps:
-      - name: Require upstream sync token
+      - name: Require upstream sync deploy key
         env:
-          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          SYNC_SSH_KEY: ${{ secrets.SYNC_SSH_KEY }}
         run: |
-          if [[ -z "$SYNC_TOKEN" ]]; then
-            echo "::error::Set the SYNC_TOKEN repository secret before syncing. Use a classic PAT with repo and workflow scopes, or a fine-grained PAT with Contents and Workflows write access to this repository. GITHUB_TOKEN cannot push upstream workflow changes or trigger Build latest."
+          if [[ -z "$SYNC_SSH_KEY" ]]; then
+            echo "::error::Set the SYNC_SSH_KEY repository secret to the private SSH key of a write-enabled deploy key installed on this repository. GITHUB_TOKEN cannot push upstream workflow changes or trigger Build latest. See README.md for setup."
             exit 1
           fi
 
@@ -37,8 +37,9 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
-          # A PAT can update workflow files and its push triggers Build latest.
-          token: ${{ secrets.SYNC_TOKEN }}
+          # This repository's write deploy key can update workflows and its push
+          # triggers Build latest without storing a personal access token.
+          ssh-key: ${{ secrets.SYNC_SSH_KEY }}
 
       - name: Configure git
         run: |
