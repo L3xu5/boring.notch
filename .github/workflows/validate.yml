@@ -37,3 +37,13 @@ jobs:
         run: python3 .github/scripts/run_yandex_auth_tests.py
       - name: Test lyrics selection and request cancellation
         run: python3 .github/scripts/test_lyrics.py
+      - name: Test track metadata and artwork transitions
+        run: python3 .github/scripts/test_music_metadata.py
+      - name: Test fragmented MediaRemote stream decoding
+        run: python3 .github/scripts/test_media_stream.py
+      - name: Test hardware media key routing
+        run: python3 .github/scripts/test_media_keys.py
+      - name: Test conservative native media-key recovery
+        run: python3 .github/scripts/test_media_key_recovery.py
+      - name: Test Yandex metadata stream and fallback parsing
+        run: python3 .github/scripts/test_yandex_metadata.py

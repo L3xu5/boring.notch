@@ -350,7 +350,7 @@ struct NowPlayingPayload: Codable {
 actor JSONLinesPipeHandler {
     private let pipe: Pipe
     private let fileHandle: FileHandle
-    private var buffer = ""
+    private var buffer = Data()
     
     init() {
         self.pipe = Pipe()
@@ -375,28 +375,31 @@ actor JSONLinesPipeHandler {
         while true {
             let data = try await readData()
             guard !data.isEmpty else { break }
-            
-            if let chunk = String(data: data, encoding: .utf8) {
-                buffer.append(chunk)
-                
-                while let range = buffer.range(of: "\n") {
-                    let line = String(buffer[..<range.lowerBound])
-                    buffer = String(buffer[range.upperBound...])
-                    
-                    if !line.isEmpty {
-                        await processJSONLine(line, as: type, onLine: onLine)
-                    }
+
+            // Pipe reads can split a UTF-8 character (or a large artwork JSON object) at any
+            // byte. Frame complete lines before decoding so an incomplete character never
+            // causes the entire chunk, and consequently the metadata update, to be dropped.
+            buffer.append(data)
+            while let newline = buffer.firstIndex(of: 0x0A) {
+                let line = Data(buffer[..<newline])
+                buffer.removeSubrange(...newline)
+                if !line.isEmpty {
+                    await processJSONLine(line, as: type, onLine: onLine)
                 }
             }
         }
+
+        // The producer may exit after a final JSON object without a trailing newline.
+        if !buffer.isEmpty {
+            let line = buffer
+            buffer.removeAll()
+            await processJSONLine(line, as: type, onLine: onLine)
+        }
     }
     
-    private func processJSONLine<T: Decodable>(_ line: String, as type: T.Type, onLine: @escaping (T) async -> Void) async {
-        guard let data = line.data(using: .utf8) else {
-            return
-        }
+    private func processJSONLine<T: Decodable>(_ line: Data, as type: T.Type, onLine: @escaping (T) async -> Void) async {
         do {
-            let decodedObject = try JSONDecoder().decode(T.self, from: data)
+            let decodedObject = try JSONDecoder().decode(T.self, from: line)
             await onLine(decodedObject)
         } catch {
             // Ignore lines that can't be decoded

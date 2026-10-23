@@ -17,7 +17,7 @@ def main() -> None:
     source = (ROOT / "boringNotch/managers/MusicManager.swift").read_text()
     properties = source[
         source.index("    // Cache of successfully fetched lyrics"):
-        source.index("    // Store last values at the time artwork was changed")
+        source.index("    @Published var isFlipping:")
     ]
     methods = source[
         source.index("    // MARK: - Lyrics\n"):

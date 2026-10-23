@@ -95,12 +95,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var isScreenLocked: Bool = false
     private var windowScreenDidChangeObserver: Any?
     private var dragDetectors: [String: DragDetector] = [:] // UUID -> DragDetector
+    private var mediaSourceObserver: NSObjectProtocol?
+    @MainActor private lazy var mediaTransportKeyMonitor = MediaTransportKeyMonitor(
+        shouldRoute: { Defaults[.mediaController] == .yandexMusic },
+        onAction: { action in
+            guard action == .playPause else { return }
+            MusicManager.shared.recoverUnresponsiveSystemPlayPause()
+        }
+    )
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return false
     }
 
+    @MainActor
     func applicationWillTerminate(_ notification: Notification) {
+        mediaTransportKeyMonitor.stop()
+        if let mediaSourceObserver {
+            NotificationCenter.default.removeObserver(mediaSourceObserver)
+            self.mediaSourceObserver = nil
+        }
         NotificationCenter.default.removeObserver(self)
         if let observer = screenLockedObserver {
             DistributedNotificationCenter.default().removeObserver(observer)
@@ -307,7 +321,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.alphaValue = 1
     }
 
+    @MainActor
     func applicationDidFinishLaunching(_ notification: Notification) {
+        mediaTransportKeyMonitor.start()
+        mediaSourceObserver = NotificationCenter.default.addObserver(
+            forName: .mediaControllerChanged, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.mediaTransportKeyMonitor.refreshConfiguration()
+            }
+        }
 
         NotificationCenter.default.addObserver(
             self,

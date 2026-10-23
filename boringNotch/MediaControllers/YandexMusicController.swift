@@ -20,6 +20,194 @@ import ApplicationServices
 import Combine
 import Foundation
 
+// The adapter distinguishes missing fields (unchanged) from explicit nulls (removed).
+// Optional properties alone lose that distinction when decoding incremental updates.
+private enum YandexMetadataValue: Decodable, Equatable {
+    case string(String), number(Double), boolean(Bool), null, unsupported
+
+    init(from decoder: any Decoder) throws {
+        let value = try decoder.singleValueContainer()
+        if value.decodeNil() { self = .null }
+        else if let string = try? value.decode(String.self) { self = .string(string) }
+        else if let boolean = try? value.decode(Bool.self) { self = .boolean(boolean) }
+        else if let number = try? value.decode(Double.self) { self = .number(number) }
+        else { self = .unsupported }
+    }
+}
+
+private struct YandexNowPlayingUpdate: Decodable {
+    let payload: [String: YandexMetadataValue]
+    let diff: Bool?
+}
+
+private extension Dictionary where Key == String, Value == YandexMetadataValue {
+    func string(_ key: String) -> String? {
+        guard case .string(let value) = self[key] else { return nil }
+        return value
+    }
+
+    func number(_ key: String) -> Double? {
+        guard case .number(let value) = self[key] else { return nil }
+        return value
+    }
+
+    func boolean(_ key: String) -> Bool? {
+        guard case .boolean(let value) = self[key] else { return nil }
+        return value
+    }
+}
+
+private struct YandexAccessibilityNode: Decodable {
+    let role: String
+    let labels: [String]
+    let value: String?
+    let url: URL?
+    let children: [YandexAccessibilityNode]
+}
+
+private struct YandexAccessibilityMetadata {
+    let title: String
+    let artist: String
+    let album: String
+    let trackID: String?
+    let artworkURL: URL?
+    let isPlaying: Bool?
+
+    init?(root: YandexAccessibilityNode) {
+        var nodes: [YandexAccessibilityNode] = []
+        func visit(_ node: YandexAccessibilityNode) { nodes.append(node); node.children.forEach(visit) }
+        visit(root)
+        func text(_ node: YandexAccessibilityNode, prefixes: [String]) -> String {
+            for label in node.labels {
+                for prefix in prefixes where label.lowercased().hasPrefix(prefix) {
+                    return String(label.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            }
+            if let value = node.value, !value.isEmpty { return value }
+            return node.children.compactMap { $0.value }.filter { !$0.isEmpty }.joined(separator: " ")
+        }
+        let tracks = nodes.filter { node in
+            node.role == "AXLink" && ((node.url.map(Self.isEntityURL) == true && node.url?.path.contains("/track/") == true)
+                || node.labels.contains { $0.lowercased().hasPrefix("track ") || $0.lowercased().hasPrefix("трек ") })
+        }
+        let titles = tracks.map { text($0, prefixes: ["track ", "трек "]) }.filter { !$0.isEmpty }
+        // A whole library/list is not the persistent player bar. Never borrow a random row's title.
+        let trackPaths = Set(tracks.compactMap { $0.url }.filter(Self.isEntityURL).map(\.path))
+        guard let title = titles.first, Set(titles).count == 1, trackPaths.count <= 1 else { return nil }
+        let track = tracks.first { $0.url.map(Self.isEntityURL) == true && $0.url?.path.contains("/track/") == true }
+        let components = track?.url?.pathComponents ?? []
+        let id = components.firstIndex(of: "track").flatMap { $0 + 1 < components.count ? components[$0 + 1] : nil }
+        self.trackID = id.flatMap { !$0.isEmpty && $0.allSatisfy({ $0 >= "0" && $0 <= "9" }) ? $0 : nil }
+        self.title = title
+        var artists: [String] = []
+        for node in nodes where node.role == "AXLink" && node.url.map(Self.isEntityURL) == true && node.url?.path.contains("/artist/") == true {
+            let name = text(node, prefixes: ["artist ", "артист ", "исполнитель "])
+            if !name.isEmpty && !artists.contains(name) { artists.append(name) }
+        }
+        artist = artists.joined(separator: ", ")
+        album = nodes.first { $0.role == "AXLink" && $0.url.map(Self.isEntityURL) == true && $0.url?.path.contains("/album/") == true
+            && $0.url?.path.contains("/track/") != true }
+            .map { text($0, prefixes: ["album ", "альбом "]) } ?? ""
+        artworkURL = nodes.lazy.filter { $0.role == "AXImage" }.compactMap(\.url)
+            .first(where: Self.isTrustedArtworkURL)
+        let controls = nodes.filter { ["AXButton", "AXCheckBox"].contains($0.role) }
+            .flatMap(\.labels).map { $0.lowercased() }
+        if controls.contains(where: { $0 == "pause" || $0.contains("пауза") || $0.contains("приостанов") }) { isPlaying = true }
+        else if controls.contains(where: { $0 == "play" || $0 == "playback" || $0.contains("воспроизвед") || $0 == "продолжить" }) { isPlaying = false }
+        else { isPlaying = nil }
+    }
+
+    static func isEntityURL(_ url: URL) -> Bool {
+        guard url.user == nil, url.password == nil, url.port == nil || url.port == 443 else { return false }
+        if url.scheme?.lowercased() == "music-application", url.host?.lowercased() == "desktop" { return true }
+        return url.scheme?.lowercased() == "https"
+            && ["music.yandex.ru", "music.yandex.com", "music.yandex.by", "music.yandex.kz", "music.yandex.uz"].contains(url.host?.lowercased() ?? "")
+    }
+
+    static func isTrustedArtworkURL(_ url: URL) -> Bool {
+        url.scheme?.lowercased() == "https" && url.user == nil && url.password == nil
+            && (url.port == nil || url.port == 443)
+            && ["avatars.yandex.net", "avatars.mds.yandex.net"].contains(url.host?.lowercased() ?? "")
+    }
+}
+
+/// All AX IPC and tree walking stays on this actor's executor, away from hover/UI updates.
+private actor YandexAccessibilityReader {
+    private var cachedBar: AXUIElement?
+    private var cachedPID: pid_t?
+    private var nextSearch = Date.distantPast
+
+    private func attributes(_ element: AXUIElement) -> (node: YandexAccessibilityNode, children: [AXUIElement])? {
+        let names = [kAXRoleAttribute, kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute, kAXURLAttribute, kAXChildrenAttribute]
+        var raw: CFArray?
+        guard AXUIElementCopyMultipleAttributeValues(element, names as CFArray, AXCopyMultipleAttributeOptions(rawValue: 0), &raw) == .success,
+              let values = raw as? [Any], values.count == names.count, let role = values[0] as? String else { return nil }
+        let url = (values[4] as? URL) ?? (values[4] as? String).flatMap(URL.init(string:))
+        let labels = [values[1] as? String, values[2] as? String].compactMap { $0 }.filter { !$0.isEmpty }
+        return (.init(role: role, labels: labels, value: values[3] as? String, url: url, children: []), values[5] as? [AXUIElement] ?? [])
+    }
+
+    private func tree(_ element: AXUIElement, remaining: inout Int, deadline: Date, depth: Int = 0) -> YandexAccessibilityNode? {
+        guard !Task.isCancelled, remaining > 0, depth < 18, Date() < deadline,
+              let (node, children) = attributes(element) else { return nil }
+        remaining -= 1
+        var descendants: [YandexAccessibilityNode] = []
+        for child in children {
+            guard let snapshot = tree(child, remaining: &remaining, deadline: deadline, depth: depth + 1) else { return nil }
+            descendants.append(snapshot)
+        }
+        return .init(role: node.role, labels: node.labels, value: node.value, url: node.url, children: descendants)
+    }
+
+    private func nextButton(_ element: AXUIElement, remaining: inout Int, deadline: Date, depth: Int = 0) -> AXUIElement? {
+        guard !Task.isCancelled, remaining > 0, depth < 60, Date() < deadline,
+              let (node, children) = attributes(element) else { return nil }
+        remaining -= 1
+        if node.role == "AXButton", node.labels.contains(where: { label in
+            let label = label.lowercased()
+            return ["next", "next song", "next track"].contains(label) || label.contains("следующ")
+        }) { return element }
+        for child in children {
+            if let found = nextButton(child, remaining: &remaining, deadline: deadline, depth: depth + 1) { return found }
+        }
+        return nil
+    }
+
+    func read(processIdentifier: pid_t) -> YandexAccessibilityMetadata? {
+        guard AXIsProcessTrusted(), !Task.isCancelled else { return nil }
+        if cachedPID != processIdentifier { cachedBar = nil; nextSearch = .distantPast; cachedPID = processIdentifier }
+        if let cachedBar {
+            var budget = 500
+            if let node = tree(cachedBar, remaining: &budget, deadline: Date().addingTimeInterval(0.25)),
+               let metadata = YandexAccessibilityMetadata(root: node) { return metadata }
+            self.cachedBar = nil
+            nextSearch = .distantPast
+        }
+        guard Date() >= nextSearch else { return nil }
+        nextSearch = Date().addingTimeInterval(5)
+        let application = AXUIElementCreateApplication(processIdentifier)
+        AXUIElementSetMessagingTimeout(application, 0.1)
+        AXUIElementSetAttributeValue(application, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        var budget = 6000
+        guard let next = nextButton(application, remaining: &budget, deadline: Date().addingTimeInterval(1)) else { return nil }
+        var candidate = next
+        for _ in 0..<7 {
+            var parent: CFTypeRef?
+            guard !Task.isCancelled, AXUIElementCopyAttributeValue(candidate, kAXParentAttribute as CFString, &parent) == .success,
+                  let parent else { break }
+            candidate = parent as! AXUIElement
+            guard let (node, _) = attributes(candidate), !["AXWebArea", "AXWindow", "AXApplication"].contains(node.role) else { break }
+            var budget = 500
+            if let snapshot = tree(candidate, remaining: &budget, deadline: Date().addingTimeInterval(0.25)),
+               let metadata = YandexAccessibilityMetadata(root: snapshot) {
+                cachedBar = candidate
+                return metadata
+            }
+        }
+        return nil
+    }
+}
+
 final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     // MARK: - Constants
     static let bundleID = "ru.yandex.desktop.music"
@@ -60,11 +248,25 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     private var process: Process?
     private var pipeHandler: JSONLinesPipeHandler?
     private var streamTask: Task<Void, Never>?
+    private var adapterPayload: [String: YandexMetadataValue] = [:]
+    private let accessibilityReader = YandexAccessibilityReader()
+    private var accessibilityTask: Task<Void, Never>?
+    private var accessibilityArtworkTask: Task<Void, Never>?
+    private var accessibilityGeneration: UInt = 0
+    private var accessibilityArtworkGeneration: UInt = 0
+    private var accessibilityArtworkKey = ""
+    private var accessibilityArtworkRetryAfter = Date.distantPast
+    private var accessibilityTrackID: String?
+    @MainActor private(set) var systemMediaOwnerBundleIdentifier: String?
+    @MainActor private(set) var systemMediaIsPlaying: Bool?
+    @MainActor private(set) var systemMediaLastUpdated: Date?
+    @MainActor private(set) var systemMediaTimestamp: Date?
+    @MainActor private(set) var lastForeignMediaActivity: Date?
+    @MainActor private(set) var accessibilityIsPlaying: Bool?
+    @MainActor private(set) var accessibilityMetadataLastReadAt: Date?
 
-    // Whether the current system Now Playing session belongs to Yandex Music. The adapter
-    // only reports the owning bundle id in full snapshots; incremental "diff" updates (a new
-    // artwork, a play/pause, a rate change) arrive with no owner, so we must remember the
-    // owner from the last full snapshot and apply owner-less diffs to it.
+    // Whether the merged system Now Playing snapshot belongs to Yandex Music. Parent and
+    // helper bundle identifiers can change independently in diffs, alongside metadata fields.
     private var sessionIsYandex = false
 
     // Cached AX element for Yandex's persistent bottom now-playing bar (the container holding
@@ -105,7 +307,10 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         MRMediaRemoteSetRepeatModeFunction = unsafeBitCast(
             setRepeatPointer, to: (@convention(c) (Int) -> Void).self)
 
-        Task { @MainActor [weak self] in await self?.setupNowPlayingObserver() }
+        Task { @MainActor [weak self] in
+            self?.startAccessibilityMonitoring()
+            await self?.setupNowPlayingObserver()
+        }
 
         // When Yandex Music quits, the adapter stops reporting for it but the last state would
         // otherwise linger as "playing"; flip it to stopped so the notch goes idle.
@@ -122,6 +327,13 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     @MainActor
     private func handleYandexTerminated() {
         sessionIsYandex = false
+        adapterPayload.removeAll()
+        accessibilityGeneration &+= 1
+        accessibilityArtworkGeneration &+= 1
+        accessibilityArtworkTask?.cancel()
+        accessibilityArtworkKey = ""
+        accessibilityIsPlaying = nil
+        accessibilityMetadataLastReadAt = nil
         cachedTransportCluster = nil
         var stopped = playbackState
         stopped.isPlaying = false
@@ -135,6 +347,8 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         }
         let streamTask = self.streamTask
         streamTask?.cancel()
+        accessibilityTask?.cancel()
+        accessibilityArtworkTask?.cancel()
 
         // Tear the adapter subprocess/pipe down OFF the calling thread — waitUntilExit() would
         // otherwise block whatever thread deallocs the controller (e.g. the main thread during a
@@ -158,6 +372,135 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
 
         self.process = nil
         self.pipeHandler = nil
+    }
+
+    // MARK: - Metadata when another app owns the system media session
+    @MainActor
+    private func startAccessibilityMonitoring() {
+        accessibilityTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                // Capture only the reader/request across AX IPC; releasing the controller while
+                // a read is in flight must still stop monitoring and cancel image downloads.
+                if let (reader, pid, generation) = self?.accessibilityRequest() {
+                    let metadata = await reader.read(processIdentifier: pid)
+                    guard !Task.isCancelled else { return }
+                    if let metadata { self?.applyAccessibilityMetadata(metadata, generation: generation) }
+                    else { self?.clearAccessibilityObservations(generation: generation) }
+                }
+                do { try await Task.sleep(for: .milliseconds(800)) }
+                catch { return }
+            }
+        }
+    }
+
+    @MainActor
+    private func accessibilityRequest() -> (YandexAccessibilityReader, pid_t, UInt)? {
+        guard !sessionIsYandex, AXIsProcessTrusted(),
+              let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == Self.bundleID }),
+              !app.isTerminated else { return nil }
+        return (accessibilityReader, app.processIdentifier, accessibilityGeneration)
+    }
+
+    /// A fresh, read-only AX sample for callers that need evidence about the actual Yandex player.
+    @MainActor
+    func refreshAccessibilityMetadata() async {
+        guard let (reader, pid, generation) = accessibilityRequest() else {
+            accessibilityIsPlaying = nil
+            accessibilityMetadataLastReadAt = nil
+            return
+        }
+        let metadata = await reader.read(processIdentifier: pid)
+        guard !Task.isCancelled else { return }
+        if let metadata { applyAccessibilityMetadata(metadata, generation: generation) }
+        else { clearAccessibilityObservations(generation: generation) }
+    }
+
+    @MainActor
+    private func clearAccessibilityObservations(generation: UInt) {
+        guard generation == accessibilityGeneration else { return }
+        accessibilityIsPlaying = nil
+        accessibilityMetadataLastReadAt = nil
+    }
+
+    @MainActor
+    private func applyAccessibilityMetadata(_ metadata: YandexAccessibilityMetadata, generation: UInt) {
+        guard !sessionIsYandex, generation == accessibilityGeneration else { return }
+        accessibilityMetadataLastReadAt = Date()
+        accessibilityIsPlaying = metadata.isPlaying
+        let trackChanged = metadata.title != playbackState.title || metadata.artist != playbackState.artist
+            || (metadata.trackID != nil && accessibilityTrackID != nil && metadata.trackID != accessibilityTrackID)
+        accessibilityTrackID = metadata.trackID
+        var state = playbackState
+        state.title = metadata.title
+        state.artist = metadata.artist
+        state.album = metadata.album.isEmpty && !trackChanged ? state.album : metadata.album
+        if let playing = metadata.isPlaying {
+            if state.isPlaying {
+                state.currentTime += max(0, Date().timeIntervalSince(state.lastUpdated)) * state.playbackRate
+            }
+            state.isPlaying = playing
+            state.playbackRate = playing ? 1 : 0
+            state.lastUpdated = Date()
+        }
+        if trackChanged {
+            accessibilityArtworkGeneration &+= 1
+            accessibilityArtworkTask?.cancel()
+            accessibilityArtworkKey = ""
+            state.artwork = nil
+            state.currentTime = 0
+            state.duration = 0
+            state.isFavorite = false
+            state.lastUpdated = Date()
+        }
+        playbackState = state
+
+        let artworkKey = [metadata.title, metadata.artist, metadata.trackID ?? "", metadata.artworkURL?.absoluteString ?? ""].joined(separator: "|")
+        guard metadata.artworkURL != nil || metadata.trackID != nil,
+              artworkKey != accessibilityArtworkKey || Date() >= accessibilityArtworkRetryAfter else { return }
+        accessibilityArtworkKey = artworkKey
+        accessibilityArtworkRetryAfter = .distantFuture
+        accessibilityArtworkTask?.cancel()
+        let artworkGeneration = accessibilityArtworkGeneration
+        let token = YandexMusicTokenStore.shared.token
+        accessibilityArtworkTask = Task { [weak self] in
+            let data = await Self.fetchAccessibilityArtwork(metadata, token: token)
+            guard !Task.isCancelled else { return }
+            self?.applyAccessibilityArtwork(data, key: artworkKey, generation: artworkGeneration)
+        }
+    }
+
+    @MainActor
+    private func applyAccessibilityArtwork(_ data: Data?, key: String, generation: UInt) {
+        guard !sessionIsYandex, accessibilityArtworkKey == key, accessibilityArtworkGeneration == generation else { return }
+        if let data { playbackState.artwork = data }
+        else { accessibilityArtworkRetryAfter = Date().addingTimeInterval(10) }
+    }
+
+    private static func fetchAccessibilityArtwork(_ metadata: YandexAccessibilityMetadata, token: String,
+                                                  session: URLSession = .shared) async -> Data? {
+        guard !Task.isCancelled else { return nil }
+        var artworkURL = metadata.artworkURL
+        if artworkURL == nil, let id = metadata.trackID,
+           let url = URL(string: "https://api.music.yandex.net/tracks/\(id)") {
+            var request = URLRequest(url: url, timeoutInterval: 5)
+            request.setValue("YandexMusicAndroid/24023621", forHTTPHeaderField: "X-Yandex-Music-Client")
+            if !token.isEmpty { request.setValue("OAuth \(token)", forHTTPHeaderField: "Authorization") }
+            if let (data, response) = try? await session.data(for: request),
+               (response as? HTTPURLResponse)?.statusCode == 200,
+               response.url?.scheme == "https", response.url?.host == "api.music.yandex.net",
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let tracks = json["result"] as? [[String: Any]], let cover = tracks.first?["coverUri"] as? String {
+                let path = cover.replacingOccurrences(of: "%%", with: "200x200")
+                artworkURL = URL(string: path.hasPrefix("https://") ? path : "https://" + path)
+            }
+        }
+        guard !Task.isCancelled, let artworkURL, YandexAccessibilityMetadata.isTrustedArtworkURL(artworkURL) else { return nil }
+        let request = URLRequest(url: artworkURL, timeoutInterval: 5)
+        guard let (data, response) = try? await session.data(for: request), !Task.isCancelled,
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let finalURL = response.url, YandexAccessibilityMetadata.isTrustedArtworkURL(finalURL),
+              !data.isEmpty, data.count <= 10_000_000 else { return nil }
+        return data
     }
 
     // MARK: - Transport controls
@@ -296,6 +639,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         // Metadata arrives continuously through the adapter stream. On an explicit refresh
         // (e.g. when this controller becomes active) re-read the like state via Accessibility.
         refreshFavoriteState()
+        await refreshAccessibilityMetadata()
     }
 
     // MARK: - Favorite (best-effort via Accessibility)
@@ -340,7 +684,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         }
 
         process.executableURL = URL(fileURLWithPath: "/usr/bin/perl")
-        process.arguments = [scriptURL.path, frameworkPath, "stream"]
+        process.arguments = [scriptURL.path, frameworkPath, "stream", "--debounce=100"]
 
         let pipeHandler = JSONLinesPipeHandler()
         process.standardOutput = await pipeHandler.getPipe()
@@ -358,7 +702,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
                 guard !Task.isCancelled else { return }
                 // Capture the handler directly: an instance method would retain the controller
                 // for the entire stream, preventing deinit when the media source changes.
-                await pipeHandler.readJSONLines(as: NowPlayingUpdate.self) { [weak self] update in
+                await pipeHandler.readJSONLines(as: YandexNowPlayingUpdate.self) { [weak self] update in
                     guard !Task.isCancelled else { return }
                     await self?.handleAdapterUpdate(update)
                 }
@@ -387,6 +731,15 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         let oldHandler = pipeHandler
         process = nil
         pipeHandler = nil
+        adapterPayload.removeAll()
+        sessionIsYandex = false
+        systemMediaOwnerBundleIdentifier = nil
+        systemMediaIsPlaying = nil
+        systemMediaLastUpdated = nil
+        systemMediaTimestamp = nil
+        accessibilityGeneration &+= 1
+        accessibilityIsPlaying = nil
+        accessibilityMetadataLastReadAt = nil
         Task.detached {
             await oldHandler?.close()
             if let oldProcess, oldProcess.isRunning {
@@ -402,24 +755,59 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     }
 
     // MARK: - Update handling
+    private static func adapterDate(_ value: String) -> Date? {
+        let formatter = ISO8601DateFormatter()
+        if let date = formatter.date(from: value) { return date }
+        formatter.formatOptions.insert(.withFractionalSeconds)
+        return formatter.date(from: value)
+    }
+
     // @MainActor so playbackState/sessionIsYandex are only ever touched on the main actor
     // (the transport methods and refreshFavoriteState are too). The existing
     // `await self?.handleAdapterUpdate(update)` call hops the stream callback onto main.
     @MainActor
-    private func handleAdapterUpdate(_ update: NowPlayingUpdate) async {
+    private func handleAdapterUpdate(_ update: YandexNowPlayingUpdate) async {
         restartAttempts = 0   // receiving data → the stream is healthy; reset watchdog backoff
-        let payload = update.payload
+        let patch = update.payload
         let diff = update.diff ?? false
+        let previousPayload = adapterPayload
 
-        // Route the update to the right session. Full snapshots (diff == false) carry the
-        // owning bundle id and (re)set who owns the session. Diffs carry no owner and belong
-        // to whatever the current session is.
-        let explicitOwner = payload.parentApplicationBundleIdentifier ?? payload.bundleIdentifier
-        if let explicitOwner {
-            sessionIsYandex = (explicitOwner == Self.bundleID)
-        } else if !diff {
-            // A full snapshot with no owner means the Now Playing session was cleared.
-            sessionIsYandex = false
+        // Merge the complete adapter state before resolving the owner. A diff can change only
+        // the helper bundle id while its parent is still Yandex, or remove the old parent only
+        // after the new bundle id and metadata have arrived. Looking at that diff in isolation
+        // would lose the session and ignore every later title/artwork update without an owner.
+        if !diff { adapterPayload.removeAll() }
+        for (key, value) in patch {
+            if case .null = value { adapterPayload.removeValue(forKey: key) }
+            else { adapterPayload[key] = value }
+        }
+        let payload = adapterPayload
+        let parent = payload.string("parentApplicationBundleIdentifier").flatMap { $0.isEmpty ? nil : $0 }
+        let previousOwner = systemMediaOwnerBundleIdentifier
+        let wasYandex = sessionIsYandex
+        systemMediaOwnerBundleIdentifier = parent ?? payload.string("bundleIdentifier")
+        systemMediaIsPlaying = payload.boolean("playing")
+        systemMediaLastUpdated = Date()
+        if let timestamp = payload.string("timestamp") {
+            systemMediaTimestamp = Self.adapterDate(timestamp)
+        } else { systemMediaTimestamp = nil }
+        if systemMediaOwnerBundleIdentifier != nil, systemMediaOwnerBundleIdentifier != Self.bundleID {
+            let changed = ["title", "artist", "elapsedTime", "playing"].contains { previousPayload[$0] != payload[$0] }
+            // A newly observed paused session still needs a conservative quiet-time baseline.
+            // Timestamp-only refreshes must not keep moving that baseline forward forever.
+            if previousOwner != systemMediaOwnerBundleIdentifier
+                || (changed && (diff || systemMediaIsPlaying == true || previousOwner != nil)) {
+                lastForeignMediaActivity = Date()
+            }
+        }
+        sessionIsYandex = (parent ?? payload.string("bundleIdentifier")) == Self.bundleID
+        if sessionIsYandex != wasYandex {
+            accessibilityGeneration &+= 1
+            accessibilityIsPlaying = nil
+            accessibilityMetadataLastReadAt = nil
+            accessibilityArtworkGeneration &+= 1
+            accessibilityArtworkTask?.cancel()
+            accessibilityArtworkKey = ""
         }
 
         // Ignore anything that is not (part of) the Yandex Music session, so the notch keeps
@@ -429,16 +817,16 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         var newState = playbackState
         newState.bundleIdentifier = Self.bundleID
 
-        newState.title = payload.title ?? (diff ? playbackState.title : "")
-        newState.artist = payload.artist ?? (diff ? playbackState.artist : "")
-        newState.album = payload.album ?? (diff ? playbackState.album : "")
-        newState.duration = payload.duration ?? (diff ? playbackState.duration : 0)
+        newState.title = payload.string("title") ?? ""
+        newState.artist = payload.string("artist") ?? ""
+        newState.album = payload.string("album") ?? ""
+        newState.duration = payload.number("duration") ?? 0
 
         // Resolve the new timestamp first so currentTime always stays a consistent pair with it
         // (the UI extrapolates position as currentTime + (now - lastUpdated) * rate).
         let newTimestamp: Date
-        if let dateString = payload.timestamp,
-           let date = ISO8601DateFormatter().date(from: dateString) {
+        if let dateString = patch.string("timestamp"),
+           let date = Self.adapterDate(dateString) {
             newTimestamp = date
         } else if !diff {
             newTimestamp = Date()
@@ -446,9 +834,9 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
             newTimestamp = playbackState.lastUpdated
         }
 
-        if let elapsedTime = payload.elapsedTime {
+        if let elapsedTime = patch.number("elapsedTime") {
             newState.currentTime = elapsedTime
-        } else if !diff {
+        } else if !diff || patch["elapsedTime"] != nil {
             newState.currentTime = 0
         } else {
             // No fresh position in a diff: roll the previous position forward to the new
@@ -462,34 +850,37 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
 
         // Shuffle/repeat are player-wide settings — carry them forward whenever an update omits
         // them (Yandex leaves them out of pause/seek/redump snapshots), never reset to off.
-        if let shuffleMode = payload.shuffleMode {
+        if let shuffleMode = payload.number("shuffleMode") {
             newState.isShuffled = shuffleMode != 1
         } else {
             newState.isShuffled = playbackState.isShuffled
         }
 
-        if let repeatModeValue = payload.repeatMode {
-            newState.repeatMode = RepeatMode(rawValue: repeatModeValue) ?? .off
+        if let repeatModeValue = payload.number("repeatMode"), let mode = Int(exactly: repeatModeValue) {
+            newState.repeatMode = RepeatMode(rawValue: mode) ?? .off
         } else {
             newState.repeatMode = playbackState.repeatMode
         }
 
-        if let artworkDataString = payload.artworkData {
+        if let artworkDataString = payload.string("artworkData") {
             newState.artwork = Data(
                 base64Encoded: artworkDataString.trimmingCharacters(in: .whitespacesAndNewlines)
             )
-        } else if !diff {
+        } else if patch["artworkData"] != nil {
+            newState.artwork = nil
+        } else {
             // Yandex omits artwork on full snapshots for the CURRENT track (pause / seek / redump).
             // Keep the existing artwork for the same track — nil-ing then re-setting it would flip
             // album art and spuriously re-trigger the lyrics fetch. Only clear on a real track change.
-            let sameTrack = (payload.title ?? "") == playbackState.title
-                && (payload.artist ?? "") == playbackState.artist
+            let sameTrack = newState.title == playbackState.title
+                && newState.artist == playbackState.artist
+                && newState.album == playbackState.album
             if !sameTrack { newState.artwork = nil }
         }
 
-        newState.playbackRate = payload.playbackRate ?? (diff ? playbackState.playbackRate : 1.0)
-        newState.isPlaying = payload.playing ?? (diff ? playbackState.isPlaying : false)
-        newState.volume = payload.volume ?? (diff ? playbackState.volume : 0.5)
+        newState.playbackRate = payload.number("playbackRate") ?? 1.0
+        newState.isPlaying = payload.boolean("playing") ?? false
+        newState.volume = payload.number("volume") ?? 0.5
 
         // The like state is only re-read from the (expensive) accessibility tree when the track
         // actually changes; position-only diffs carry the previous value forward. On a track

@@ -57,6 +57,7 @@ class MusicManager: ObservableObject {
     @Published var isFavoriteTrack: Bool = false
 
     private var artworkData: Data? = nil
+    private var artworkRequestID = UUID()
 
     // Cache of successfully fetched lyrics, keyed by track. Serving a re-fetch (e.g. triggered
     // by artwork arriving late, or a pause/seek update) from here prevents a flaky LRCLIB
@@ -68,6 +69,10 @@ class MusicManager: ObservableObject {
     private var lyricsFetchTask: Task<Void, Never>?
     private var lyricsRequestID = UUID()
     private var lyricsRetryAfter: Date?
+    private var mediaKeyRecoveryTask: Task<Void, Never>?
+    private var mediaKeyRecoveryID = UUID()
+    private var lastHardwareMediaKeyAt: Date?
+    private var recoveredMediaSession: (owner: String, activity: Date, recoveredAt: Date)?
 
     // On-disk persistence of the lyrics cache, so lyrics survive relaunches instead of re-hitting
     // lrclib (slow on some networks) every time.
@@ -83,12 +88,6 @@ class MusicManager: ObservableObject {
     private static let legacyLyricsCacheURLs = ["boringNotch-lyrics-cache.json", "boringNotch-lyrics-cache-v2.json", "boringNotch-lyrics-cache-v3.json"]
         .map { temporaryDirectory.appendingPathComponent($0) }
     private var lyricsSaveTask: Task<Void, Never>?
-
-    // Store last values at the time artwork was changed
-    private var lastArtworkTitle: String = "I'm Handsome"
-    private var lastArtworkArtist: String = "Me"
-    private var lastArtworkAlbum: String = "Self Love"
-    private var lastArtworkBundleIdentifier: String? = nil
 
     @Published var isFlipping: Bool = false
     private var flipWorkItem: DispatchWorkItem?
@@ -157,6 +156,8 @@ class MusicManager: ObservableObject {
     
     public func destroy() {
         debounceIdleTask?.cancel()
+        cancelMediaKeyRecovery()
+        artworkRequestID = UUID()
         cancelLyricsFetch()
         lyricsSaveTask?.cancel()
         cancellables.removeAll()
@@ -170,7 +171,9 @@ class MusicManager: ObservableObject {
 
     // MARK: - Setup Methods
     private func createController(for type: MediaControllerType) -> (any MediaControllerProtocol)? {
+        cancelMediaKeyRecovery()
         cancelLyricsFetch()
+        artworkRequestID = UUID()
         // Cleanup previous controller
         if activeController != nil {
             controllerCancellables.removeAll()
@@ -259,38 +262,36 @@ class MusicManager: ObservableObject {
             }
         }
 
-        // Check for changes in track metadata using last artwork change values
-        let titleChanged = state.title != self.lastArtworkTitle
-        let artistChanged = state.artist != self.lastArtworkArtist
-        let albumChanged = state.album != self.lastArtworkAlbum
-        let bundleChanged = state.bundleIdentifier != self.lastArtworkBundleIdentifier
+        // Track metadata changes independently of artwork. Several tracks may use the same
+        // cover bytes; comparing with an artwork-only snapshot retriggers every progress tick.
+        let titleChanged = state.title != self.songTitle
+        let artistChanged = state.artist != self.artistName
+        let albumChanged = state.album != self.album
+        let bundleChanged = state.bundleIdentifier != self.bundleIdentifier
+        let metadataChanged = titleChanged || artistChanged || albumChanged || bundleChanged
 
         // Check for artwork changes
-        let artworkChanged = state.artwork != nil && state.artwork != self.artworkData
-        let hasContentChange = titleChanged || artistChanged || albumChanged || artworkChanged || bundleChanged
+        let artworkChanged = state.artwork != self.artworkData
+        let hasContentChange = metadataChanged || artworkChanged
 
         // Handle artwork and visual transitions for changed content
         if hasContentChange {
+            self.artworkRequestID = UUID()
             self.triggerFlipAnimation()
 
-            if artworkChanged, let artwork = state.artwork {
-                self.updateArtwork(artwork)
+            if let artwork = state.artwork {
+                self.updateArtwork(artwork, requestID: artworkRequestID)
             } else if state.artwork == nil {
                 // Try to use app icon if no artwork but track changed
                 if let appIconImage = AppIconAsNSImage(for: state.bundleIdentifier) {
                     self.usingAppIconForArtwork = true
                     self.updateAlbumArt(newAlbumArt: appIconImage)
+                } else {
+                    self.usingAppIconForArtwork = false
+                    self.updateAlbumArt(newAlbumArt: defaultImage)
                 }
             }
             self.artworkData = state.artwork
-
-            if artworkChanged || state.artwork == nil {
-                // Update last artwork change values
-                self.lastArtworkTitle = state.title
-                self.lastArtworkArtist = state.artist
-                self.lastArtworkAlbum = state.album
-                self.lastArtworkBundleIdentifier = state.bundleIdentifier
-            }
 
             // Only update sneak peek if there's actual content and something changed
             if !state.title.isEmpty && !state.artist.isEmpty && state.isPlaying {
@@ -408,6 +409,78 @@ class MusicManager: ObservableObject {
         guard canDislikeTrack, let controller = activeController else { return }
         Task { @MainActor in
             await controller.dislike()
+        }
+    }
+
+    // MARK: - Native media-key recovery
+
+    private func cancelMediaKeyRecovery() {
+        mediaKeyRecoveryTask?.cancel()
+        mediaKeyRecoveryTask = nil
+        mediaKeyRecoveryID = UUID()
+        lastHardwareMediaKeyAt = nil
+        recoveredMediaSession = nil
+    }
+
+    @MainActor
+    private func mediaKeySnapshot(_ controller: YandexMusicController) -> MediaKeyRecoverySnapshot {
+        MediaKeyRecoverySnapshot(
+            systemOwner: controller.systemMediaOwnerBundleIdentifier,
+            systemIsPlaying: controller.systemMediaIsPlaying,
+            foreignActivity: controller.lastForeignMediaActivity,
+            yandexIsPlaying: controller.accessibilityIsPlaying,
+            accessibilityObservedAt: controller.accessibilityMetadataLastReadAt,
+            foregroundApp: NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+            capturedAt: Date()
+        )
+    }
+
+    /// Hardware keys always reach macOS first. Only recover a proven unresponsive, paused
+    /// foreign session; active or focused players keep their native keyboard behavior.
+    @MainActor
+    func recoverUnresponsiveSystemPlayPause() {
+        mediaKeyRecoveryTask?.cancel()
+        mediaKeyRecoveryTask = nil
+        mediaKeyRecoveryID = UUID()
+        let requestID = mediaKeyRecoveryID
+        let now = Date()
+        let previousPress = lastHardwareMediaKeyAt
+        lastHardwareMediaKeyAt = now
+        // Rapid double presses can return a responsive player to its original state.
+        // Do not mistake their net result for an ignored native command.
+        guard previousPress.map({ now.timeIntervalSince($0) >= 1.2 }) ?? true,
+              Defaults[.mediaController] == .yandexMusic,
+              let controller = activeController as? YandexMusicController else { return }
+
+        let before = mediaKeySnapshot(controller)
+        let recentRecovery = recoveredMediaSession.map {
+            $0.owner == before.systemOwner && $0.activity == before.foreignActivity
+                && now.timeIntervalSince($0.recoveredAt) >= 0
+                && now.timeIntervalSince($0.recoveredAt) <= 120
+        } ?? false
+        guard MediaKeyRecoveryPolicy.isCandidate(before, at: before.capturedAt,
+                                                  recentlyRecoveredYandex: recentRecovery) else { return }
+
+        mediaKeyRecoveryTask = Task { @MainActor [weak self, weak controller] in
+            do {
+                try await Task.sleep(for: .milliseconds(1200))
+            } catch { return }
+            guard let self, let controller, !Task.isCancelled,
+                  self.mediaKeyRecoveryID == requestID,
+                  self.activeController === controller,
+                  Defaults[.mediaController] == .yandexMusic else { return }
+            await controller.refreshAccessibilityMetadata()
+            guard !Task.isCancelled, self.mediaKeyRecoveryID == requestID,
+                  self.activeController === controller,
+                  Defaults[.mediaController] == .yandexMusic else { return }
+
+            let after = self.mediaKeySnapshot(controller)
+            guard MediaKeyRecoveryPolicy.shouldRecover(before: before, after: after, at: Date(),
+                                                        recentlyRecoveredYandex: recentRecovery) else { return }
+            await controller.togglePlay()
+            if let owner = after.systemOwner, let activity = after.foreignActivity {
+                self.recoveredMediaSession = (owner, activity, Date())
+            }
         }
     }
 
@@ -765,14 +838,21 @@ class MusicManager: ObservableObject {
         DispatchQueue.main.async(execute: workItem)
     }
 
-    private func updateArtwork(_ artworkData: Data) {
+    private func updateArtwork(_ artworkData: Data, requestID: UUID) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self = self else { return }
-
-            if let artworkImage = NSImage(data: artworkData) {
-                DispatchQueue.main.async { [weak self] in
-                    self?.usingAppIconForArtwork = false
-                    self?.updateAlbumArt(newAlbumArt: artworkImage)
+            let artworkImage = NSImage(data: artworkData)
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.artworkRequestID == requestID else { return }
+                if let artworkImage {
+                    self.usingAppIconForArtwork = false
+                    self.updateAlbumArt(newAlbumArt: artworkImage)
+                } else if let bundleIdentifier = self.bundleIdentifier,
+                          let icon = AppIconAsNSImage(for: bundleIdentifier) {
+                    self.usingAppIconForArtwork = true
+                    self.updateAlbumArt(newAlbumArt: icon)
+                } else {
+                    self.usingAppIconForArtwork = false
+                    self.updateAlbumArt(newAlbumArt: defaultImage)
                 }
             }
         }
@@ -816,10 +896,12 @@ class MusicManager: ObservableObject {
     }
 
     func calculateAverageColor() {
-        albumArt.averageColor { [weak self] color in
+        let image = albumArt
+        image.averageColor { [weak self] color in
             DispatchQueue.main.async {
+                guard let self, self.albumArt === image else { return }
                 withAnimation(.smooth) {
-                    self?.avgColor = color ?? .white
+                    self.avgColor = color ?? .white
                 }
             }
         }

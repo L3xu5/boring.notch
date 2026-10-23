@@ -63,7 +63,7 @@ Playback integration lives in [`YandexMusicController.swift`](boringNotch/MediaC
 
 1. In the notch settings (menu-bar star → **Settings → Media Source**) choose **Yandex Music**.
 2. Grant **Accessibility** permission — **System Settings → Privacy & Security → Accessibility** → enable **boringNotch**.
-   *Required for transport and likes. Metadata & artwork work without it.*
+   *Required for transport, likes and the metadata fallback. System metadata and artwork work without it while Yandex owns the Now Playing session.*
 3. Play something in the Yandex Music app 🎧
 4. Optionally use **Connect…** in the Yandex Music settings to enable lyrics from your account. Lyrics timing can be adjusted with **Lyrics offset**.
 
@@ -75,9 +75,11 @@ Updates are delivered from this fork through **Check for Updates…**. You can a
 brew install --cask l3xu5/boring-notch/boring-notch-yandex
 ```
 
+Physical media keys retain native macOS handling, including Safari and other players. The app only attempts Yandex Play/Pause recovery after an unchanged, inactive foreign session fails to respond, with fresh Yandex playback data. Configurable media shortcuts explicitly control the selected music source.
+
 ## ⚠️ Known limitation
 
-macOS exposes a **single** system *Now Playing* session. If another app (e.g. a video in Safari) is actively playing and owns that session, Yandex's live position can't be read from the system, so synced lyrics may drift. Yandex Music also doesn't expose a playback slider through Accessibility, so there's no fallback. **For accurate lyrics, keep Yandex Music as the active media session.**
+macOS exposes a **single** system *Now Playing* session. When another app owns it, the Yandex integration reads title, artist and artwork from Yandex's own accessible player instead of retaining the previous track. This does not change which app receives native media controls. Yandex's live position still cannot be read from that session, and its Accessibility tree does not expose a playback slider, so synced lyrics may drift. **For accurate lyrics, keep Yandex Music as the active media session.**
 
 ## 🛠️ Building from source
 
