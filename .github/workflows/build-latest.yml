@@ -145,7 +145,7 @@ jobs:
             --download-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/latest/${ARCHIVE}" \
             --signature "$SIGINFO" --output appcast.xml
 
-      - name: Publish rolling latest release
+      - name: Publish rolling and versioned releases
         env:
           GH_TOKEN: ${{ github.token }}
           ARCHIVE: ${{ steps.ver.outputs.archive }}
@@ -159,6 +159,35 @@ jobs:
             echo "Skipping publication: main advanced beyond ${GITHUB_SHA}." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
+          VERSION_TAG="v${SHORT}"
+          VERSION_TITLE="Boring Notch — Yandex Music ${SHORT}"
+          VERSION_DRAFT=missing
+          if VERSION_DRAFT="$(gh release view "$VERSION_TAG" --json isDraft --jq '.isDraft' 2>"$RUNNER_TEMP/version-release-error")"; then
+            if [[ "$VERSION_DRAFT" != true && "$VERSION_DRAFT" != false ]]; then
+              echo "::error::Could not determine whether ${VERSION_TAG} is a draft."
+              exit 1
+            fi
+          elif grep -Eq 'release not found|HTTP 404' "$RUNNER_TEMP/version-release-error"; then
+            VERSION_DRAFT=missing
+          else
+            cat "$RUNNER_TEMP/version-release-error" >&2
+            exit 1
+          fi
+          # Versioned releases are permanent: a rerun may reuse only this commit's tag.
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION_TAG}" > /dev/null 2>"$RUNNER_TEMP/version-tag-error"; then
+            # The commits endpoint also resolves annotated tags to their commit.
+            VERSION_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${VERSION_TAG}" --jq '.sha')"
+            if [[ "$VERSION_SHA" != "$GITHUB_SHA" ]]; then
+              echo "::error::${VERSION_TAG} points to ${VERSION_SHA}, expected ${GITHUB_SHA}; refusing to replace it."
+              exit 1
+            fi
+          elif ! grep -q 'HTTP 404' "$RUNNER_TEMP/version-tag-error"; then
+            cat "$RUNNER_TEMP/version-tag-error" >&2
+            exit 1
+          elif [[ "$VERSION_DRAFT" == false ]]; then
+            echo "::error::Published release ${VERSION_TAG} is missing its tag. Restore it before rerunning."
+            exit 1
+          fi
           cat > "$RUNNER_TEMP/release-notes.md" <<EOF
           Auto-built from \`main\` (${GITHUB_SHA::7}), version ${SHORT}, build ${BUILD}.
 
@@ -166,7 +195,7 @@ jobs:
           Homebrew: \`brew install --cask l3xu5/boring-notch/boring-notch-yandex\`.
           EOF
           if ! gh release view latest >/dev/null 2>&1; then
-            gh release create latest --draft --title "Latest build" \
+            gh release create latest --draft --title "Rolling build ${SHORT}" \
               --notes-file "$RUNNER_TEMP/release-notes.md" --target "$GITHUB_SHA"
           fi
           gh release upload latest "$ARCHIVE"
@@ -182,6 +211,18 @@ jobs:
             gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
               -f ref=refs/tags/latest -f sha="$GITHUB_SHA" >/dev/null
           fi
-          gh release edit latest --draft=false --latest --title "Latest build" \
+          gh release edit latest --draft=false --latest=false --title "Rolling build ${SHORT}" \
             --notes-file "$RUNNER_TEMP/release-notes.md"
-          echo "Published ${SHORT} (${GITHUB_SHA})." >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$VERSION_DRAFT" == false ]]; then
+            echo "Kept published release ${VERSION_TAG}; its assets and notes are unchanged." >> "$GITHUB_STEP_SUMMARY"
+          else
+            if [[ "$VERSION_DRAFT" == missing ]]; then
+              gh release create "$VERSION_TAG" --draft --title "$VERSION_TITLE" \
+                --notes-file "$RUNNER_TEMP/release-notes.md" --target "$GITHUB_SHA"
+            fi
+            gh release upload "$VERSION_TAG" boringNotch.zip appcast.xml --clobber
+            # Publish last so the new release is visible only with both assets ready.
+            gh release edit "$VERSION_TAG" --draft=false --latest --title "$VERSION_TITLE" \
+              --notes-file "$RUNNER_TEMP/release-notes.md" --target "$GITHUB_SHA"
+          fi
+          echo "Published rolling build ${SHORT} (${GITHUB_SHA}) and release ${VERSION_TAG}." >> "$GITHUB_STEP_SUMMARY"

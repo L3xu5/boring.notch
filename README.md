@@ -107,7 +107,9 @@ Grant Accessibility to that local app separately. An ad-hoc signature does not p
 
 **Build latest** publishes every push to `main`, using the full commit count as `CFBundleVersion`. The marketing version is derived from the project and stamped into both the app and Sparkle feed. Keep `main` history intact so update build numbers continue to increase.
 
-The rolling release retains `boringNotch.zip` for direct downloads and Homebrew. Sparkle uses an archive unique to each build, uploaded before `appcast.xml`, so clients with an older feed can still download the matching signed archive. Old build archives must remain available. The `latest` tag moves to the built source commit. Manually dispatched builds from other branches cannot publish.
+Each build creates a new versioned release such as `v2.7.3-yandex.1353`, with `boringNotch.zip` and `appcast.xml`, and marks it as GitHub's latest release. Reruns preserve the assets and notes of an already published version. A version tag must continue to point to the original built commit.
+
+The separate rolling release retains the fixed `latest` tag and `boringNotch.zip` URL for existing Sparkle clients and Homebrew. Its title shows the current build, while the latest-release badge belongs to the versioned release. Sparkle uses an archive unique to each build, uploaded before `appcast.xml`, so clients with an older feed can still download the matching signed archive. Old build archives must remain available. The rolling `latest` tag moves to the built source commit. Manually dispatched builds from other branches cannot publish.
 
 Configure these repository secrets in **Settings → Secrets and variables → Actions**:
 
