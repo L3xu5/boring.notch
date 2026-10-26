@@ -149,8 +149,11 @@ struct MusicControlsView: View {
     private func overflowAction(_ slot: MusicControlButton) -> some View {
         switch slot {
         case .favorite:
-            Button(musicManager.isFavoriteTrack ? "Unlike track" : "Like track") { musicManager.toggleFavoriteTrack() }
+            let presentation = FavoriteControlPresentation(stateKnown: musicManager.isFavoriteStateKnown,
+                                                          isFavorite: musicManager.isFavoriteTrack)
+            Button(LocalizedStringKey(presentation.actionLabel)) { musicManager.toggleFavoriteTrack() }
                 .disabled(!musicManager.canFavoriteTrack)
+                .accessibilityValue(Text(LocalizedStringKey(presentation.accessibilityValue)))
         case .dislike:
             Button("Dislike track") { musicManager.dislikeCurrentTrack() }.disabled(!musicManager.canDislikeTrack)
         case .playPause:

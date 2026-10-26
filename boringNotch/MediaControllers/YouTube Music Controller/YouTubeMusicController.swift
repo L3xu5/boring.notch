@@ -27,6 +27,7 @@ final class YouTubeMusicController: MediaControllerProtocol {
     var playbackStatePublisher: AnyPublisher<PlaybackState, Never> { $playbackState.eraseToAnyPublisher() }
     var supportsVolumeControl: Bool { true }
     var supportsFavorite: Bool { true }
+    var currentFavoriteState: Bool? { stopped ? nil : playbackState.isFavorite }
     private let configuration: YouTubeMusicConfiguration
     private var session: YouTubeMusicSession?
     private var startupTask: Task<Void, Never>?

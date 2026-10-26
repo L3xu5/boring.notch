@@ -63,6 +63,7 @@ class MusicManager: ObservableObject {
     @Published var canFavoriteTrack: Bool = false
     @Published var canDislikeTrack: Bool = false
     @Published var isFavoriteTrack: Bool = false
+    @Published private(set) var isFavoriteStateKnown: Bool = false
 
     private var presentationSnapshot: PlaybackState?
     private var artworkPresentation: ArtworkPresentationService!
@@ -152,6 +153,9 @@ class MusicManager: ObservableObject {
         activeController?.stop()
         activeController = nil
         selectedSource = nil
+        canFavoriteTrack = false
+        isFavoriteStateKnown = false
+        isFavoriteTrack = false
     }
 
     // MARK: - Setup Methods
@@ -244,6 +248,8 @@ class MusicManager: ObservableObject {
 
         self.canFavoriteTrack = controller.supportsFavorite
         self.canDislikeTrack = controller.supportsDislike
+        self.isFavoriteStateKnown = controller.currentFavoriteState != nil
+        self.isFavoriteTrack = false
 
         // Get current state from active controller
         forceUpdate()
@@ -322,8 +328,15 @@ class MusicManager: ObservableObject {
         if repeatModeChanged {
             self.repeatMode = state.repeatMode
         }
-        if state.isFavorite != self.isFavoriteTrack {
-            self.isFavoriteTrack = state.isFavorite
+        // Action availability and an observed like state are independent: Electron can
+        // expose a working toggle without exposing whether that toggle is selected.
+        let favoriteStateKnown = activeController?.currentFavoriteState != nil
+        if self.isFavoriteStateKnown != favoriteStateKnown {
+            self.isFavoriteStateKnown = favoriteStateKnown
+        }
+        let favorite = favoriteStateKnown && state.isFavorite
+        if favorite != self.isFavoriteTrack {
+            self.isFavoriteTrack = favorite
         }
 
         if volumeChanged {
@@ -345,8 +358,11 @@ class MusicManager: ObservableObject {
 
     func toggleFavoriteTrack() {
         guard canFavoriteTrack else { return }
-        // Toggle based on current state
-        setFavorite(!isFavoriteTrack)
+        performCommand { controller in
+            await controller.toggleFavorite()
+            guard !Task.isCancelled else { return }
+            await controller.updatePlaybackInfo()
+        }
     }
 
     func setFavorite(_ favorite: Bool) {

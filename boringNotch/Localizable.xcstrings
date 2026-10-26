@@ -11909,6 +11909,23 @@
         }
       }
     },
+    "Like status unavailable" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Like status unavailable"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Статус лайка недоступен"
+          }
+        }
+      }
+    },
     "Layout Preview" : {
       "localizations" : {
         "ar" : {
@@ -21410,6 +21427,23 @@
           "stringUnit" : {
             "state" : "needs_review",
             "value" : "Tint progress bar with accent color"
+          }
+        }
+      }
+    },
+    "Toggle like" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Toggle like"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Переключить лайк"
           }
         }
       }

@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import ApplicationServices
 
 protocol YandexAccessibilityProviding: Sendable {
@@ -6,6 +7,69 @@ protocol YandexAccessibilityProviding: Sendable {
     func perform(_ action: YandexPlayerAction, processIdentifier: pid_t,
                  isCurrent: @escaping @Sendable () -> Bool) async -> Bool
     func favoriteState(processIdentifier: pid_t) async -> Bool?
+    func favoriteState(processIdentifier: pid_t, expectedTrack: YandexFavoriteTarget) async -> Bool?
+    func setFavorite(_ favorite: Bool, processIdentifier: pid_t, expectedTrack: YandexFavoriteTarget,
+                     isCurrent: @escaping @Sendable () -> Bool) async -> Bool
+    func toggleFavorite(processIdentifier: pid_t, expectedTrack: YandexFavoriteTarget,
+                        isCurrent: @escaping @Sendable () -> Bool) async -> Bool
+}
+
+extension YandexAccessibilityProviding {
+    func favoriteState(processIdentifier: pid_t, expectedTrack: YandexFavoriteTarget) async -> Bool? {
+        guard let metadata = await read(processIdentifier: processIdentifier), expectedTrack.matches(metadata) else { return nil }
+        return metadata.isFavorite
+    }
+
+    func setFavorite(_ favorite: Bool, processIdentifier: pid_t, expectedTrack: YandexFavoriteTarget,
+                     isCurrent: @escaping @Sendable () -> Bool) async -> Bool {
+        guard let current = await favoriteState(processIdentifier: processIdentifier, expectedTrack: expectedTrack),
+              !Task.isCancelled, isCurrent() else { return false }
+        if current == favorite { return true }
+        return await toggleFavorite(processIdentifier: processIdentifier, expectedTrack: expectedTrack, isCurrent: isCurrent)
+    }
+    func toggleFavorite(processIdentifier: pid_t, expectedTrack: YandexFavoriteTarget,
+                        isCurrent: @escaping @Sendable () -> Bool) async -> Bool {
+        guard isCurrent(), !Task.isCancelled else { return false }
+        return await perform(.like, processIdentifier: processIdentifier, isCurrent: isCurrent)
+    }
+}
+
+struct YandexFavoriteTarget: Sendable {
+    let trackID: String?
+    let title: String
+    let artist: String
+
+    private func normalized(_ value: String) -> String {
+        value.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+            .components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }.joined(separator: " ")
+    }
+
+    /// The player can render a plain title/artist span and an album link instead of a track link.
+    /// Only use this with the bounded transport bar, never with a whole page/library snapshot.
+    func matches(root: YandexAccessibilityNode) -> Bool {
+        var nodes: [YandexAccessibilityNode] = []
+        func visit(_ node: YandexAccessibilityNode) { nodes.append(node); node.children.forEach(visit) }
+        visit(root)
+        let ids = Set(nodes.filter { $0.role == "AXLink" }.compactMap { $0.url.flatMap { YandexAccessibilityMetadata.entityID(in: $0, kind: "track") } })
+        if let trackID, !ids.isEmpty { return ids == [trackID] }
+        if let metadata = YandexAccessibilityMetadata(root: root), matches(metadata) { return true }
+        let title = normalized(title), artist = normalized(artist)
+        guard !title.isEmpty, !artist.isEmpty, ids.count <= 1 else { return false }
+        let texts = Set(nodes.filter { node in
+            if node.role == "AXStaticText" { return true }
+            guard node.role == "AXLink", let url = node.url,
+                  YandexAccessibilityMetadata.isEntityURL(url) else { return false }
+            return YandexAccessibilityMetadata.entityID(in: url, kind: "track") != nil
+                || YandexAccessibilityMetadata.entityID(in: url, kind: "artist") != nil
+        }.flatMap { $0.labels + [$0.value].compactMap { $0 } }.map(normalized))
+        return texts.contains(title) && texts.contains(artist)
+    }
+
+    func matches(_ metadata: YandexAccessibilityMetadata) -> Bool {
+        if let trackID, let observedID = metadata.trackID { return trackID == observedID }
+        return !title.isEmpty && normalized(title) == normalized(metadata.title)
+            && normalized(artist) == normalized(metadata.artist)
+    }
 }
 
 /// The AX worker checks the same ticket immediately before its native side effect. MainActor
@@ -75,29 +139,27 @@ struct YandexAccessibilityMetadata: Sendable {
                 }
             }
             if let value = node.value, !value.isEmpty { return value }
-            return node.children.compactMap { $0.value }.filter { !$0.isEmpty }.joined(separator: " ")
+            let childText = node.children.compactMap { $0.value }.filter { !$0.isEmpty }.joined(separator: " ")
+            return childText.isEmpty ? (node.labels.first ?? "") : childText
         }
         let tracks = nodes.filter { node in
-            node.role == "AXLink" && ((node.url.map(Self.isEntityURL) == true && node.url?.path.contains("/track/") == true)
+            node.role == "AXLink" && ((node.url.flatMap { Self.entityID(in: $0, kind: "track") } != nil)
                 || node.labels.contains { $0.lowercased().hasPrefix("track ") || $0.lowercased().hasPrefix("трек ") })
         }
         let titles = tracks.map { text($0, prefixes: ["track ", "трек "]) }.filter { !$0.isEmpty }
         // A whole library/list is not the persistent player bar. Never borrow a random row's title.
-        let trackPaths = Set(tracks.compactMap { $0.url }.filter(Self.isEntityURL).map(\.path))
+        let trackPaths = Set(tracks.compactMap { $0.url.flatMap { Self.entityID(in: $0, kind: "track") } })
         guard let title = titles.first, Set(titles).count == 1, trackPaths.count <= 1 else { return nil }
-        let track = tracks.first { $0.url.map(Self.isEntityURL) == true && $0.url?.path.contains("/track/") == true }
-        let components = track?.url?.pathComponents ?? []
-        let id = components.firstIndex(of: "track").flatMap { $0 + 1 < components.count ? components[$0 + 1] : nil }
-        self.trackID = id.flatMap { !$0.isEmpty && $0.allSatisfy({ $0 >= "0" && $0 <= "9" }) ? $0 : nil }
+        self.trackID = trackPaths.first
         self.title = title
         var artists: [String] = []
-        for node in nodes where node.role == "AXLink" && node.url.map(Self.isEntityURL) == true && node.url?.path.contains("/artist/") == true {
+        for node in nodes where node.role == "AXLink" && node.url.flatMap({ Self.entityID(in: $0, kind: "artist") }) != nil {
             let name = text(node, prefixes: ["artist ", "артист ", "исполнитель "])
             if !name.isEmpty && !artists.contains(name) { artists.append(name) }
         }
         artist = artists.joined(separator: ", ")
-        album = nodes.first { $0.role == "AXLink" && $0.url.map(Self.isEntityURL) == true && $0.url?.path.contains("/album/") == true
-            && $0.url?.path.contains("/track/") != true }
+        album = nodes.first { $0.role == "AXLink" && $0.url.flatMap({ Self.entityID(in: $0, kind: "album") }) != nil
+            && $0.url.flatMap({ Self.entityID(in: $0, kind: "track") }) == nil }
             .map { text($0, prefixes: ["album ", "альбом "]) } ?? ""
         artworkURL = nodes.lazy.filter { $0.role == "AXImage" }.compactMap(\.url)
             .first(where: Self.isTrustedArtworkURL)
@@ -117,6 +179,26 @@ struct YandexAccessibilityMetadata: Sendable {
         if url.scheme?.lowercased() == "music-application", url.host?.lowercased() == "desktop" { return true }
         return url.scheme?.lowercased() == "https"
             && ["music.yandex.ru", "music.yandex.com", "music.yandex.by", "music.yandex.kz", "music.yandex.uz"].contains(url.host?.lowercased() ?? "")
+    }
+
+    static func entityID(in url: URL, kind: String) -> String? {
+        guard isEntityURL(url) else { return nil }
+        func valid(_ value: String) -> String? {
+            !value.isEmpty && value.allSatisfy { $0 >= "0" && $0 <= "9" } ? value : nil
+        }
+        let parts = url.pathComponents
+        guard parts.filter({ $0 == kind }).count <= 1 else { return nil }
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        let queryIDs = items.filter { $0.name.lowercased() == kind + "id" }
+        guard queryIDs.count <= 1 else { return nil }
+        let queryID = queryIDs.first?.value.flatMap(valid)
+        guard queryIDs.isEmpty || queryID != nil else { return nil }
+        if let index = parts.firstIndex(of: kind), index + 1 < parts.count {
+            guard let pathID = valid(parts[index + 1]), queryID == nil || queryID == pathID else { return nil }
+            return pathID
+        }
+        guard url.scheme?.lowercased() == "music-application", parts.last == kind else { return nil }
+        return queryID
     }
 
     static func isTrustedArtworkURL(_ url: URL) -> Bool {
@@ -494,5 +576,136 @@ extension YandexAccessibilityClient {
         prepare(processIdentifier)
         controlDeadline = Date().addingTimeInterval(1)
         return readLikeState()
+    }
+
+    /// Resolve the smallest current-player scope with transport, identity and a unique Like.
+    /// Plain text is valid identity evidence here; a complete metadata object is unnecessary.
+    private struct FavoriteControl {
+        let bar: AXUIElement
+        let button: AXUIElement
+    }
+
+    private func favoriteControl(expectedTrack: YandexFavoriteTarget) -> FavoriteControl? {
+        guard let app = yandexAppElement() else { return nil }
+        var budget = 6000
+        guard let next = nextButton(app, remaining: &budget, deadline: controlDeadline) else { return nil }
+        var candidate = next
+        for _ in 0..<8 {
+            guard !Task.isCancelled, Date() < controlDeadline, actionIsCurrent(),
+                  let parent = axParent(candidate), let (node, _) = attributes(parent),
+                  !["AXWebArea", "AXWindow", "AXApplication"].contains(node.role) else { return nil }
+            candidate = parent
+            var budget = 200
+            guard let snapshot = tree(candidate, remaining: &budget, deadline: controlDeadline),
+                  expectedTrack.matches(root: snapshot), isTransportCluster(candidate) else { continue }
+            var likes: [AXUIElement] = []
+            func collect(_ element: AXUIElement, _ depth: Int = 0) {
+                guard depth < 18, likes.count < 2, !Task.isCancelled, Date() < controlDeadline,
+                      let (node, children) = attributes(element) else { return }
+                if YandexLikeState.isLikeControl(role: node.role, labels: node.labels) { likes.append(element) }
+                children.forEach { collect($0, depth + 1) }
+            }
+            collect(candidate)
+            guard likes.count == 1, let button = likes.first,
+                  (axAttribute(button, kAXEnabledAttribute) as Bool?) == true else { continue }
+            return FavoriteControl(bar: candidate, button: button)
+        }
+        return nil
+    }
+
+    func favoriteState(processIdentifier: pid_t, expectedTrack: YandexFavoriteTarget) async -> Bool? {
+        prepare(processIdentifier)
+        actionIsCurrent = { true }
+        controlDeadline = Date().addingTimeInterval(1)
+        guard AXIsProcessTrusted(), !Task.isCancelled,
+              let control = favoriteControl(expectedTrack: expectedTrack) else { return nil }
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(control.button, kAXValueAttribute as CFString, &value) == .success else { return nil }
+        return YandexLikeState.decodeAXValue(value)
+    }
+
+    func toggleFavorite(processIdentifier: pid_t, expectedTrack: YandexFavoriteTarget,
+                        isCurrent: @escaping @Sendable () -> Bool) async -> Bool {
+        guard await ensureFavoriteWindow(processIdentifier: processIdentifier, isCurrent: isCurrent) else { return false }
+        return changeFavorite(nil, processIdentifier: processIdentifier, expectedTrack: expectedTrack, isCurrent: isCurrent)
+    }
+
+    func setFavorite(_ favorite: Bool, processIdentifier: pid_t, expectedTrack: YandexFavoriteTarget,
+                     isCurrent: @escaping @Sendable () -> Bool) async -> Bool {
+        guard await ensureFavoriteWindow(processIdentifier: processIdentifier, isCurrent: isCurrent) else { return false }
+        return changeFavorite(favorite, processIdentifier: processIdentifier, expectedTrack: expectedTrack, isCurrent: isCurrent)
+    }
+
+    /// Electron removes the player from AX when its window is closed. Reopen only for an
+    /// explicit command; passive reads never open a window or change the foreground app.
+    private func ensureFavoriteWindow(processIdentifier: pid_t,
+                                      isCurrent: @escaping @Sendable () -> Bool) async -> Bool {
+        guard AXIsProcessTrusted(), !Task.isCancelled, isCurrent() else { return false }
+        let app = AXUIElementCreateApplication(processIdentifier)
+        AXUIElementSetMessagingTimeout(app, 0.1)
+        func hasWindow() -> Bool? {
+            var raw: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &raw) == .success,
+                  let windows = raw as? [AXUIElement] else { return nil }
+            return !windows.isEmpty
+        }
+        guard let available = hasWindow() else { return false }
+        if available { return true }
+        guard await Self.reopenFavoriteWindow(processIdentifier: processIdentifier, isCurrent: isCurrent) else { return false }
+        for _ in 0..<10 {
+            guard !Task.isCancelled, isCurrent() else { return false }
+            if hasWindow() == true { return true }
+            do { try await Task.sleep(for: .milliseconds(100)) } catch { return false }
+        }
+        return false
+    }
+
+    @MainActor
+    private static func reopenFavoriteWindow(processIdentifier: pid_t,
+                                              isCurrent: @escaping @Sendable () -> Bool) async -> Bool {
+        guard !Task.isCancelled, isCurrent(),
+              let app = NSRunningApplication(processIdentifier: processIdentifier),
+              app.bundleIdentifier == "ru.yandex.desktop.music", let url = app.bundleURL else { return false }
+        let workspace = NSWorkspace.shared
+        let previous = workspace.frontmostApplication
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = false
+        configuration.appleEvent = NSAppleEventDescriptor(eventClass: 0x61657674, eventID: 0x72617070,
+            targetDescriptor: NSAppleEventDescriptor(bundleIdentifier: "ru.yandex.desktop.music"),
+            returnID: -1, transactionID: 0)
+        do {
+            let opened = try await workspace.openApplication(at: url, configuration: configuration)
+            // Yandex's reopen handler calls window.show(), which can activate Electron despite
+            // activates=false. Restore only if Yandex took focus, never over a different app.
+            try? await Task.sleep(for: .milliseconds(150))
+            if let previous, previous.processIdentifier != processIdentifier,
+               workspace.frontmostApplication?.processIdentifier == processIdentifier {
+                _ = previous.activate(options: [])
+                try? await Task.sleep(for: .milliseconds(150))
+            }
+            return opened.processIdentifier == processIdentifier && !Task.isCancelled && isCurrent()
+        } catch { return false }
+    }
+
+    private func changeFavorite(_ desiredState: Bool?, processIdentifier: pid_t, expectedTrack: YandexFavoriteTarget,
+                                isCurrent: @escaping @Sendable () -> Bool) -> Bool {
+        prepare(processIdentifier)
+        actionIsCurrent = isCurrent
+        controlDeadline = Date().addingTimeInterval(2)
+        guard AXIsProcessTrusted(), !Task.isCancelled, isCurrent(),
+              let control = favoriteControl(expectedTrack: expectedTrack) else { return false }
+        // Recheck after locating the control: Yandex can advance tracks before its adapter update arrives.
+        var budget = 200
+        guard let snapshot = tree(control.bar, remaining: &budget, deadline: controlDeadline),
+              expectedTrack.matches(root: snapshot) else { return false }
+        if let desiredState {
+            var value: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(control.button, kAXValueAttribute as CFString, &value) == .success,
+                  let current = YandexLikeState.decodeAXValue(value) else { return false }
+            if current == desiredState { return true }
+        }
+        guard !Task.isCancelled, Date() < controlDeadline, isCurrent(),
+              (axAttribute(control.button, kAXEnabledAttribute) as Bool?) == true else { return false }
+        return AXUIElementPerformAction(control.button, kAXPressAction as CFString) == .success
     }
 }

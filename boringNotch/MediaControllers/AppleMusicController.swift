@@ -27,6 +27,7 @@ class AppleMusicController: MediaControllerProtocol {
     var supportsFavorite: Bool {
         return true
     }
+    var currentFavoriteState: Bool? { stopped ? nil : playbackState.isFavorite }
 
     private var notificationTask: Task<Void, Never>?
     private var applicationObserver: MediaApplicationObserver?

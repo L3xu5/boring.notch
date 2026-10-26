@@ -16,10 +16,15 @@ protocol MediaControllerProtocol: ObservableObject {
     var capabilities: MediaCapabilities { get }
     var supportsVolumeControl: Bool { get }
     var supportsFavorite: Bool { get }
+    /// Nil means the current value is unreadable; action availability is a separate capability.
+    var currentFavoriteState: Bool? { get }
     var supportsDislike: Bool { get }
 
     func stop()
+    /// Requests a specific state; an unknown value must not be implemented by a blind press.
     func setFavorite(_ favorite: Bool) async
+    /// Explicit user intent to toggle the current source's control once.
+    func toggleFavorite() async
     func dislike() async
     func play() async
     func pause() async
@@ -39,6 +44,11 @@ extension MediaControllerProtocol {
         .init(volume: supportsVolumeControl, favorite: supportsFavorite, dislike: supportsDislike)
     }
     func stop() {}
+    var currentFavoriteState: Bool? { nil }
+    func toggleFavorite() async {
+        guard !Task.isCancelled, supportsFavorite, let current = currentFavoriteState else { return }
+        await setFavorite(!current)
+    }
     // Most sources have no dedicated dislike; default to just removing the like.
     var supportsDislike: Bool { false }
     func dislike() async { await setFavorite(false) }

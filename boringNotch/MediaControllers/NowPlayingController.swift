@@ -34,6 +34,7 @@ final class NowPlayingController: ObservableObject, MediaControllerProtocol {
         let bundleID = playbackState.bundleIdentifier
         return bundleID == "com.apple.Music"
     }
+    var currentFavoriteState: Bool? { !stopped && supportsFavorite ? playbackState.isFavorite : nil }
     var capabilities: MediaCapabilities {
         .init(volume: supportsVolumeControl, favorite: supportsFavorite,
               seek: commands.canSeek, shuffle: commands.canShuffle, repeatMode: commands.canRepeat)
