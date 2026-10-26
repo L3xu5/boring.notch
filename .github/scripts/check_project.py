@@ -34,6 +34,7 @@ NATIVE_SUITES = (
     "test_media_checker.py",
     "test_native_utilities.py",
     "test_camera_presentation.py",
+    "test_slider_input.py",
     "test_spotify_lifecycle.py",
     "test_shelf_preview.py",
 )

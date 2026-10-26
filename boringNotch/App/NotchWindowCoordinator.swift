@@ -156,7 +156,7 @@ final class NotchWindowCoordinator {
             styleMask: [.borderless, .nonactivatingPanel, .utilityWindow, .hudWindow],
             backing: .buffered, defer: false
         )
-        window.contentView = NSHostingView(rootView: ContentView().environmentObject(model))
+        window.contentView = NotchHostingView(rootView: ContentView().environmentObject(model))
         let record = Record(window: window, model: model)
         NotchSpaceManager.shared.notchSpace.windows.insert(window)
         record.observations.append(NotificationObservation(name: NSWindow.didResignKeyNotification,
