@@ -27,6 +27,7 @@ NATIVE_SUITES = (
     "test_lyrics.py",
     "test_music_metadata.py",
     "test_yandex_metadata.py",
+    "test_yandex_favorite_ax.py",
     "test_media_stream.py",
     "test_media_keys.py",
     "test_media_key_recovery.py",

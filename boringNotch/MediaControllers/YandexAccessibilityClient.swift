@@ -26,6 +26,35 @@ struct YandexAccessibilityNode: Decodable, Sendable {
     let children: [YandexAccessibilityNode]
 }
 
+/// A toggle's label describes the action in both states. Only its explicit AX value
+/// confirms a like; Chromium exposes mixed/indeterminate as 2, not as true.
+enum YandexLikeState {
+    static func isLikeControl(role: String, labels: [String]) -> Bool {
+        guard ["AXButton", "AXCheckBox"].contains(role) else { return false }
+        let names: Set<String> = ["like", "нравится", "мне нравится", "ұнайды", "yoqadi"]
+        return labels.contains { names.contains($0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) }
+    }
+
+    static func decode(_ value: String?) -> Bool? {
+        switch value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "1", "true": return true
+        case "0", "false": return false
+        default: return nil
+        }
+    }
+
+    static func decodeAXValue(_ value: Any?) -> Bool? {
+        if let number = value as? NSNumber {
+            switch number.doubleValue {
+            case 0: return false
+            case 1: return true
+            default: return nil
+            }
+        }
+        return decode(value as? String)
+    }
+}
+
 struct YandexAccessibilityMetadata: Sendable {
     let title: String
     let artist: String
@@ -33,6 +62,7 @@ struct YandexAccessibilityMetadata: Sendable {
     let trackID: String?
     let artworkURL: URL?
     let isPlaying: Bool?
+    let isFavorite: Bool?
 
     init?(root: YandexAccessibilityNode) {
         var nodes: [YandexAccessibilityNode] = []
@@ -76,6 +106,10 @@ struct YandexAccessibilityMetadata: Sendable {
         if controls.contains(where: { $0 == "pause" || $0.contains("пауза") || $0.contains("приостанов") }) { isPlaying = true }
         else if controls.contains(where: { $0 == "play" || $0 == "playback" || $0.contains("воспроизвед") || $0 == "продолжить" }) { isPlaying = false }
         else { isPlaying = nil }
+        let likes = nodes.filter { YandexLikeState.isLikeControl(role: $0.role, labels: $0.labels) }
+        let values = likes.compactMap { YandexLikeState.decode($0.value) }
+        // Multiple rendered controls must agree, and an unknown value cannot establish true.
+        isFavorite = !likes.isEmpty && values.count == likes.count && Set(values).count == 1 ? values.first : nil
     }
 
     static func isEntityURL(_ url: URL) -> Bool {
@@ -102,13 +136,18 @@ actor YandexAccessibilityClient: YandexAccessibilityProviding {
     private var nextSearch = Date.distantPast
 
     private func attributes(_ element: AXUIElement) -> (node: YandexAccessibilityNode, children: [AXUIElement])? {
-        let names = [kAXRoleAttribute, kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute, kAXURLAttribute, kAXChildrenAttribute]
+        let names = [kAXRoleAttribute, kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute, kAXURLAttribute, kAXChildrenAttribute, kAXEnabledAttribute]
         var raw: CFArray?
         guard AXUIElementCopyMultipleAttributeValues(element, names as CFArray, AXCopyMultipleAttributeOptions(rawValue: 0), &raw) == .success,
               let values = raw as? [Any], values.count == names.count, let role = values[0] as? String else { return nil }
         let url = (values[4] as? URL) ?? (values[4] as? String).flatMap(URL.init(string:))
         let labels = [values[1] as? String, values[2] as? String].compactMap { $0 }.filter { !$0.isEmpty }
-        return (.init(role: role, labels: labels, value: values[3] as? String, url: url, children: []), values[5] as? [AXUIElement] ?? [])
+        var value = values[3] as? String
+        if ["AXButton", "AXCheckBox"].contains(role) {
+            value = (values[6] as? NSNumber)?.boolValue == false ? nil
+                : YandexLikeState.decodeAXValue(values[3]).map { $0 ? "1" : "0" }
+        }
+        return (.init(role: role, labels: labels, value: value, url: url, children: []), values[5] as? [AXUIElement] ?? [])
     }
 
     private func tree(_ element: AXUIElement, remaining: inout Int, deadline: Date, depth: Int = 0) -> YandexAccessibilityNode? {
@@ -155,6 +194,7 @@ actor YandexAccessibilityClient: YandexAccessibilityProviding {
         var budget = 6000
         guard let next = nextButton(application, remaining: &budget, deadline: Date().addingTimeInterval(1)) else { return nil }
         var candidate = next
+        var best: (AXUIElement, YandexAccessibilityMetadata)?
         for _ in 0..<7 {
             var parent: CFTypeRef?
             guard !Task.isCancelled, AXUIElementCopyAttributeValue(candidate, kAXParentAttribute as CFString, &parent) == .success,
@@ -164,10 +204,14 @@ actor YandexAccessibilityClient: YandexAccessibilityProviding {
             var budget = 500
             if let snapshot = tree(candidate, remaining: &budget, deadline: Date().addingTimeInterval(0.25)),
                let metadata = YandexAccessibilityMetadata(root: snapshot) {
-                cachedBar = candidate
-                return metadata
+                best = (candidate, metadata)
+                if metadata.isFavorite != nil {
+                    cachedBar = candidate
+                    return metadata
+                }
             }
         }
+        if let (element, metadata) = best { cachedBar = element; return metadata }
         return nil
     }
 }
@@ -183,9 +227,7 @@ extension YandexAccessibilityClient {
     fileprivate static let previousExact = ["previous", "previous song", "previous track"]
     fileprivate static let previousContains = ["предыдущ", "назад"]
 
-    // The "like" toggle. The dislike button ("I don't like it" / "Мне не нравится") also
-    // contains "like"/"нравится", so its labels are excluded first.
-    private static let likeLabelHints = ["like", "нравится"]
+    // Dislike is a different action from the explicitly matched Like toggle.
     private static let dislikeLabelHints = ["don't like", "dont like", "dislike", "не нравится"]
 
     // MARK: Transport
@@ -209,20 +251,22 @@ extension YandexAccessibilityClient {
 
     // MARK: Like
 
-    func pressLikeButton() {
+    @discardableResult
+    func pressLikeButton() -> Bool {
         guard AXIsProcessTrusted() else {
             NSLog("[YandexMusic] Accessibility permission not granted; cannot toggle like.")
-            return
+            return false
         }
         guard let button = findLikeButton() else {
             NSLog("[YandexMusic] Like button not found in accessibility tree.")
-            return
+            return false
         }
-        guard !Task.isCancelled, Date() < controlDeadline, actionIsCurrent() else { return }
+        guard !Task.isCancelled, Date() < controlDeadline, actionIsCurrent() else { return false }
         let result = AXUIElementPerformAction(button, kAXPressAction as CFString)
         if result != .success {
             NSLog("[YandexMusic] Failed to press like button (AX error \(result.rawValue)).")
         }
+        return result == .success
     }
 
     /// Returns the current like state if it can be determined, otherwise nil.
@@ -230,10 +274,9 @@ extension YandexAccessibilityClient {
         guard AXIsProcessTrusted(), let button = findLikeButton() else { return nil }
 
         // The like toggle exposes its pressed state via kAXValueAttribute (1 = liked, 0 = not).
-        if let value: Int = axAttribute(button, kAXValueAttribute) {
-            return value != 0
-        }
-        return nil
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(button, kAXValueAttribute as CFString, &value) == .success else { return nil }
+        return YandexLikeState.decodeAXValue(value)
     }
 
     private func findLikeButton() -> AXUIElement? {
@@ -384,15 +427,8 @@ extension YandexAccessibilityClient {
     }
 
     private func isLikeButton(_ element: AXUIElement) -> Bool {
-        guard isPressableControl(element) else { return false }
-        let labels = axLabels(element)
-        guard !labels.isEmpty else { return false }
-        // Exclude the dislike control ("I don't like it" / "Мне не нравится") first, as it also
-        // contains "like"/"нравится".
-        if labels.contains(where: { label in Self.dislikeLabelHints.contains(where: label.contains) }) {
-            return false
-        }
-        return labels.contains { label in Self.likeLabelHints.contains(where: label.contains) }
+        guard let role: String = axAttribute(element, kAXRoleAttribute) else { return false }
+        return YandexLikeState.isLikeControl(role: role, labels: axLabels(element))
     }
 
     private func isPressableControl(_ element: AXUIElement) -> Bool {
@@ -450,7 +486,7 @@ extension YandexAccessibilityClient {
         case .playPause: return pressTransport(exact: Self.playPauseExact, contains: Self.playPauseContains)
         case .next: return pressTransport(exact: Self.nextExact, contains: Self.nextContains)
         case .previous: return pressTransport(exact: Self.previousExact, contains: Self.previousContains)
-        case .like: pressLikeButton(); return true
+        case .like: return pressLikeButton()
         case .dislike: pressDislikeButton(); return true
         }
     }

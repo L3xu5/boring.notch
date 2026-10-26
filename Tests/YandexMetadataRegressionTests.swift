@@ -9,14 +9,27 @@ private struct YandexMetadataFailure: Error, CustomStringConvertible {
     let description: String
 }
 
+private func favoriteMetadata(_ favorite: Bool?, title: String = "Before", artist: String = "Artist",
+                              trackID: String? = nil) -> YandexAccessibilityMetadata {
+    let trackURL = trackID.flatMap { URL(string: "music-application://desktop/album/123/track/\($0)") }
+    return YandexAccessibilityMetadata(root: .init(role: "AXGroup", labels: [], value: nil, url: nil, children: [
+        .init(role: "AXLink", labels: ["Track \(title)"], value: nil, url: trackURL, children: []),
+        .init(role: "AXLink", labels: ["Artist \(artist)"], value: nil,
+              url: URL(string: "music-application://desktop/artist/1"), children: []),
+        .init(role: "AXCheckBox", labels: ["Like"], value: favorite.map { $0 ? "1" : "0" }, url: nil, children: []),
+    ]))!
+}
+
 private actor DelayedYandexAX: YandexAccessibilityProviding {
     private var actions: [YandexPlayerAction] = []
     private var actionWaiters: [CheckedContinuation<Bool, Never>] = []
-    private var favoriteWaiters: [CheckedContinuation<Bool?, Never>] = []
+    private var favoriteWaiters: [CheckedContinuation<YandexAccessibilityMetadata?, Never>] = []
     var pendingActions: Int { actionWaiters.count }
     var pendingFavorites: Int { favoriteWaiters.count }
     var performedCount: Int { actions.count }
-    func read(processIdentifier: pid_t) -> YandexAccessibilityMetadata? { nil }
+    func read(processIdentifier: pid_t) async -> YandexAccessibilityMetadata? {
+        await withCheckedContinuation { favoriteWaiters.append($0) }
+    }
     func perform(_ action: YandexPlayerAction, processIdentifier: pid_t,
                  isCurrent: @escaping @Sendable () -> Bool) async -> Bool {
         let success = await withCheckedContinuation { actionWaiters.append($0) }
@@ -24,11 +37,40 @@ private actor DelayedYandexAX: YandexAccessibilityProviding {
         actions.append(action)
         return true
     }
-    func favoriteState(processIdentifier: pid_t) async -> Bool? {
-        await withCheckedContinuation { favoriteWaiters.append($0) }
-    }
+    func favoriteState(processIdentifier: pid_t) -> Bool? { nil }
     func finishAction(_ result: Bool) { actionWaiters.removeFirst().resume(returning: result) }
-    func finishFavorite(_ result: Bool?) { favoriteWaiters.removeFirst().resume(returning: result) }
+    func finishFavorite(_ result: Bool?) { finishSnapshot(favoriteMetadata(result)) }
+    func finishSnapshot(_ result: YandexAccessibilityMetadata?, index: Int = 0) {
+        favoriteWaiters.remove(at: index).resume(returning: result)
+    }
+}
+
+private actor SnapshotYandexAX: YandexAccessibilityProviding {
+    private var metadata: YandexAccessibilityMetadata?
+    private var receipt = false
+    private var afterAction: YandexAccessibilityMetadata?
+    private(set) var readCount = 0
+    private(set) var attempts = 0
+    private(set) var accepted = 0
+    init(_ metadata: YandexAccessibilityMetadata?) { self.metadata = metadata }
+    func setSnapshot(_ metadata: YandexAccessibilityMetadata?) { self.metadata = metadata }
+    func setReceipt(_ receipt: Bool, afterAction: YandexAccessibilityMetadata? = nil) {
+        self.receipt = receipt; self.afterAction = afterAction
+    }
+    func read(processIdentifier: pid_t) -> YandexAccessibilityMetadata? {
+        readCount += 1
+        return metadata
+    }
+    func favoriteState(processIdentifier: pid_t) -> Bool? { nil }
+    func perform(_ action: YandexPlayerAction, processIdentifier: pid_t,
+                 isCurrent: @escaping @Sendable () -> Bool) -> Bool {
+        guard !Task.isCancelled, isCurrent() else { return false }
+        attempts += 1
+        guard receipt else { return false }
+        accepted += 1
+        if let afterAction { metadata = afterAction }
+        return true
+    }
 }
 
 private final class YandexMetadataURLProtocol: URLProtocol {
@@ -70,6 +112,10 @@ private extension YandexMusicController {
         await handleAdapterUpdate(try JSONDecoder().decode(YandexNowPlayingUpdate.self, from: data))
     }
     @MainActor func metadataTestRefreshFavorite() async { await refreshFavoriteState() }
+    @MainActor func metadataTestStartMonitoring() { startAccessibilityMonitoring() }
+    @MainActor func metadataTestTerminate() { handleYandexTerminated() }
+    @MainActor func metadataTestReset() { resetAdapterState() }
+    @MainActor func metadataTestNativeTrackID(_ id: String) { playbackState.nativeTrackID = id }
     static func metadataTestFetchArtwork(_ node: YandexAccessibilityNode, token: String,
                                          session: URLSession) async -> Data? {
         guard let metadata = YandexAccessibilityMetadata(root: node) else { return nil }
@@ -100,6 +146,18 @@ private struct YandexMetadataRegressionTests {
             guard Date() < deadline else { throw YandexMetadataFailure(description: message) }
             try await Task.sleep(for: .milliseconds(5))
         }
+    }
+
+    @MainActor
+    private static func expectPassiveRefreshSkipped(_ controller: YandexMusicController,
+                                                   client: DelayedYandexAX, phase: String) async throws {
+        let before = await client.pendingFavorites
+        var finished = false
+        let refresh = Task { await controller.refreshAccessibilityMetadata(); finished = true }
+        try await waitFor("Passive refresh competed with the explicit favorite command during \(phase)") { finished }
+        await refresh.value
+        let after = await client.pendingFavorites
+        try expect(after == before, "Passive favorite polling scheduled an AX read during \(phase)")
     }
 
     @MainActor
@@ -197,6 +255,238 @@ private struct YandexMetadataRegressionTests {
     }
 
     @MainActor
+    private static func favoriteReconciliation() async throws {
+        for foreignOwner in [false, true] {
+            let client = SnapshotYandexAX(favoriteMetadata(false))
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await controller.metadataTestUpdate(["bundleIdentifier": "ru.yandex.desktop.music", "title": "Before", "artist": "Artist"], diff: false)
+            if foreignOwner {
+                try await controller.metadataTestUpdate(["bundleIdentifier": "com.apple.Safari", "title": "Browser media", "playing": false], diff: false)
+            }
+            controller.metadataTestStartMonitoring()
+            try await waitFor("initial AX favorite was not observed") { controller.supportsFavorite }
+            try expect(!controller.playbackState.isFavorite, "Initial unliked track was shown liked")
+            await client.setSnapshot(favoriteMetadata(true))
+            try await waitFor("same-track like made in Yandex was not reconciled") { controller.playbackState.isFavorite }
+            await client.setSnapshot(favoriteMetadata(false))
+            try await waitFor("same-track unlike made in Yandex stayed cached forever") { !controller.playbackState.isFavorite }
+            try expect(controller.supportsFavorite && controller.playbackState.title == "Before",
+                       "Reconciliation lost current metadata or known-state capability")
+            if foreignOwner {
+                try expect(controller.systemMediaOwnerBundleIdentifier == "com.apple.Safari",
+                           "Favorite polling changed the system session owner")
+            }
+            let attempts = await client.attempts
+            try expect(attempts == 0, "Read-only favorite reconciliation pressed a player control")
+            controller.stop()
+            passed += 1
+            print("PASS continuous same-track favorite reconciliation (foreign owner \(foreignOwner))")
+        }
+        do {
+            let client = SnapshotYandexAX(favoriteMetadata(true, title: "Previous track"))
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await controller.metadataTestUpdate(["bundleIdentifier": "ru.yandex.desktop.music", "title": "Before", "artist": "Artist"], diff: false)
+            await controller.refreshAccessibilityMetadata()
+            try expect(!controller.playbackState.isFavorite && !controller.capabilities.favorite,
+                       "A previous track's lazily rebuilt AX control supplied the new track's like")
+            await client.setSnapshot(favoriteMetadata(false))
+            await controller.refreshAccessibilityMetadata()
+            try expect(!controller.playbackState.isFavorite && controller.capabilities.favorite,
+                       "A later matching snapshot could not correct the first stale AX read")
+            controller.metadataTestNativeTrackID("2")
+            await client.setSnapshot(favoriteMetadata(true, trackID: "1"))
+            await controller.refreshAccessibilityMetadata()
+            try expect(!controller.playbackState.isFavorite && !controller.capabilities.favorite,
+                       "Different recording IDs with the same title/artist shared a favorite")
+            controller.stop()
+            passed += 1
+            print("PASS favorite snapshots match current track metadata and exact recording ID")
+        }
+        do {
+            let client = SnapshotYandexAX(favoriteMetadata(true))
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await controller.metadataTestUpdate(["bundleIdentifier": "ru.yandex.desktop.music", "title": "Before", "artist": "Artist"], diff: false)
+            await controller.refreshAccessibilityMetadata()
+            try expect(controller.playbackState.isFavorite && controller.supportsFavorite, "Known liked snapshot was lost")
+            await client.setSnapshot(favoriteMetadata(nil))
+            await controller.refreshAccessibilityMetadata()
+            try expect(!controller.playbackState.isFavorite && !controller.supportsFavorite,
+                       "An unknown pressed state retained a false positive like")
+            await controller.setFavorite(true)
+            let attempts = await client.attempts
+            try expect(attempts == 0, "Unknown favorite state caused a blind toggle")
+            await client.setSnapshot(favoriteMetadata(true))
+            await controller.refreshAccessibilityMetadata()
+            await client.setSnapshot(nil)
+            await controller.refreshAccessibilityMetadata()
+            try expect(!controller.playbackState.isFavorite && !controller.supportsFavorite,
+                       "A missing/untrusted AX snapshot left an old like cached")
+            controller.stop()
+            passed += 1
+            print("PASS unknown and unavailable favorite state clear the heart without a blind toggle")
+        }
+        do {
+            let client = DelayedYandexAX()
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await controller.metadataTestUpdate(["bundleIdentifier": "ru.yandex.desktop.music", "title": "Before", "artist": "Artist"], diff: false)
+            let older = Task { await controller.refreshAccessibilityMetadata() }
+            try await waitForAX("older favorite read did not enter AX") { await client.pendingFavorites == 1 }
+            let newer = Task { await controller.refreshAccessibilityMetadata() }
+            try await waitForAX("newer favorite read did not enter AX") { await client.pendingFavorites == 2 }
+            await client.finishSnapshot(favoriteMetadata(false), index: 1)
+            await newer.value
+            await client.finishSnapshot(favoriteMetadata(true))
+            await older.value
+            try expect(!controller.playbackState.isFavorite && controller.supportsFavorite,
+                       "An older same-track read overwrote the newer unlike observation")
+            controller.stop()
+            passed += 1
+            print("PASS reversed same-track favorite reads retain the newest observation")
+        }
+        for transition in ["stop", "terminate", "reset"] {
+            let client = DelayedYandexAX()
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await controller.metadataTestUpdate(["bundleIdentifier": "ru.yandex.desktop.music", "title": "Before", "artist": "Artist"], diff: false)
+            let seed = Task { await controller.metadataTestRefreshFavorite() }
+            try await waitForAX("seed favorite read did not enter AX") { await client.pendingFavorites == 1 }
+            await client.finishFavorite(true)
+            await seed.value
+            try expect(controller.playbackState.isFavorite, "Lifecycle fixture did not start with a known like")
+            let pending = Task { await controller.metadataTestRefreshFavorite() }
+            try await waitForAX("pending lifecycle favorite did not enter AX") { await client.pendingFavorites == 1 }
+            switch transition {
+            case "stop": controller.stop()
+            case "terminate": controller.metadataTestTerminate()
+            default: controller.metadataTestReset()
+            }
+            try expect(!controller.playbackState.isFavorite && !controller.supportsFavorite,
+                       "\(transition) retained a previous session's liked state")
+            await client.finishFavorite(true)
+            await pending.value
+            try expect(!controller.playbackState.isFavorite && !controller.supportsFavorite,
+                       "An AX read completed after \(transition) and restored an old like")
+            controller.stop()
+            passed += 1
+            print("PASS favorite invalidation after \(transition) rejects late AX reads")
+        }
+        do {
+            let client = SnapshotYandexAX(favoriteMetadata(false))
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await controller.metadataTestUpdate(["bundleIdentifier": "ru.yandex.desktop.music", "title": "Before", "artist": "Artist"], diff: false)
+            await controller.setFavorite(true)
+            let failedAttempts = await client.attempts
+            let failedAccepted = await client.accepted
+            try expect(failedAttempts == 1 && failedAccepted == 0 && !controller.playbackState.isFavorite,
+                       "A failed AX press was presented as an accepted like")
+            await client.setReceipt(true, afterAction: favoriteMetadata(true))
+            await controller.setFavorite(true)
+            let accepted = await client.accepted
+            try expect(accepted == 1 && controller.playbackState.isFavorite && controller.supportsFavorite,
+                       "An accepted press was not verified through a new matching snapshot")
+            controller.stop()
+            passed += 1
+            print("PASS favorite press receipt and verified state determine the displayed heart")
+        }
+        do {
+            let client = DelayedYandexAX()
+            var controller: YandexMusicController? = YandexMusicController(accessibility: client,
+                processIdentifier: { 42 }, onTransportUnavailable: {}, startMonitoring: false)!
+            weak var weakController = controller
+            defer { weakController = nil }
+            controller!.metadataTestStartMonitoring()
+            try await waitForAX("poll did not enter injected AX") { await client.pendingFavorites == 1 }
+            controller = nil
+            try await waitFor("pending favorite poll retained the stopped source") { weakController == nil }
+            await client.finishSnapshot(nil)
+            passed += 1
+            print("PASS supervised favorite poll releases its controller during delayed AX")
+        }
+    }
+
+    @MainActor
+    private static func favoriteCommandPriority() async throws {
+        do {
+            let client = DelayedYandexAX()
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await controller.metadataTestUpdate(["bundleIdentifier": "ru.yandex.desktop.music", "title": "Before", "artist": "Artist"], diff: false)
+            let command = Task { await controller.setFavorite(true) }
+            try await waitForAX("favorite command did not begin its pre-read") { await client.pendingFavorites == 1 }
+            try await expectPassiveRefreshSkipped(controller, client: client, phase: "the command pre-read")
+            await client.finishFavorite(false)
+            try await waitForAX("passive polling invalidated a valid favorite click") { await client.pendingActions == 1 }
+            try await expectPassiveRefreshSkipped(controller, client: client, phase: "the AX press")
+            await client.finishAction(true)
+            try await expectPassiveRefreshSkipped(controller, client: client, phase: "post-press settling")
+            try await waitForAX("accepted favorite press did not verify the new state") { await client.pendingFavorites == 1 }
+            try await expectPassiveRefreshSkipped(controller, client: client, phase: "the verification read")
+            await client.finishFavorite(true)
+            await command.value
+            let performed = await client.performedCount
+            try expect(performed == 1 && controller.playbackState.isFavorite && controller.supportsFavorite,
+                       "The explicit favorite command was dropped or its verified state was lost")
+            controller.stop()
+            passed += 1
+            print("PASS explicit favorite command keeps priority over passive polls through verification")
+        }
+        do {
+            let client = DelayedYandexAX()
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await controller.metadataTestUpdate(["bundleIdentifier": "ru.yandex.desktop.music", "title": "Before", "artist": "Artist"], diff: false)
+            let older = Task { await controller.setFavorite(true) }
+            try await waitForAX("older explicit command did not begin its read") { await client.pendingFavorites == 1 }
+            let newer = Task { await controller.setFavorite(true) }
+            try await waitForAX("newer explicit command did not begin its read") { await client.pendingFavorites == 2 }
+            await client.finishFavorite(false)
+            await older.value
+            try await expectPassiveRefreshSkipped(controller, client: client, phase: "a newer command after the old defer")
+            await client.finishFavorite(false)
+            try await waitForAX("newer explicit command lost its priority token") { await client.pendingActions == 1 }
+            await client.finishAction(false)
+            await newer.value
+            let resumed = Task { await controller.refreshAccessibilityMetadata() }
+            try await waitForAX("passive polling did not resume after the newest command finished") { await client.pendingFavorites == 1 }
+            await client.finishFavorite(true)
+            await resumed.value
+            try expect(controller.playbackState.isFavorite && controller.supportsFavorite,
+                       "The action priority slot remained stuck after completion")
+            controller.stop()
+            passed += 1
+            print("PASS overlapping favorite commands keep the newest priority and release it on completion")
+        }
+        do {
+            let client = DelayedYandexAX()
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await controller.metadataTestUpdate(["bundleIdentifier": "ru.yandex.desktop.music", "title": "Before", "artist": "Artist"], diff: false)
+            let passive = Task { await controller.refreshAccessibilityMetadata() }
+            try await waitForAX("old passive read did not begin") { await client.pendingFavorites == 1 }
+            let command = Task { await controller.setFavorite(true) }
+            try await waitForAX("explicit command did not supersede an old passive read") { await client.pendingFavorites == 2 }
+            await client.finishFavorite(true)
+            await passive.value
+            try expect(!controller.playbackState.isFavorite && !controller.supportsFavorite,
+                       "An old passive read changed the explicit command's observation")
+            await client.finishFavorite(false)
+            try await waitForAX("old passive result prevented the current command") { await client.pendingActions == 1 }
+            await client.finishAction(false)
+            await command.value
+            try expect(!controller.playbackState.isFavorite && controller.supportsFavorite,
+                       "The obsolete passive read overwrote the command's newer unliked snapshot")
+            controller.stop()
+            passed += 1
+            print("PASS explicit favorite commands invalidate already-pending passive reads")
+        }
+    }
+
+    @MainActor
     private static func stream(_ name: String, _ messages: [[String: Any]],
                                verify: (YandexMusicController) async throws -> Void) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -212,7 +502,7 @@ private struct YandexMetadataRegressionTests {
         try data.write(to: fixture)
         setenv("YANDEX_METADATA_FIXTURE", fixture.path, 1)
         setenv("YANDEX_METADATA_DONE", done.path, 1)
-        var controller = YandexMusicController()
+        var controller = YandexMusicController(accessibility: SnapshotYandexAX(nil), processIdentifier: { 42 })
         guard controller != nil else { throw YandexMetadataFailure(description: "MediaRemote initialization unavailable") }
         weak var weakController = controller
         defer { weakController = nil }
@@ -248,6 +538,8 @@ private struct YandexMetadataRegressionTests {
     @MainActor
     static func main() async throws {
         try await delayedAXLifecycle()
+        try await favoriteReconciliation()
+        try await favoriteCommandPriority()
         try await stream("parent owner survives helper-only diff", [
             update(["parentApplicationBundleIdentifier": "ru.yandex.desktop.music", "bundleIdentifier": "ru.yandex.helper.1",
                     "title": "Old title", "artist": "Old artist"], diff: false),

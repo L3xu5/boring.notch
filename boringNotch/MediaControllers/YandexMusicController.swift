@@ -48,13 +48,13 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     var supportsVolumeControl: Bool { false }
 
     // Best-effort via Accessibility (see setFavorite / refreshFavoriteState).
-    var supportsFavorite: Bool { true }
+    var supportsFavorite: Bool { favoriteStateKnown }
 
     // Yandex has a real "I don't like it" control that trains My Wave (pressed via Accessibility).
     var supportsDislike: Bool { true }
 
     var capabilities: MediaCapabilities {
-        .init(volume: false, favorite: true, dislike: true,
+        .init(volume: false, favorite: favoriteStateKnown, dislike: true,
               seek: sessionIsYandex && commands.canSeek,
               shuffle: sessionIsYandex && commands.canShuffle, repeatMode: sessionIsYandex && commands.canRepeat)
     }
@@ -75,6 +75,15 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     private let sourceLifetime = YandexCommandLifetime()
     private let favoriteLifetime = YandexCommandLifetime()
     private let transportLifetime = YandexCommandLifetime()
+    private var favoriteStateKnown = false
+    private var favoriteReadRevision: UInt = 0
+    private var favoriteActionInFlight: UUID?
+    private struct FavoriteReadRequest {
+        let source: UUID
+        let lifetime: UUID
+        let item: MediaItemIdentity
+        let revision: UInt
+    }
     private var accessibilityTask: Task<Void, Never>?
     private var accessibilityArtworkTask: Task<Void, Never>?
     private var accessibilityGeneration: UInt = 0
@@ -133,6 +142,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     private func handleYandexTerminated() {
         guard !stopped else { return }
         sourceLifetime.invalidate(); favoriteLifetime.invalidate(); transportLifetime.invalidate()
+        favoriteActionInFlight = nil
         sessionIsYandex = false
         wire.reset()
         accessibilityGeneration &+= 1
@@ -144,6 +154,9 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         var stopped = playbackState
         stopped.isPlaying = false
         stopped.playbackRate = 0
+        favoriteStateKnown = false
+        favoriteReadRevision &+= 1
+        stopped.isFavorite = false
         playbackState = stopped
     }
 
@@ -156,6 +169,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     }
     func stop() {
         sourceLifetime.invalidate(); favoriteLifetime.invalidate(); transportLifetime.invalidate()
+        favoriteActionInFlight = nil
         stopped = true
         sessionIsYandex = false
         wire.reset()
@@ -163,6 +177,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         accessibilityTask?.cancel(); accessibilityTask = nil
         accessibilityArtworkTask?.cancel(); accessibilityArtworkTask = nil
         accessibilityGeneration &+= 1; accessibilityArtworkGeneration &+= 1
+        clearFavoriteObservation()
         if let terminationObserver { NSWorkspace.shared.notificationCenter.removeObserver(terminationObserver) }
         terminationObserver = nil
     }
@@ -175,11 +190,10 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
             while !Task.isCancelled {
                 // Capture only the reader/request across AX IPC; releasing the controller while
                 // a read is in flight must still stop monitoring and cancel image downloads.
-                if let (reader, pid, generation) = self?.accessibilityRequest() {
+                if let (reader, pid, generation, favorite) = self?.accessibilityRequest() {
                     let metadata = await reader.read(processIdentifier: pid)
                     guard !Task.isCancelled else { return }
-                    if let metadata { self?.applyAccessibilityMetadata(metadata, generation: generation) }
-                    else { self?.clearAccessibilityObservations(generation: generation) }
+                    self?.receiveAccessibilitySnapshot(metadata, generation: generation, favorite: favorite)
                 }
                 do { try await Task.sleep(for: .milliseconds(800)) }
                 catch { return }
@@ -188,23 +202,40 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     }
 
     @MainActor
-    private func accessibilityRequest() -> ((any YandexAccessibilityProviding), pid_t, UInt)? {
-        guard !stopped, !sessionIsYandex, AXIsProcessTrusted(), let pid = currentProcessIdentifier() else { return nil }
-        return (accessibilityReader, pid, accessibilityGeneration)
+    private func accessibilityRequest() -> ((any YandexAccessibilityProviding), pid_t, UInt, FavoriteReadRequest)? {
+        // A user command owns its pre-read, press and verification. A passive refresh must not
+        // supersede that read revision and silently turn a valid click into an unknown state.
+        guard !stopped, !Task.isCancelled, favoriteActionInFlight == nil else { return nil }
+        guard let pid = currentProcessIdentifier() else {
+            clearFavoriteObservation()
+            return nil
+        }
+        // The worker performs the no-prompt AX trust check. Reading the same bounded player-bar
+        // snapshot also reconciles likes when Yandex owns MediaRemote, without replacing its metadata.
+        return (accessibilityReader, pid, accessibilityGeneration, beginFavoriteRead())
     }
 
     /// A fresh, read-only AX sample for callers that need evidence about the actual Yandex player.
     @MainActor
     func refreshAccessibilityMetadata() async {
-        guard let (reader, pid, generation) = accessibilityRequest() else {
+        guard let (reader, pid, generation, favorite) = accessibilityRequest() else {
             accessibilityIsPlaying = nil
             accessibilityMetadataLastReadAt = nil
             return
         }
         let metadata = await reader.read(processIdentifier: pid)
         guard !Task.isCancelled else { return }
-        if let metadata { applyAccessibilityMetadata(metadata, generation: generation) }
-        else { clearAccessibilityObservations(generation: generation) }
+        receiveAccessibilitySnapshot(metadata, generation: generation, favorite: favorite)
+    }
+
+    private func receiveAccessibilitySnapshot(_ metadata: YandexAccessibilityMetadata?, generation: UInt,
+                                              favorite: FavoriteReadRequest) {
+        guard !stopped, !Task.isCancelled, generation == accessibilityGeneration,
+              isCurrentFavoriteRead(favorite) else { return }
+        if let metadata {
+            if !sessionIsYandex { applyAccessibilityMetadata(metadata, generation: generation) }
+        } else { clearAccessibilityObservations(generation: generation) }
+        _ = reconcileFavoriteObservation(metadata, request: favorite)
     }
 
     @MainActor
@@ -245,7 +276,13 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
             state.isFavorite = false
             state.lastUpdated = Date()
         }
-        if state.identity != playbackState.identity { favoriteLifetime.invalidate() }
+        if state.identity != playbackState.identity {
+            favoriteLifetime.invalidate()
+            favoriteActionInFlight = nil
+            favoriteReadRevision &+= 1
+            favoriteStateKnown = false
+            state.isFavorite = false
+        }
         if state.identity != playbackState.identity || state.isPlaying != playbackState.isPlaying { transportLifetime.invalidate() }
         playbackState = state
 
@@ -416,10 +453,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     @MainActor
     func updatePlaybackInfo() async {
         guard !stopped, !Task.isCancelled else { return }
-        // Metadata arrives continuously through the adapter stream. On an explicit refresh
-        // (e.g. when this controller becomes active) re-read the like state via Accessibility.
-        await refreshFavoriteState()
-        guard !stopped, !Task.isCancelled else { return }
+        // A single bar snapshot keeps metadata and its like control associated with one track.
         await refreshAccessibilityMetadata()
     }
 
@@ -428,32 +462,40 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     // already in the requested state (the protocol contract is "set", not "toggle").
     @MainActor
     func setFavorite(_ favorite: Bool) async {
+        let action = beginFavoriteAction()
+        defer { finishFavoriteAction(action) }
         let ticket = sourceLifetime.ticket(), item = playbackState.identity
         let favoriteTicket = favoriteLifetime.ticket()
         guard isCurrentCommand(ticket) else { return }
         let current = await readLikeState()
         guard isCurrentCommand(ticket), favoriteLifetime.isCurrent(favoriteTicket), playbackState.identity == item else { return }
-        if current == favorite { playbackState.isFavorite = favorite; return }
-        _ = await performPlayerAction(.like, sourceTicket: ticket, favoriteTicket: favoriteTicket)
+        // A missing or previous-track control cannot safely implement a requested target state.
+        // A blind toggle here could remove a like when the user asked to add it.
+        guard let current else { return }
+        if current == favorite { return }
+        let performed = await performPlayerAction(.like, sourceTicket: ticket, favoriteTicket: favoriteTicket)
         guard isCurrentCommand(ticket), favoriteLifetime.isCurrent(favoriteTicket), playbackState.identity == item else { return }
+        guard performed else { return }
+        clearFavoriteObservation()
         do { try await Task.sleep(for: .milliseconds(200)) } catch { return }
         guard isCurrentCommand(ticket), favoriteLifetime.isCurrent(favoriteTicket), playbackState.identity == item else { return }
         await refreshFavoriteState()
     }
     @MainActor
     private func refreshFavoriteState() async {
-        let ticket = sourceLifetime.ticket(), item = playbackState.identity
-        guard isCurrentCommand(ticket), let liked = await readLikeState(),
-              isCurrentCommand(ticket), playbackState.identity == item else { return }
-        if liked != playbackState.isFavorite { playbackState.isFavorite = liked }
+        _ = await readLikeState()
     }
     @MainActor
     func dislike() async {
+        let action = beginFavoriteAction()
+        defer { finishFavoriteAction(action) }
         let ticket = sourceLifetime.ticket(), item = playbackState.identity
         let favoriteTicket = favoriteLifetime.ticket()
         guard isCurrentCommand(ticket) else { return }
-        _ = await performPlayerAction(.dislike, sourceTicket: ticket, favoriteTicket: favoriteTicket)
+        let performed = await performPlayerAction(.dislike, sourceTicket: ticket, favoriteTicket: favoriteTicket)
         guard isCurrentCommand(ticket), favoriteLifetime.isCurrent(favoriteTicket), playbackState.identity == item else { return }
+        guard performed else { return }
+        clearFavoriteObservation()
         do { try await Task.sleep(for: .milliseconds(200)) } catch { return }
         guard isCurrentCommand(ticket), favoriteLifetime.isCurrent(favoriteTicket), playbackState.identity == item else { return }
         await refreshFavoriteState()
@@ -469,6 +511,9 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     }
     private func resetAdapterState() {
         transportLifetime.invalidate()
+        favoriteLifetime.invalidate()
+        favoriteActionInFlight = nil
+        clearFavoriteObservation()
         wire.reset(); sessionIsYandex = false
         systemMediaOwnerBundleIdentifier = nil; systemMediaIsPlaying = nil
         systemMediaLastUpdated = nil; systemMediaTimestamp = nil
@@ -488,12 +533,66 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         return performed
     }
     private func readLikeState() async -> Bool? {
-        let ticket = sourceLifetime.ticket(), item = playbackState.identity
-        let favoriteTicket = favoriteLifetime.ticket()
-        guard isCurrentCommand(ticket), let pid = currentProcessIdentifier() else { return nil }
-        let value = await accessibilityReader.favoriteState(processIdentifier: pid)
-        guard isCurrentCommand(ticket), favoriteLifetime.isCurrent(favoriteTicket), playbackState.identity == item else { return nil }
-        return value
+        guard !stopped, !Task.isCancelled else { return nil }
+        guard let pid = currentProcessIdentifier() else { clearFavoriteObservation(); return nil }
+        let request = beginFavoriteRead()
+        let metadata = await accessibilityReader.read(processIdentifier: pid)
+        return reconcileFavoriteObservation(metadata, request: request)
+    }
+
+    private func beginFavoriteRead() -> FavoriteReadRequest {
+        favoriteReadRevision &+= 1
+        return .init(source: sourceLifetime.ticket(), lifetime: favoriteLifetime.ticket(),
+                     item: playbackState.identity, revision: favoriteReadRevision)
+    }
+
+    private func beginFavoriteAction() -> UUID {
+        favoriteLifetime.invalidate()
+        let action = UUID()
+        favoriteActionInFlight = action
+        return action
+    }
+
+    private func finishFavoriteAction(_ action: UUID) {
+        // A newer explicit command may already own the slot when an older awaited read returns.
+        if favoriteActionInFlight == action { favoriteActionInFlight = nil }
+    }
+
+    private func isCurrentFavoriteRead(_ request: FavoriteReadRequest) -> Bool {
+        isCurrentCommand(request.source) && favoriteLifetime.isCurrent(request.lifetime)
+            && request.revision == favoriteReadRevision && request.item == playbackState.identity
+    }
+
+    private func metadataMatchesCurrentTrack(_ metadata: YandexAccessibilityMetadata) -> Bool {
+        let state = playbackState
+        guard !state.title.isEmpty, MediaText.normalized(metadata.title) == MediaText.normalized(state.title),
+              MediaText.normalized(metadata.artist) == MediaText.normalized(state.artist) else { return false }
+        if let currentID = state.nativeTrackID, let observedID = metadata.trackID, currentID != observedID { return false }
+        if !state.album.isEmpty, !metadata.album.isEmpty, state.album != metadata.album { return false }
+        return true
+    }
+
+    @discardableResult
+    private func reconcileFavoriteObservation(_ metadata: YandexAccessibilityMetadata?, request: FavoriteReadRequest) -> Bool? {
+        guard isCurrentFavoriteRead(request) else { return nil }
+        let liked = metadata.flatMap { metadataMatchesCurrentTrack($0) ? $0.isFavorite : nil }
+        publishFavoriteObservation(liked)
+        return liked
+    }
+
+    private func publishFavoriteObservation(_ liked: Bool?) {
+        let known = liked != nil
+        guard favoriteStateKnown != known || playbackState.isFavorite != (liked ?? false) else { return }
+        favoriteStateKnown = known
+        var state = playbackState
+        state.isFavorite = liked ?? false
+        // Publish even when only known/unknown changes so the facade refreshes capabilities.
+        playbackState = state
+    }
+
+    private func clearFavoriteObservation() {
+        favoriteReadRevision &+= 1
+        publishFavoriteObservation(nil)
     }
 
     // MARK: - Update handling
@@ -544,6 +643,9 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
             || previousForeignActivity != lastForeignMediaActivity { transportLifetime.invalidate() }
         sessionIsYandex = (parent ?? payload.string("bundleIdentifier")) == Self.bundleID
         if sessionIsYandex != wasYandex {
+            favoriteLifetime.invalidate()
+            favoriteActionInFlight = nil
+            clearFavoriteObservation()
             accessibilityGeneration &+= 1
             accessibilityIsPlaying = nil
             accessibilityMetadataLastReadAt = nil
@@ -559,34 +661,18 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         var newState = wire.playbackState(applying: update, previous: playbackState, now: Date())
         newState.bundleIdentifier = Self.bundleID
 
-        // The like state is only re-read from the (expensive) accessibility tree when the track
-        // actually changes; position-only diffs carry the previous value forward. On a track
-        // change we read it up front and fold it into this single publish (no stale-then-correct
-        // double emission). album is included so same-title/artist-different-album counts.
         let trackChanged = newState.identity != playbackState.identity
-        if trackChanged { favoriteLifetime.invalidate() }
+        if trackChanged {
+            favoriteLifetime.invalidate()
+            favoriteActionInFlight = nil
+            favoriteReadRevision &+= 1
+            favoriteStateKnown = false
+        }
         if trackChanged || newState.isPlaying != playbackState.isPlaying { transportLifetime.invalidate() }
-        // Carry the like state forward here. Reading it inline would do a synchronous Accessibility
-        // tree walk on the main actor on every track change (a visible UI stall); the bounded poll
-        // below reconciles it from the (lazily-built) control off the hot path instead.
+        // Chromium does not reliably publish likes through MediaRemote. The supervised AX poll
+        // reconciles the current bar continuously, including same-track edits made in Yandex.
         newState.isFavorite = trackChanged ? false : playbackState.isFavorite
 
         self.playbackState = newState
-
-        if trackChanged {
-            // Chromium rebuilds the like control lazily; poll briefly until we get a stable read
-            // for THIS track (bail if the track changes again mid-poll).
-            let identity = newState.identity
-            Task { @MainActor [weak self] in
-                for _ in 0..<6 {
-                    do { try await Task.sleep(for: .milliseconds(350)) } catch { return }
-                    guard let self, !self.stopped, self.playbackState.identity == identity else { return }
-                    if let liked = await self.readLikeState(), self.playbackState.identity == identity {
-                        if liked != self.playbackState.isFavorite { self.playbackState.isFavorite = liked }
-                        return
-                    }
-                }
-            }
-        }
     }
 }
