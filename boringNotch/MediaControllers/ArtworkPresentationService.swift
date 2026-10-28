@@ -1,4 +1,5 @@
 import AppKit
+import BoringCore
 import Combine
 import Foundation
 import ImageIO
@@ -20,6 +21,7 @@ final class ArtworkPresentationService: ObservableObject {
     private let sampleColor: @MainActor (NSImage, @escaping (NSColor?) -> Void) -> Void
     private var data: Data?
     private var bundle: String?
+    private var itemIdentity: MediaItemIdentity?
     private var revision = UUID()
     private var decodeTask: Task<Void, Never>?
 
@@ -31,14 +33,21 @@ final class ArtworkPresentationService: ObservableObject {
         self.decode = decode; self.sampleColor = sampleColor
     }
     deinit { decodeTask?.cancel() }
-    func stop() { decodeTask?.cancel(); decodeTask = nil; revision = UUID(); data = nil; bundle = nil }
+    func stop() { decodeTask?.cancel(); decodeTask = nil; revision = UUID(); data = nil; bundle = nil; itemIdentity = nil }
 
-    func apply(data: Data?, bundleIdentifier: String) {
-        guard self.data != data || bundle != bundleIdentifier else { return }
+    func apply(data: Data?, bundleIdentifier: String, identity: MediaItemIdentity? = nil) {
+        guard self.data != data || bundle != bundleIdentifier else {
+            itemIdentity = identity
+            return
+        }
+        let changedTrack = itemIdentity != identity
         stop()
-        self.data = data; bundle = bundleIdentifier
+        self.data = data; bundle = bundleIdentifier; itemIdentity = identity
         let ticket = revision
         guard let data else { applyFallback(bundleIdentifier); return }
+        // A new title must never be paired with the preceding track's decoded image while
+        // this decode is pending. Shared covers and same-track quality updates stay seamless.
+        if changedTrack { applyFallback(bundleIdentifier) }
         decodeTask = Task { @MainActor [weak self, decode] in
             let decoded = await decode(data)
             guard !Task.isCancelled, let self, self.revision == ticket else { return }

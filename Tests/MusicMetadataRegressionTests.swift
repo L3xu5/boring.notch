@@ -45,7 +45,7 @@ final class MusicManager {
     func apply(_ next: PlaybackState) {
         if MediaContentChange.hasChanged(from: state, to: next) { flips += 1 }
         state = next
-        presentation.apply(data: next.artwork, bundleIdentifier: next.bundleIdentifier)
+        presentation.apply(data: next.artwork, bundleIdentifier: next.bundleIdentifier, identity: next.identity)
     }
     func updateAlbumArt(newAlbumArt: NSImage) { presentation.setImage(newAlbumArt) }
     func calculateAverageColor() { presentation.calculateAverageColor() }
@@ -71,12 +71,14 @@ func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
     }
     @MainActor static func main() async throws {
         try await metadataWithSharedCover()
+        try await changedTrackClearsDecodedCover()
+        try await sameTrackQualityKeepsDecodedCover()
         try await staleArtworkDecode()
         try await missingArtworkCancelsOldDecode()
         try await invalidArtworkUsesFallback()
         try await staleColorCallback()
         try await boundedProductionDecoder()
-        print("6 music metadata regression scenarios passed (actual service/Core; real AppKit image values)")
+        print("8 music metadata regression scenarios passed (actual service/Core; real AppKit image values)")
     }
     @MainActor static func metadataWithSharedCover() async throws {
         let manager = MusicManager()
@@ -88,6 +90,27 @@ func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
         manager.apply(progress)
         try expect(manager.songTitle == "B" && manager.artistName == "Artist B" && manager.album == "Album B", "Shared cover prevented metadata advance")
         try expect(manager.flips == flips, "Progress tick retriggered content transition")
+    }
+    @MainActor static func changedTrackClearsDecodedCover() async throws {
+        let manager = MusicManager()
+        manager.apply(state("Old decoded", artwork: "old-decoded-cover"))
+        try await eventually("old decoded cover") { manager.albumArt === ImageFixtures.image("old-decoded-cover") }
+        manager.apply(state("New pending", artwork: "slow-new-track-cover"))
+        try expect(manager.songTitle == "New pending" && manager.albumArt === ImageFixtures.image("icon:fixture.player"),
+                   "A new title was temporarily paired with the preceding track's decoded cover")
+        try await eventually("new track decoded") { manager.albumArt === ImageFixtures.image("slow-new-track-cover") }
+        manager.apply(state("Shared next", artwork: "slow-new-track-cover"))
+        try expect(manager.albumArt === ImageFixtures.image("slow-new-track-cover") && !manager.usingAppIconForArtwork,
+                   "A shared album cover flashed a placeholder on a track change")
+    }
+    @MainActor static func sameTrackQualityKeepsDecodedCover() async throws {
+        let manager = MusicManager()
+        manager.apply(state("Same track", artwork: "small-cover"))
+        try await eventually("small decoded cover") { manager.albumArt === ImageFixtures.image("small-cover") }
+        manager.apply(state("Same track", artwork: "slow-large-cover"))
+        try expect(manager.albumArt === ImageFixtures.image("small-cover"),
+                   "A same-track image update flashed a placeholder before decoding")
+        try await eventually("large cover decoded") { manager.albumArt === ImageFixtures.image("slow-large-cover") }
     }
     @MainActor static func staleArtworkDecode() async throws {
         let manager = MusicManager()

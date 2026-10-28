@@ -15,6 +15,7 @@ def main() -> None:
             "xcrun", "swiftc", "-swift-version", "5", "-parse-as-library",
             "-module-cache-path", str(directory / "ModuleCache"),
             str(ROOT / "boringNotch/MediaControllers/YandexAccessibilityClient.swift"),
+            str(ROOT / "boringNotch/MediaControllers/YandexPlaybackPowerState.swift"),
             str(ROOT / "Tests/YandexFavoriteAXTests.swift"), "-o", str(executable),
         ], check=True, timeout=120)
         subprocess.run([str(executable)], check=True, timeout=30)

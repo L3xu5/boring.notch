@@ -326,7 +326,7 @@ class MusicManager: ObservableObject {
         presentationSnapshot = state
         if hasContentChange {
             triggerFlipAnimation()
-            artworkPresentation.apply(data: state.artwork, bundleIdentifier: state.bundleIdentifier)
+            artworkPresentation.apply(data: state.artwork, bundleIdentifier: state.bundleIdentifier, identity: state.identity)
         }
 
         let timeChanged = state.currentTime != self.elapsedTime

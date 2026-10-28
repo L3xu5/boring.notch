@@ -111,7 +111,7 @@ final class MediaChecker: Sendable {
     init(defaultImage: NSImage, icon: @escaping (String) -> NSImage?, colorEnabled: @escaping () -> Bool) { image = defaultImage }
     func stop() {}
     func setImage(_ image: NSImage) { self.image = image }
-    func apply(data: Data?, bundleIdentifier: String) {}
+    func apply(data: Data?, bundleIdentifier: String, identity: MediaItemIdentity? = nil) {}
     func calculateAverageColor() {}
 }
 func AppIconAsNSImage(for bundle: String) -> NSImage? { nil }

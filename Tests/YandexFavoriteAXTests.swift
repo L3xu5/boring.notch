@@ -231,6 +231,69 @@ private enum YandexFavoriteAXTests {
         expect(target.matches(root: labelOnly), "Label-only title/artist fallback no longer matches the current track")
     }
 
+    private static func playbackControlState() {
+        // Exact player-actions.play/pause strings from the installed renderer.
+        // The button's label is the available action, so Pause means currently playing.
+        let locales = [
+            (play: "Playback", pause: "Pause"),
+            (play: "Воспроизведение", pause: "Пауза"),
+            (play: "Ijro", pause: "Pauza"),
+            (play: "Ойнату", pause: "Үзіліс"),
+        ]
+        for labels in locales {
+            expect(YandexPlaybackControl.state(role: "AXButton", labels: [labels.pause]) == true,
+                   "The exact localized Pause action did not establish playing state: \(labels.pause)")
+            expect(YandexPlaybackControl.state(role: "AXButton", labels: [labels.play]) == false,
+                   "The exact localized Playback action did not establish paused state: \(labels.play)")
+            expect(YandexPlaybackControl.state(role: "AXButton", labels: ["  \(labels.pause.uppercased())\n"]) == true,
+                   "Case or surrounding whitespace defeated the exact Pause action")
+            expect(YandexPlaybackControl.state(role: "AXButton", labels: [labels.play, labels.pause]) == nil,
+                   "Contradictory action labels guessed one playback state")
+            expect(metadata([node("AXButton", [labels.pause])])?.isPlaying == true,
+                   "Whole metadata lost the exact localized playing signal")
+            expect(metadata([node("AXButton", [labels.play])])?.isPlaying == false,
+                   "Whole metadata lost the exact localized paused signal")
+        }
+        expect(YandexPlaybackControl.state(role: "AXButton", labels: ["Play"]) == false,
+               "The existing exact Play alias no longer establishes a paused control")
+        for role in ["AXStaticText", "AXGroup", "AXLink", "AXMenuItem", "AXMenuButton", "AXCheckBox", "AXSlider"] {
+            expect(YandexPlaybackControl.state(role: role, labels: ["Pause"]) == nil,
+                   "A non-playback role established playing state: \(role)")
+            expect(YandexPlaybackControl.state(role: role, labels: ["Playback"]) == nil,
+                   "A non-playback role established paused state: \(role)")
+        }
+        for label in ["", " ", "Pause on hover", "Play queue", "Playback settings", "Paused", "Start playback",
+                      "Пауза при наведении", "Воспроизведение очереди", "Приостановить при наведении",
+                      "Next song", "Previous song", "Like", "Келесі ән", "Yoqadi"] {
+            expect(YandexPlaybackControl.state(role: "AXButton", labels: [label]) == nil,
+                   "An unknown or partial action label guessed playback state: \(label)")
+        }
+        expect(YandexPlaybackControl.state(role: "AXButton", labels: []) == nil, "An unlabeled button guessed playback state")
+        expect(YandexPlaybackControl.state(role: "AXButton", labels: ["Pause", "Пауза", "Pause"]) == true,
+               "Equivalent Pause labels were mistaken for a contradiction")
+        expect(YandexPlaybackControl.state(role: "AXButton", labels: ["Playback", "Ойнату"]) == false,
+               "Equivalent Playback labels were mistaken for a contradiction")
+        expect(YandexPlaybackControl.state(role: "AXButton", labels: ["Pause", "Play queue"]) == true,
+               "An unrelated secondary label defeated an exact Pause action")
+        expect(metadata([])?.isPlaying == nil, "Missing playback controls guessed a state")
+        expect(metadata([node("AXButton", ["Pause"]), node("AXButton", ["Playback"])])?.isPlaying == nil,
+               "Two conflicting controls were resolved by first-match precedence")
+        expect(metadata([node("AXButton", ["Пауза"]), node("AXButton", ["Ойнату"])])?.isPlaying == nil,
+               "Conflicting localized controls guessed one playback state")
+        expect(metadata([node("AXButton", ["Pause", "Playback"])])?.isPlaying == nil,
+               "Contradictory labels on the same control guessed one metadata state")
+        expect(metadata([node("AXButton", ["Pause", "Playback"]), node("AXButton", ["Pause"])])?.isPlaying == nil,
+               "A contradictory control was silently discarded in favor of another Pause button")
+        expect(metadata([node("AXButton", ["Pause"]), node("AXButton", ["Үзіліс"])])?.isPlaying == true,
+               "Agreeing playing controls lost their state")
+        expect(metadata([node("AXButton", ["Playback"]), node("AXButton", ["Ijro"])])?.isPlaying == false,
+               "Agreeing paused controls lost their state")
+        expect(metadata([node("AXStaticText", ["Pause"]), node("AXButton", ["Playback"])])?.isPlaying == false,
+               "Static text overrode the actual paused control")
+        expect(metadata([node("AXButton", ["Pause on hover"]), node("AXButton", ["Playback"])])?.isPlaying == false,
+               "A partial Pause substring overrode the actual paused control")
+    }
+
     static func main() {
         for role in ["AXButton", "AXCheckBox"] {
             for label in ["Like", "Нравится", "Мне нравится", "Ұнайды", "Yoqadi"] {
@@ -276,6 +339,7 @@ private enum YandexFavoriteAXTests {
         entityRoutes()
         targetMatching()
         nativePlayerIdentity()
+        playbackControlState()
         // The native player can expose only an album link and plain title/artist text.
         // This exact shape was read from the live bottom transport bar, without account mutation.
         let plainTarget = YandexFavoriteTarget(trackID: "42", title: "Fixture song", artist: "Fixture artist")

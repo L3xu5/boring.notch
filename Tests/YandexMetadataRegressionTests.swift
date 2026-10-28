@@ -9,6 +9,25 @@ private struct YandexMetadataFailure: Error, CustomStringConvertible {
     let description: String
 }
 
+private actor MetadataGetFixture {
+    private var response: MediaWireUpdate?
+    private var delayed = false
+    private var waiters: [CheckedContinuation<MediaWireUpdate?, Never>] = []
+    private(set) var reads = 0
+    var pending: Int { waiters.count }
+    init(_ response: MediaWireUpdate? = nil) { self.response = response }
+    func set(_ response: MediaWireUpdate?) { self.response = response }
+    func delay() { delayed = true }
+    func read() async -> MediaWireUpdate? {
+        reads += 1
+        if delayed { return await withCheckedContinuation { waiters.append($0) } }
+        return response
+    }
+    func finish(_ response: MediaWireUpdate?, index: Int = 0) { waiters.remove(at: index).resume(returning: response) }
+}
+
+@MainActor private final class MetadataClockFixture { var now: TimeInterval = 100 }
+
 private func favoriteMetadata(_ favorite: Bool?, title: String = "Before", artist: String = "Artist",
                               trackID: String? = nil) -> YandexAccessibilityMetadata {
     let trackURL = trackID.flatMap { URL(string: "music-application://desktop/album/123/track/\($0)") }
@@ -31,6 +50,17 @@ private actor DelayedYandexAX: YandexAccessibilityProviding {
     private(set) var favoriteTargets: [YandexFavoriteTarget] = []
     private(set) var setRequests: [Bool] = []
     private var fullMetadataUnavailable = false
+    private var delayPlayback = false
+    private var playing: Bool?
+    private var playbackWaiters: [CheckedContinuation<Bool?, Never>] = []
+    var pendingPlaybackReads: Int { playbackWaiters.count }
+    func setDelayPlayback() { delayPlayback = true }
+    func setPlaybackState(_ playing: Bool?) { self.playing = playing }
+    func playbackState(processIdentifier: pid_t) async -> Bool? {
+        if delayPlayback { return await withCheckedContinuation { playbackWaiters.append($0) } }
+        return playing
+    }
+    func finishPlayback(_ playing: Bool?, index: Int = 0) { playbackWaiters.remove(at: index).resume(returning: playing) }
     func setFullMetadataUnavailable() { fullMetadataUnavailable = true }
     func read(processIdentifier: pid_t) async -> YandexAccessibilityMetadata? {
         if fullMetadataUnavailable { return nil }
@@ -82,8 +112,16 @@ private actor SnapshotYandexAX: YandexAccessibilityProviding {
     private var satisfiedSet: YandexAccessibilityMetadata?
     private(set) var scopedReadCount = 0
     private(set) var setRequests: [Bool] = []
+    private var independentPlaying: Bool?
+    private var useIndependentPlaying = false
+    private(set) var playbackReadCount = 0
     init(_ metadata: YandexAccessibilityMetadata?) { self.metadata = metadata }
     func setSnapshot(_ metadata: YandexAccessibilityMetadata?) { self.metadata = metadata }
+    func setPlaybackState(_ playing: Bool?) { independentPlaying = playing; useIndependentPlaying = true }
+    func playbackState(processIdentifier: pid_t) async -> Bool? {
+        playbackReadCount += 1
+        return useIndependentPlaying ? independentPlaying : metadata?.isPlaying
+    }
     func setScopedSnapshot(_ metadata: YandexAccessibilityMetadata?) {
         scopedMetadata = metadata; useScopedMetadata = true
     }
@@ -141,6 +179,9 @@ private actor FavoriteQueueGate {
 }
 
 @MainActor
+private final class PlaybackPIDBox { var value: pid_t? = 42 }
+
+@MainActor
 private final class FavoriteProtocolFixture: MediaControllerProtocol {
     let playbackStatePublisher = Just(PlaybackState(bundleIdentifier: "fixture")).eraseToAnyPublisher()
     let supportsVolumeControl = false
@@ -186,6 +227,7 @@ private extension YandexMusicController {
     @MainActor func metadataTestApplyAX(_ node: YandexAccessibilityNode) {
         if let metadata = YandexAccessibilityMetadata(root: node) {
             applyAccessibilityMetadata(metadata, generation: accessibilityGeneration)
+            if let (_, request) = playbackRequest() { receivePlaybackState(metadata.isPlaying, request: request) }
         }
     }
     @MainActor func metadataTestPrimeArtwork(_ key: String) -> UInt {
@@ -201,7 +243,10 @@ private extension YandexMusicController {
     }
     @MainActor func metadataTestRefreshFavorite() async { await refreshFavoriteState() }
     @MainActor func metadataTestStartMonitoring() { startAccessibilityMonitoring() }
-    @MainActor func metadataTestTerminate() { handleYandexTerminated() }
+    @MainActor func metadataTestStartPlayingMonitoring() { startPlaybackMonitoring() }
+    @MainActor func metadataTestRefreshPlaying() async { await refreshPlaybackState() }
+    @MainActor var metadataTestPlaybackTask: Task<Void, Never>? { playbackTask }
+    @MainActor func metadataTestTerminate(processIdentifier: pid_t? = nil) { handleYandexTerminated(processIdentifier: processIdentifier) }
     @MainActor func metadataTestReset() { resetAdapterState() }
     @MainActor func metadataTestNativeTrackID(_ id: String) { playbackState.nativeTrackID = id }
     @MainActor var metadataTestFavoriteQueueID: UUID? { favoriteQueueTailID }
@@ -1132,7 +1177,272 @@ private struct YandexMetadataRegressionTests {
     }
 
     @MainActor
-    private static func stream(_ name: String, _ messages: [[String: Any]],
+    private static func playbackEvidence() async throws {
+        func seed(_ controller: YandexMusicController, playing: Bool = true) async throws {
+            try await controller.metadataTestUpdate(["bundleIdentifier": "ru.yandex.desktop.music", "title": "Before", "artist": "Artist",
+                "playing": playing, "playbackRate": playing ? 1.0 : 0.0, "elapsedTime": 40.0, "duration": 180.0], diff: false)
+        }
+        for lifecycle in ["terminate", "cold ghost", "missing PID", "reset"] {
+            let pid = PlaybackPIDBox(), client = SnapshotYandexAX(nil)
+            if lifecycle == "cold ghost" { pid.value = nil }
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { pid.value },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await seed(controller)
+            switch lifecycle {
+            case "terminate":
+                pid.value = nil
+                controller.metadataTestTerminate()
+                try await seed(controller)
+            case "missing PID":
+                pid.value = nil
+                await controller.metadataTestRefreshPlaying()
+            case "reset":
+                controller.metadataTestReset()
+                await controller.metadataTestRefreshPlaying()
+            default: break
+            }
+            let state = controller.playbackState
+            try expect(!state.isPlaying && state.playbackRate == 0
+                       && state.timeline.position(at: state.lastUpdated.addingTimeInterval(10)) == state.currentTime,
+                       "\(lifecycle) left an old playing animation/timeline without current source evidence")
+            pid.value = 43
+            await client.setPlaybackState(true)
+            await controller.metadataTestRefreshPlaying()
+            try expect(controller.isActive() && controller.playbackState.isPlaying,
+                       "\(lifecycle) permanently stopped the source or prevented fresh relaunch evidence")
+            controller.stop()
+            passed += 1
+            print("PASS playing lifecycle \(lifecycle) stops stale state and permits fresh relaunch")
+        }
+        do {
+            let paused = YandexAccessibilityMetadata(root: .init(role: "AXGroup", labels: [], value: nil, url: nil, children: [
+                .init(role: "AXLink", labels: ["Track Before"], value: nil, url: nil, children: []),
+                .init(role: "AXLink", labels: ["Artist Artist"], value: nil, url: URL(string: "music-application://desktop/artist/1"), children: []),
+                .init(role: "AXButton", labels: ["Playback"], value: nil, url: nil, children: []),
+            ]))!
+            let client = SnapshotYandexAX(paused)
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await seed(controller)
+            await controller.refreshAccessibilityMetadata()
+            try expect(!controller.playbackState.isPlaying && controller.accessibilityIsPlaying == false,
+                       "A matching native-owner AX pause was ignored in favor of cached MR playing")
+            controller.stop()
+            passed += 1
+            print("PASS matching full AX pause reconciles the native Yandex session owner")
+        }
+        for foreignOwner in [false, true] {
+            for playing in [false, true] {
+                let client = SnapshotYandexAX(nil)
+                await client.setPlaybackState(playing)
+                let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                    onTransportUnavailable: {}, startMonitoring: false)!
+                try await seed(controller, playing: !playing)
+                if foreignOwner {
+                    try await controller.metadataTestUpdate(["bundleIdentifier": "com.apple.Safari", "title": "Browser", "playing": false], diff: false)
+                }
+                await controller.refreshAccessibilityMetadata()
+                try expect(controller.playbackState.isPlaying == playing && controller.accessibilityIsPlaying == playing
+                           && controller.accessibilityMetadataLastReadAt != nil,
+                           "Independent playback evidence was hidden by unavailable full metadata or session ownership")
+                if !foreignOwner { try await controller.metadataTestUpdate(["playing": !playing, "album": "Heartbeat"]) }
+                else { try await controller.metadataTestUpdate(["title": "Browser heartbeat"]) }
+                try expect(controller.playbackState.isPlaying == playing,
+                           "A cached MediaRemote playing value immediately undid a newer scoped observation")
+                await client.setPlaybackState(nil)
+                await controller.metadataTestRefreshPlaying()
+                try expect(controller.playbackState.isPlaying == playing && controller.accessibilityIsPlaying == nil,
+                           "An unknown read invented a pause or resumed a previously confirmed pause")
+                if !foreignOwner { try await controller.metadataTestUpdate(["album": "Another heartbeat"]) }
+                try expect(controller.playbackState.isPlaying == playing,
+                           "Unknown playback evidence let an unchanged cached MR value resurrect the old state")
+                controller.stop()
+                passed += 1
+                print("PASS independent playing \(playing) with unavailable metadata (foreign owner \(foreignOwner))")
+            }
+        }
+        do {
+            let client = SnapshotYandexAX(nil)
+            await client.setPlaybackState(false)
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await seed(controller)
+            await controller.metadataTestRefreshPlaying()
+            try await controller.metadataTestUpdate(["playing": false])
+            try await controller.metadataTestUpdate(["playing": true])
+            try expect(controller.playbackState.isPlaying, "A real new MR playing transition could not replace previous pause evidence")
+            controller.stop()
+            passed += 1
+            print("PASS new native playing transitions replace previous scoped evidence")
+        }
+        do {
+            let client = SnapshotYandexAX(nil)
+            await client.setPlaybackState(true)
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await seed(controller)
+            for rate in [0.5, 1.5] {
+                try await controller.metadataTestUpdate(["playbackRate": rate])
+                await controller.metadataTestRefreshPlaying()
+                try await controller.metadataTestUpdate(["album": "Rate heartbeat \(rate)"])
+                try expect(controller.playbackState.playbackRate == rate,
+                           "A boolean scoped playback observation changed the source's actual playback speed")
+            }
+            controller.stop()
+            passed += 1
+            print("PASS scoped playing confirmation preserves native playback speed")
+        }
+        do {
+            let client = DelayedYandexAX()
+            await client.setDelayPlayback()
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await seed(controller)
+            let older = Task { await controller.metadataTestRefreshPlaying() }
+            try await waitForAX("Old playback request did not begin") { await client.pendingPlaybackReads == 1 }
+            let newer = Task { await controller.metadataTestRefreshPlaying() }
+            try await waitForAX("New playback request did not begin") { await client.pendingPlaybackReads == 2 }
+            await client.finishPlayback(false, index: 1)
+            await newer.value
+            await client.finishPlayback(true)
+            await older.value
+            try expect(!controller.playbackState.isPlaying && controller.accessibilityIsPlaying == false,
+                       "An older playing read overwrote a newer pause")
+            controller.stop()
+            passed += 1
+            print("PASS reversed playback samples keep the newest pause")
+        }
+        for lifecycle in ["stop", "terminate", "reset", "PID change"] {
+            let pid = PlaybackPIDBox(), client = DelayedYandexAX()
+            await client.setDelayPlayback()
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { pid.value },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await seed(controller)
+            let pending = Task { await controller.metadataTestRefreshPlaying() }
+            try await waitForAX("Delayed playback sample did not begin") { await client.pendingPlaybackReads == 1 }
+            switch lifecycle {
+            case "stop": controller.stop()
+            case "terminate": pid.value = nil; controller.metadataTestTerminate()
+            case "reset": controller.metadataTestReset()
+            default:
+                pid.value = 43
+                try await seed(controller, playing: false)
+            }
+            await client.finishPlayback(true)
+            await pending.value
+            try expect(!controller.playbackState.isPlaying && controller.accessibilityIsPlaying == nil,
+                       "An old playback sample resurrected the source after \(lifecycle)")
+            controller.stop()
+            passed += 1
+            print("PASS late playback sample cannot resurrect source after \(lifecycle)")
+        }
+        do {
+            let client = DelayedYandexAX()
+            await client.setPlaybackState(false)
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await seed(controller)
+            let favorite = Task { await controller.toggleFavorite() }
+            try await waitForAX("Favorite action did not begin") { await client.pendingActions == 1 }
+            controller.metadataTestStartPlayingMonitoring()
+            try await waitFor("Favorite action hid a real pause from independent monitoring") { !controller.playbackState.isPlaying }
+            await client.finishAction(false)
+            await favorite.value
+            try expect(controller.accessibilityIsPlaying == false, "Favorite completion erased an independent pause sample")
+            controller.stop()
+            passed += 1
+            print("PASS favorite actions do not block independent pause monitoring")
+        }
+        do {
+            let client = DelayedYandexAX()
+            await client.setDelayPlayback()
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await seed(controller)
+            let playing = Task { await controller.metadataTestRefreshPlaying() }
+            try await waitForAX("Independent playback request did not begin") { await client.pendingPlaybackReads == 1 }
+            let favorite = Task { await controller.metadataTestRefreshFavorite() }
+            try await waitForAX("Concurrent favorite read did not begin") { await client.pendingFavorites == 1 }
+            await client.finishFavorite(false)
+            await favorite.value
+            await client.finishPlayback(false)
+            await playing.value
+            try expect(!controller.playbackState.isPlaying && controller.accessibilityIsPlaying == false,
+                       "Favorite read revisions invalidated an unrelated playback observation")
+            controller.stop()
+            passed += 1
+            print("PASS favorite and playback reads have independent revision lifetimes")
+        }
+        do {
+            let client = DelayedYandexAX()
+            await client.setDelayPlayback()
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await seed(controller, playing: false)
+            let oldPause = Task { await controller.metadataTestRefreshPlaying() }
+            try await waitForAX("Pre-play sample did not begin") { await client.pendingPlaybackReads == 1 }
+            let play = Task { await controller.play() }
+            try await waitForAX("Explicit play did not enter AX") { await client.pendingActions == 1 }
+            await client.finishAction(true)
+            await play.value
+            await client.finishPlayback(false)
+            await oldPause.value
+            try await controller.metadataTestUpdate(["album": "Cached paused heartbeat"])
+            try expect(controller.playbackState.isPlaying && controller.accessibilityIsPlaying == nil,
+                       "A pre-command pause read/cache overrode an accepted play")
+            let oldPlay = Task { await controller.metadataTestRefreshPlaying() }
+            try await waitForAX("Pre-pause sample did not begin") { await client.pendingPlaybackReads == 1 }
+            let pause = Task { await controller.pause() }
+            try await waitForAX("Explicit pause did not enter AX") { await client.pendingActions == 1 }
+            await client.finishAction(true)
+            await pause.value
+            await client.finishPlayback(true)
+            await oldPlay.value
+            try expect(!controller.playbackState.isPlaying && controller.playbackState.playbackRate == 0,
+                       "A pre-command playing read overrode an accepted pause")
+            controller.stop()
+            passed += 1
+            print("PASS accepted native play/pause discards pre-command playback samples")
+        }
+        do {
+            let client = DelayedYandexAX()
+            await client.setDelayPlayback()
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 43 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await seed(controller)
+            let current = Task { await controller.metadataTestRefreshPlaying() }
+            try await waitForAX("Relaunched process sample did not begin") { await client.pendingPlaybackReads == 1 }
+            controller.metadataTestTerminate(processIdentifier: 42)
+            try expect(controller.playbackState.isPlaying, "A late old-process quit notification stopped the relaunched source")
+            await client.finishPlayback(false)
+            await current.value
+            try expect(controller.accessibilityIsPlaying == false && !controller.playbackState.isPlaying,
+                       "An old-process quit invalidated the new process's current evidence")
+            controller.stop()
+            passed += 1
+            print("PASS late quit notification from the previous PID preserves the relaunched source")
+        }
+        do {
+            let client = DelayedYandexAX()
+            await client.setDelayPlayback()
+            var controller: YandexMusicController? = YandexMusicController(accessibility: client,
+                processIdentifier: { 42 }, onTransportUnavailable: {}, startMonitoring: false)!
+            controller!.metadataTestStartPlayingMonitoring()
+            let reader = controller!.metadataTestPlaybackTask
+            weak var weakController = controller
+            defer { weakController = nil }
+            try await waitForAX("Playback monitor did not enter AX") { await client.pendingPlaybackReads == 1 }
+            controller = nil
+            try await waitFor("Playback monitor retained its source across AX IPC") { weakController == nil }
+            await client.finishPlayback(true)
+            await reader?.value
+            passed += 1
+            print("PASS independent playback monitor releases its source while waiting")
+        }
+    }
+
+    @MainActor
+    private static func stream(_ name: String, _ messages: [[String: Any]], snapshot: [String: Any]? = nil,
                                verify: (YandexMusicController) async throws -> Void) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -1147,12 +1457,14 @@ private struct YandexMetadataRegressionTests {
         try data.write(to: fixture)
         setenv("YANDEX_METADATA_FIXTURE", fixture.path, 1)
         setenv("YANDEX_METADATA_DONE", done.path, 1)
-        var controller = YandexMusicController(accessibility: SnapshotYandexAX(nil), processIdentifier: { 42 })
+        let confirmed = try snapshot.map { try wireSnapshot($0) }
+        var controller = YandexMusicController(accessibility: SnapshotYandexAX(nil), processIdentifier: { 42 },
+                                               snapshotReader: { confirmed })
         guard controller != nil else { throw YandexMetadataFailure(description: "MediaRemote initialization unavailable") }
         weak var weakController = controller
         defer { weakController = nil }
         try await waitFor("fixture stream did not complete") { FileManager.default.fileExists(atPath: done.path) }
-        try await Task.sleep(for: .milliseconds(80))
+        try await Task.sleep(for: .milliseconds(snapshot == nil ? 80 : 250))
         try await verify(controller!)
         let process = controller!.metadataTestProcess
         let reader = controller!.metadataTestReader
@@ -1180,6 +1492,207 @@ private struct YandexMetadataRegressionTests {
         .init(role: role, labels: label.isEmpty ? [] : [label], value: value, url: url.flatMap(URL.init(string:)), children: children)
     }
 
+    private static func wireSnapshot(_ payload: [String: Any]) throws -> MediaWireUpdate {
+        try JSONDecoder().decode(MediaWireUpdate.self,
+            from: JSONSerialization.data(withJSONObject: ["diff": false, "payload": payload]))
+    }
+
+    private static func track(_ title: String, artist: String = "Artist", album: String = "Album",
+                              id: String? = nil, art: String? = nil, owner: String = YandexMusicController.bundleID) -> [String: Any] {
+        var payload: [String: Any] = ["bundleIdentifier": owner, "title": title, "artist": artist, "album": album, "playing": true]
+        if let id { payload["contentItemIdentifier"] = id }
+        if let art { payload["artworkData"] = Data(art.utf8).base64EncodedString() }
+        return payload
+    }
+
+    @MainActor
+    private static func metadataOwnership() async throws {
+        for release in ["matching", "novel", "expiry", "next", "previous"] {
+            let clock = MetadataClockFixture()
+            let controller = YandexMusicController(accessibility: SnapshotYandexAX(nil), processIdentifier: { 42 },
+                startMonitoring: false, metadataClock: { clock.now })!
+            try await controller.metadataTestUpdate(track("A", art: "art A"), diff: false)
+            try await controller.metadataTestUpdate(track("Browser", owner: "com.apple.Safari"), diff: false)
+            controller.metadataTestApplyAX(node("AXGroup", children: [node("AXLink", "Track B"), node("AXLink", "Artist Artist")]))
+            var titles: [String] = []
+            let subscription = controller.playbackStatePublisher.sink { titles.append($0.title) }
+            try await controller.metadataTestUpdate(track("A", art: "art A"), diff: false)
+            try expect(!titles.contains("A") && controller.playbackState.title == "B", "Delayed MR A rolled fresh AX B back")
+            switch release {
+            case "matching": try await controller.metadataTestUpdate(track("B", art: "art B"), diff: false)
+            case "novel": try await controller.metadataTestUpdate(track("C", art: "art C"), diff: false)
+            case "expiry": clock.now += 2.1; try await controller.metadataTestUpdate(track("A"), diff: false)
+            default:
+                let action = Task { if release == "next" { await controller.nextTrack() } else { await controller.previousTrack() } }
+                await action.value
+                try await controller.metadataTestUpdate(track("A"), diff: false)
+            }
+            // A failed fake AX navigation cannot release authority; successful navigation is
+            // covered below with an accepting worker.
+            let expected = release == "matching" ? "B" : release == "novel" ? "C" : release == "expiry" ? "A" : "B"
+            try expect(controller.playbackState.title == expected, "Metadata authority failed its \(release) boundary")
+            _ = subscription
+            controller.stop()
+            passed += 1
+            print("PASS fresh AX metadata barrier \(release)")
+        }
+        for previous in [false, true] {
+            let client = SnapshotYandexAX(nil)
+            await client.setReceipt(true, afterAction: nil)
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 }, startMonitoring: false)!
+            try await controller.metadataTestUpdate(track("A"), diff: false)
+            try await controller.metadataTestUpdate(track("Browser", owner: "com.apple.Safari"), diff: false)
+            let bar = node("AXGroup", children: [node("AXLink", "Track B"), node("AXLink", "Artist Artist")])
+            controller.metadataTestApplyAX(bar)
+            if previous { await controller.previousTrack() } else { await controller.nextTrack() }
+            controller.metadataTestApplyAX(bar)
+            try await controller.metadataTestUpdate(track("A"), diff: false)
+            try expect(controller.playbackState.title == "A", "Explicit navigation kept or rearmed the old AX barrier")
+            controller.stop(); passed += 1
+            print("PASS accepted explicit navigation releases AX metadata authority")
+        }
+        do {
+            let controller = YandexMusicController(accessibility: SnapshotYandexAX(nil), processIdentifier: { 42 }, startMonitoring: false)!
+            try await controller.metadataTestUpdate(track("A", art: "art A"), diff: false)
+            try await controller.metadataTestUpdate(track("Browser", art: "browser art", owner: "com.apple.Safari"), diff: false)
+            var titles: [String] = []
+            let subscription = controller.playbackStatePublisher.sink { titles.append($0.title) }
+            try await controller.metadataTestUpdate(["bundleIdentifier": YandexMusicController.bundleID])
+            try await controller.metadataTestUpdate(["elapsedTime": 20])
+            try expect(!titles.contains("Browser") && controller.playbackState.artwork == Data("art A".utf8),
+                       "Owner-only return relabeled a retained browser payload as Yandex")
+            try await controller.metadataTestUpdate(track("B", art: "art B"))
+            try expect(controller.playbackState.title == "B", "Fresh Yandex title did not release owner-only return guard")
+            _ = subscription
+            controller.stop(); passed += 1
+            print("PASS owner-only return waits for source metadata")
+        }
+    }
+
+    @MainActor
+    private static func artworkAssociation() async throws {
+        do {
+            let fixture = MetadataGetFixture()
+            await fixture.delay()
+            let controller = YandexMusicController(accessibility: SnapshotYandexAX(nil), processIdentifier: { 42 },
+                startMonitoring: false, snapshotReader: { await fixture.read() })!
+            try await controller.metadataTestUpdate(track("A", id: "opaque A", art: "art A"), diff: false)
+            var states: [PlaybackState] = []
+            let subscription = controller.playbackStatePublisher.sink { states.append($0) }
+            try await controller.metadataTestUpdate(["artworkData": Data("art B".utf8).base64EncodedString(), "contentItemIdentifier": "opaque B"])
+            try expect(controller.playbackState.artwork == Data("art A".utf8), "Art-first diff exposed A text with B artwork")
+            try await waitForAX("Staged artwork did not request validation") { await fixture.pending == 1 }
+            try await controller.metadataTestUpdate(["title": "B", "album": "Album B"])
+            try expect(controller.playbackState.artwork == nil, "New item retained A cover while validation was pending")
+            try await waitForAX("New title did not request current artwork") { await fixture.pending == 2 }
+            await fixture.finish(try wireSnapshot(track("B", album: "Album B", id: "opaque B", art: "art B")))
+            try await Task.sleep(for: .milliseconds(20))
+            try expect(controller.playbackState.artwork == nil, "Late pre-title snapshot applied under a different item")
+            await fixture.finish(try wireSnapshot(track("B", album: "Album B", id: "opaque B", art: "art B")))
+            try await waitFor("Current art-first cover was not recovered") { controller.playbackState.artwork == Data("art B".utf8) }
+            try expect(!states.contains { $0.title == "A" && $0.artwork == Data("art B".utf8) }, "An intermediate publication mixed A text and B art")
+            _ = subscription
+            controller.stop(); passed += 1
+            print("PASS art-first staging, canceled old validation and current snapshot recovery")
+        }
+        do {
+            let fixture = MetadataGetFixture(try wireSnapshot(track("A", id: "opaque A", art: "quality A")))
+            let controller = YandexMusicController(accessibility: SnapshotYandexAX(nil), processIdentifier: { 42 },
+                startMonitoring: false, snapshotReader: { await fixture.read() })!
+            try await controller.metadataTestUpdate(track("A", id: "opaque A", art: "art A"), diff: false)
+            try await controller.metadataTestUpdate(["artworkData": Data("quality A".utf8).base64EncodedString()])
+            try expect(controller.playbackState.artwork == Data("art A".utf8), "Quality change bypassed item validation")
+            try await waitFor("Same-item higher quality cover was lost") { controller.playbackState.artwork == Data("quality A".utf8) }
+            controller.stop(); passed += 1
+            print("PASS same-item quality cover passes full snapshot validation")
+        }
+        for variant in ["valid", "owner", "id", "title", "artist", "album", "old art", "shared album"] {
+            var response = track("B", album: "Album B", id: "opaque B", art: "art B")
+            switch variant {
+            case "owner": response["bundleIdentifier"] = "com.apple.Safari"
+            case "id": response["contentItemIdentifier"] = "opaque A"
+            case "title": response["title"] = "A"
+            case "artist": response["artist"] = "Other"
+            case "album": response["album"] = "Other"
+            case "old art", "shared album": response["artworkData"] = Data("art A".utf8).base64EncodedString()
+            default: break
+            }
+            let fixture = MetadataGetFixture(try wireSnapshot(response))
+            let controller = YandexMusicController(accessibility: SnapshotYandexAX(nil), processIdentifier: { 42 },
+                startMonitoring: false, snapshotReader: { await fixture.read() })!
+            try await controller.metadataTestUpdate(track("A", album: variant == "shared album" ? "Album B" : "Album A", id: "opaque A", art: "art A"), diff: false)
+            try await controller.metadataTestUpdate(["title": "B", "album": "Album B", "contentItemIdentifier": "opaque B"])
+            try await waitForAX("New item did not validate missing artwork") { await fixture.reads == 1 }
+            try await Task.sleep(for: .milliseconds(20))
+            let accepted = variant == "valid" || variant == "shared album"
+            try expect((controller.playbackState.artwork != nil) == accepted, "Snapshot association accepted/rejected wrong \(variant) cover")
+            try await controller.metadataTestUpdate(["elapsedTime": 5])
+            try expect((controller.playbackState.artwork != nil) == accepted, "Heartbeat resurrected previous-item cover")
+            controller.stop(); passed += 1
+            print("PASS missing-cover snapshot validation \(variant)")
+        }
+        do {
+            let controller = YandexMusicController(accessibility: SnapshotYandexAX(nil), processIdentifier: { 42 }, startMonitoring: false)!
+            try await controller.metadataTestUpdate(track("Same base title", id: "opaque A", art: "art A"), diff: false)
+            controller.metadataTestNativeTrackID("trusted native A")
+            try await controller.metadataTestUpdate(["title": "Same base title", "contentItemIdentifier": "opaque B"])
+            try expect(controller.playbackState.nativeTrackID == nil && controller.playbackState.artwork == nil,
+                       "Different opaque item retained a previous recording's API ID or cover")
+            controller.stop(); passed += 1
+            print("PASS opaque item change clears API identity without promoting opaque IDs")
+        }
+        do {
+            let fixture = MetadataGetFixture(try wireSnapshot(track("Same base title", id: "opaque B", art: "art B")))
+            let controller = YandexMusicController(accessibility: SnapshotYandexAX(nil), processIdentifier: { 42 },
+                startMonitoring: false, snapshotReader: { await fixture.read() })!
+            try await controller.metadataTestUpdate(track("Same base title", id: "opaque A", art: "art A"), diff: false)
+            controller.metadataTestNativeTrackID("trusted native A")
+            try await controller.metadataTestUpdate(["artworkData": Data("art B".utf8).base64EncodedString(), "contentItemIdentifier": "opaque B"])
+            try expect(controller.playbackState.artwork == Data("art A".utf8), "Same-title item bypassed artwork association")
+            try await waitFor("Verified same-title opaque item never promoted its cover") { controller.playbackState.artwork == Data("art B".utf8) }
+            try expect(controller.playbackState.nativeTrackID == nil, "Verified new opaque item retained the old native recording ID")
+            controller.stop(); passed += 1
+            print("PASS same-title new opaque item verifies cover and releases old API identity")
+        }
+        for boundary in ["stop", "reset", "foreign"] {
+            let fixture = MetadataGetFixture()
+            await fixture.delay()
+            var controller: YandexMusicController? = YandexMusicController(accessibility: SnapshotYandexAX(nil), processIdentifier: { 42 },
+                startMonitoring: false, snapshotReader: { await fixture.read() })!
+            try await controller!.metadataTestUpdate(track("A", id: "opaque A", art: "art A"), diff: false)
+            try await controller!.metadataTestUpdate(["artworkData": Data("quality A".utf8).base64EncodedString()])
+            try await waitForAX("Lifecycle validation did not enter reader") { await fixture.pending == 1 }
+            switch boundary {
+            case "stop": controller!.stop()
+            case "reset": controller!.metadataTestReset()
+            default: try await controller!.metadataTestUpdate(track("Browser", owner: "com.apple.Safari"), diff: false)
+            }
+            await fixture.finish(try wireSnapshot(track("A", id: "opaque A", art: "quality A")))
+            try await Task.sleep(for: .milliseconds(20))
+            try expect(controller!.playbackState.artwork != Data("quality A".utf8), "Late artwork validation crossed \(boundary)")
+            weak var weakController = controller
+            controller = nil
+            try await waitFor("Artwork validation retained its controller") { weakController == nil }
+            passed += 1
+            print("PASS artwork validation lifetime \(boundary)")
+        }
+        do {
+            let fixture = MetadataGetFixture()
+            await fixture.delay()
+            var controller: YandexMusicController? = YandexMusicController(accessibility: SnapshotYandexAX(nil), processIdentifier: { 42 },
+                startMonitoring: false, snapshotReader: { await fixture.read() })!
+            try await controller!.metadataTestUpdate(track("A", id: "opaque A", art: "art A"), diff: false)
+            try await controller!.metadataTestUpdate(["artworkData": Data("quality A".utf8).base64EncodedString()])
+            try await waitForAX("Weak validation did not enter reader") { await fixture.pending == 1 }
+            weak var weakController = controller
+            controller = nil
+            try await waitFor("In-flight snapshot read retained its controller") { weakController == nil }
+            await fixture.finish(try wireSnapshot(track("A", id: "opaque A", art: "quality A")))
+            passed += 1
+            print("PASS in-flight artwork snapshot read releases the source before reply")
+        }
+    }
+
     @MainActor
     static func main() async throws {
         try await delayedAXLifecycle()
@@ -1189,13 +1702,17 @@ private struct YandexMetadataRegressionTests {
         try await scopedFavoriteFallback()
         try await favoriteHeartbeatAndOwnerChanges()
         try await favoriteFIFO()
+        try await playbackEvidence()
+        try await metadataOwnership()
+        try await artworkAssociation()
         try await stream("parent owner survives helper-only diff", [
             update(["parentApplicationBundleIdentifier": "ru.yandex.desktop.music", "bundleIdentifier": "ru.yandex.helper.1",
                     "title": "Old title", "artist": "Old artist"], diff: false),
             update(["bundleIdentifier": "ru.yandex.helper.2"]),
             update(["title": "New title"]), update(["artist": "New artist"]),
             update(["artworkData": Data("new art".utf8).base64EncodedString()]),
-        ]) { controller in
+        ], snapshot: ["bundleIdentifier": "ru.yandex.desktop.music", "title": "New title", "artist": "New artist",
+                      "artworkData": Data("new art".utf8).base64EncodedString()]) { controller in
             try expect(controller.playbackState.title == "New title", "Helper diff lost Yandex title updates")
             try expect(controller.playbackState.artist == "New artist", "Artist update was dropped")
             try expect(controller.playbackState.artwork == Data("new art".utf8), "Artwork update was dropped")
@@ -1207,15 +1724,18 @@ private struct YandexMetadataRegressionTests {
             update(["bundleIdentifier": "ru.yandex.desktop.music"]),
             update(["title": "Yandex track", "artist": "Yandex artist", "artworkData": Data("cover".utf8).base64EncodedString()]),
             update(["parentApplicationBundleIdentifier": NSNull()]),
-        ]) { controller in
+        ], snapshot: ["bundleIdentifier": "ru.yandex.desktop.music", "title": "Yandex track", "artist": "Yandex artist",
+                      "artworkData": Data("cover".utf8).base64EncodedString()]) { controller in
             try expect(controller.playbackState.title == "Yandex track", "Removing stale parent did not restore Yandex")
-            try expect(controller.playbackState.artwork == Data("cover".utf8), "Metadata received before owner was lost")
+            try expect(controller.playbackState.artwork == Data("cover".utf8), "Verified artwork received before owner was lost")
         }
 
         let fields: [[String: Any]] = [["title": "Новый трек 🎵"], ["artist": "Новый артист"],
                                      ["artworkData": Data("new art".utf8).base64EncodedString()]]
         for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
-            try await stream("metadata order \(order)", [initial] + order.map { update(fields[$0]) }) { controller in
+            try await stream("metadata order \(order)", [initial] + order.map { update(fields[$0]) },
+                snapshot: ["bundleIdentifier": "ru.yandex.desktop.music", "title": "Новый трек 🎵", "artist": "Новый артист",
+                           "album": "Old album", "artworkData": Data("new art".utf8).base64EncodedString()]) { controller in
                 try expect(controller.playbackState.title == "Новый трек 🎵", "Title was lost")
                 try expect(controller.playbackState.artist == "Новый артист", "Artist was lost")
                 try expect(controller.playbackState.artwork == Data("new art".utf8), "Early/late artwork was lost")

@@ -80,12 +80,15 @@ public struct MediaWireState: Sendable {
         else if patch["repeatMode"] != nil { state.repeatMode = .off }
         if let liked = payload.boolean("isLiked") { state.isFavorite = liked }
         else if patch["isLiked"] != nil || state.identity != previous.identity { state.isFavorite = false }
-        if patch["artworkData"] != nil || !diff || state.identity != previous.identity
-            || (previous.artwork == nil && payload["artworkData"] != nil) {
-            if let encoded = payload.string("artworkData") {
-                state.artwork = Data(base64Encoded: encoded.trimmingCharacters(in: .whitespacesAndNewlines))
-            } else if patch["artworkData"] != nil || state.identity != previous.identity { state.artwork = nil }
-        } else if payload["artworkData"] == nil && state.identity != previous.identity { state.artwork = nil }
+        // Merged payload artwork may belong to the previous item. Only the current
+        // patch can establish fresh artwork; a later heartbeat must not resurrect it.
+        if patch["artworkData"] != nil {
+            state.artwork = patch.string("artworkData").flatMap {
+                Data(base64Encoded: $0.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+        } else if state.identity != previous.identity {
+            state.artwork = nil
+        }
         return state
     }
 

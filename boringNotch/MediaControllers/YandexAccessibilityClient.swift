@@ -4,6 +4,7 @@ import ApplicationServices
 
 protocol YandexAccessibilityProviding: Sendable {
     func read(processIdentifier: pid_t) async -> YandexAccessibilityMetadata?
+    func playbackState(processIdentifier: pid_t) async -> Bool?
     func perform(_ action: YandexPlayerAction, processIdentifier: pid_t,
                  isCurrent: @escaping @Sendable () -> Bool) async -> Bool
     func favoriteState(processIdentifier: pid_t) async -> Bool?
@@ -15,6 +16,9 @@ protocol YandexAccessibilityProviding: Sendable {
 }
 
 extension YandexAccessibilityProviding {
+    func playbackState(processIdentifier: pid_t) async -> Bool? {
+        await read(processIdentifier: processIdentifier)?.isPlaying
+    }
     func favoriteState(processIdentifier: pid_t, expectedTrack: YandexFavoriteTarget) async -> Bool? {
         guard let metadata = await read(processIdentifier: processIdentifier), expectedTrack.matches(metadata) else { return nil }
         return metadata.isFavorite
@@ -119,6 +123,29 @@ struct YandexAccessibilityNode: Decodable, Sendable {
     }
 }
 
+/// The native play button uses an action label: Pause means playing, Playback means paused.
+/// Read the complete, exact label and reject conflicting samples instead of guessing from substrings.
+enum YandexPlaybackControl {
+    static func state(role: String, labels: [String]) -> Bool? {
+        guard role == "AXButton" else { return nil }
+        let pause: Set<String> = ["pause", "пауза", "приостановить", "үзіліс", "pauza"]
+        let play: Set<String> = ["play", "playback", "воспроизведение", "воспроизвести", "продолжить", "ойнату", "ijro"]
+        let labels = Set(labels.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
+        let canPause = !labels.isDisjoint(with: pause), canPlay = !labels.isDisjoint(with: play)
+        return canPause == canPlay ? nil : canPause
+    }
+
+    static func state(in root: YandexAccessibilityNode) -> Bool? {
+        var labels: [String] = []
+        func visit(_ node: YandexAccessibilityNode) {
+            if node.role == "AXButton" { labels.append(contentsOf: node.labels) }
+            node.children.forEach(visit)
+        }
+        visit(root)
+        return state(role: "AXButton", labels: labels)
+    }
+}
+
 /// A toggle's label describes the action in both states. Only its explicit AX value
 /// confirms a like; Chromium exposes mixed/indeterminate as 2, not as true.
 enum YandexLikeState {
@@ -194,11 +221,7 @@ struct YandexAccessibilityMetadata: Sendable {
             .map { text($0, prefixes: ["album ", "альбом "]) } ?? ""
         artworkURL = nodes.lazy.filter { $0.role == "AXImage" }.compactMap(\.url)
             .first(where: Self.isTrustedArtworkURL)
-        let controls = nodes.filter { ["AXButton", "AXCheckBox"].contains($0.role) }
-            .flatMap(\.labels).map { $0.lowercased() }
-        if controls.contains(where: { $0 == "pause" || $0.contains("пауза") || $0.contains("приостанов") }) { isPlaying = true }
-        else if controls.contains(where: { $0 == "play" || $0 == "playback" || $0.contains("воспроизвед") || $0 == "продолжить" }) { isPlaying = false }
-        else { isPlaying = nil }
+        isPlaying = YandexPlaybackControl.state(in: root)
         let likes = nodes.filter { YandexLikeState.isLikeControl(role: $0.role, labels: $0.labels) }
         let values = likes.compactMap { YandexLikeState.decode($0.value) }
         // Multiple rendered controls must agree, and an unknown value cannot establish true.
@@ -247,6 +270,7 @@ actor YandexAccessibilityClient: YandexAccessibilityProviding {
     private var cachedBar: AXUIElement?
     private var cachedPID: pid_t?
     private var nextSearch = Date.distantPast
+    private var playbackPowerState = YandexPlaybackPowerState()
 
     private func attributes(_ element: AXUIElement) -> (node: YandexAccessibilityNode, children: [AXUIElement])? {
         let names = [kAXRoleAttribute, kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute, kAXURLAttribute, kAXChildrenAttribute, kAXEnabledAttribute]
@@ -587,6 +611,7 @@ extension YandexAccessibilityClient {
     private func prepare(_ processIdentifier: pid_t) {
         if cachedPID != processIdentifier {
             cachedBar = nil; cachedTransportCluster = nil; nextSearch = .distantPast; cachedPID = processIdentifier
+            playbackPowerState.reset()
         }
     }
     func perform(_ action: YandexPlayerAction, processIdentifier: pid_t,
@@ -642,6 +667,27 @@ extension YandexAccessibilityClient {
             return FavoriteControl(bar: candidate, button: button)
         }
         return nil
+    }
+
+    /// The transport stays readable even when the track title/artwork cannot be decoded.
+    /// This is a read-only sample: it never reopens the player or sends a media command.
+    func playbackState(processIdentifier: pid_t) async -> Bool? {
+        prepare(processIdentifier)
+        actionIsCurrent = { true }
+        controlDeadline = Date().addingTimeInterval(1)
+        guard !Task.isCancelled else { return nil }
+        if AXIsProcessTrusted(), let cluster = transportCluster() {
+            var budget = 400
+            if let snapshot = tree(cluster, remaining: &budget, deadline: controlDeadline),
+               let playing = YandexPlaybackControl.state(in: snapshot) {
+                playbackPowerState.reset()
+                return playing
+            }
+        }
+        // A closed Electron window removes its AX tree. Yandex's playback-owned sleep blocker
+        // remains readable without opening the window; stable absence confirms a pause.
+        guard !Task.isCancelled else { return nil }
+        return playbackPowerState.read(processIdentifier: processIdentifier)
     }
 
     func favoriteState(processIdentifier: pid_t, expectedTrack: YandexFavoriteTarget) async -> Bool? {
