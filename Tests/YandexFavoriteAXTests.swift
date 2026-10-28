@@ -151,6 +151,86 @@ private enum YandexFavoriteAXTests {
         expect(!YandexFavoriteTarget(trackID: nil, title: "Fixture", artist: "").matches(labelOnly),
                "Missing artist evidence matched a nonempty observed artist")
     }
+    private static func nativePlayerIdentity() {
+        // MediaSession publishes the base title and artists joined with ", ". The
+        // installed player renders the version in its ARIA label and a separate
+        // span; each artist can be a link or a separate plain-text span.
+        let target = YandexFavoriteTarget(trackID: nil, title: "Fixture song", artist: "Artist A, Artist B")
+        func bar(artists: [YandexAccessibilityNode], visibleTitle: String = "Fixture song",
+                 titleLabel: String = "Track Fixture song (Live)") -> YandexAccessibilityNode {
+            node("AXGroup", children: [
+                node("AXGroup", children: [
+                    node("AXLink", [titleLabel], url: "music-application://desktop/track?trackId=42", children: [
+                        node("AXStaticText", value: visibleTitle),
+                    ]),
+                    node("AXStaticText", value: " (Live)"),
+                ]),
+                node("AXGroup", children: artists),
+                node("AXButton", ["Previous song"]), node("AXButton", ["Next song"]),
+                node("AXCheckBox", ["Like"], value: "1"),
+            ])
+        }
+        let linkedArtists = [
+            node("AXLink", ["Artist Artist A"], url: "music-application://desktop/artist?artistId=1", children: [
+                node("AXStaticText", value: "Artist A"),
+            ]),
+            node("AXStaticText", value: ", "),
+            node("AXLink", ["Artist Artist B"], url: "music-application://desktop/artist?artistId=2", children: [
+                node("AXStaticText", value: "Artist B"),
+            ]),
+        ]
+        let staticArtists = [
+            node("AXStaticText", value: "Artist A"), node("AXStaticText", value: ", "),
+            node("AXStaticText", value: "Artist B"),
+        ]
+        let linked = bar(artists: linkedArtists)
+        let parsed = YandexAccessibilityMetadata(root: linked)
+        expect(parsed?.title == target.title, "The ARIA version replaced MediaSession's visible base title")
+        expect(parsed?.artist == target.artist, "Separate artist links did not retain the complete ordered artist list")
+        expect(parsed?.isFavorite == true, "Versioned multiartist metadata lost its explicit favorite value")
+        expect(target.matches(root: linked), "A versioned title and separate artist links rejected the actual current track")
+        let plain = bar(artists: staticArtists)
+        expect(YandexAccessibilityMetadata(root: plain)?.title == target.title,
+               "A plain artist group prevented reading the visible base title")
+        expect(target.matches(root: plain), "A complete plain artist group was mistaken for a missing single-string artist")
+        let mixed = bar(artists: [linkedArtists[0], node("AXStaticText", value: ", "), node("AXStaticText", value: "Artist B")])
+        expect(target.matches(root: mixed), "A complete artist list split between a link and plain text was rejected")
+        expect(!YandexFavoriteTarget(trackID: nil, title: target.title, artist: "Artist A").matches(root: mixed),
+               "Partial linked metadata overrode a complete mixed artist list")
+        expect(!YandexFavoriteTarget(trackID: nil, title: target.title, artist: "Artist A").matches(root: linked),
+               "The first artist of a linked list authorized the whole multiartist recording")
+        expect(!target.matches(root: bar(artists: [linkedArtists[0], node("AXStaticText", value: ", "),
+                                                  node("AXStaticText", value: "Other artist")])),
+               "Partial linked metadata hid a conflicting plain-text collaborator")
+        expect(target.matches(root: bar(artists: staticArtists, titleLabel: "Трек Fixture song (Live)")),
+               "A localized versioned ARIA label replaced the visible base title")
+        expect(!target.matches(root: bar(artists: [])), "Missing artist evidence authorized a favorite action")
+        expect(!target.matches(root: bar(artists: [node("AXStaticText", value: "Artist A")])),
+               "A partial artist list authorized a multiartist favorite action")
+        expect(!target.matches(root: bar(artists: [
+            node("AXStaticText", value: "Artist A"), node("AXStaticText", value: ", "),
+            node("AXStaticText", value: "Artist…"),
+        ])), "A truncated artist list authorized a favorite action")
+        expect(!target.matches(root: bar(artists: [node("AXStaticText", value: "Other artist")])),
+               "The same title from another artist authorized a favorite action")
+        let conflictingTitle = bar(artists: linkedArtists, visibleTitle: "Another song")
+        expect(YandexAccessibilityMetadata(root: conflictingTitle)?.title == "Another song",
+               "A stale versioned ARIA label overrode the current visible base title")
+        expect(!target.matches(root: conflictingTitle), "A previous versioned ARIA title authorized a different visible track")
+        expect(!YandexFavoriteTarget(trackID: nil, title: "Fixture", artist: target.artist).matches(root: plain),
+               "A title substring authorized a favorite action")
+        expect(!YandexFavoriteTarget(trackID: nil, title: target.title, artist: "Artist A").matches(root: plain),
+               "A subset of the complete visible artist group authorized a favorite action")
+        let labelOnly = node("AXGroup", children: [
+            node("AXLink", ["Track Fixture song"], url: "music-application://desktop/track?trackId=42"),
+            node("AXLink", ["Artist Artist A"], url: "music-application://desktop/artist?artistId=1"),
+            node("AXLink", ["Artist Artist B"], url: "music-application://desktop/artist?artistId=2"),
+        ])
+        expect(YandexAccessibilityMetadata(root: labelOnly)?.title == target.title,
+               "A label-only track without child text lost its existing fallback")
+        expect(target.matches(root: labelOnly), "Label-only title/artist fallback no longer matches the current track")
+    }
+
     static func main() {
         for role in ["AXButton", "AXCheckBox"] {
             for label in ["Like", "Нравится", "Мне нравится", "Ұнайды", "Yoqadi"] {
@@ -195,6 +275,7 @@ private enum YandexFavoriteAXTests {
         expect(YandexLikeState.decodeAXValue(nil) == nil, "Absent AX value was guessed")
         entityRoutes()
         targetMatching()
+        nativePlayerIdentity()
         // The native player can expose only an album link and plain title/artist text.
         // This exact shape was read from the live bottom transport bar, without account mutation.
         let plainTarget = YandexFavoriteTarget(trackID: "42", title: "Fixture song", artist: "Fixture artist")

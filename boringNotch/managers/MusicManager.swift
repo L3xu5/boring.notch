@@ -119,9 +119,16 @@ class MusicManager: ObservableObject {
     private func startSelectedSource() {
         guard !MediaExecutionMode.isIsolatedPreview else { return }
         initializationTask?.cancel(); initializationTask = nil
+        let preferredType = Defaults[.mediaController]
+        if activeController != nil, selectedSource != resolvedControllerType(preferredType) {
+            // The requested source changes now, not when an optional bridge probe finishes.
+            // Invalidate commands and observations before awaiting that probe so an old AX
+            // lookup cannot still press the previous player's controls during the transition.
+            clearActiveSource()
+        }
         // Probing follows an explicit source choice (or an existing user's saved choice).
         // Direct controllers do not need a generic bridge probe before they can start.
-        guard Defaults[.mediaController] == .nowPlaying, !bridgeChecked else {
+        guard preferredType == .nowPlaying, !bridgeChecked else {
             setActiveControllerBasedOnPreference(); return
         }
         initializationTask = Task { @MainActor [weak self, mediaChecker] in
@@ -134,6 +141,54 @@ class MusicManager: ObservableObject {
             self.bridgeChecked = true
             self.setActiveControllerBasedOnPreference()
         }
+    }
+
+    private func resolvedControllerType(_ preferredType: MediaControllerType) -> MediaControllerType {
+        isNowPlayingDeprecated && preferredType == .nowPlaying ? .appleMusic : preferredType
+    }
+
+    private func clearActiveSource() {
+        cancelMediaKeyRecovery()
+        commandTasks.values.forEach { $0.cancel() }; commandTasks.removeAll()
+        controllerCancellables.removeAll()
+        activeController?.stop()
+        activeController = nil
+        selectedSource = nil
+        cancelLyricsFetch()
+        artworkPresentation?.setImage(defaultImage)
+        debounceIdleTask?.cancel(); debounceIdleTask = nil
+        flipWorkItem?.cancel(); flipWorkItem = nil
+        transitionWorkItem?.cancel(); transitionWorkItem = nil
+        presentationSnapshot = nil
+        nativeTrackID = nil
+        songTitle = ""
+        artistName = ""
+        album = ""
+        bundleIdentifier = nil
+        isPlaying = false
+        isPlayerIdle = true
+        songDuration = 0
+        elapsedTime = 0
+        timestampDate = Date()
+        playbackRate = 1
+        isShuffled = false
+        repeatMode = .off
+        volume = 0.5
+        volumeControlSupported = false
+        mediaCapabilities = .init(volume: false, favorite: false, dislike: false,
+                                  seek: false, shuffle: false, repeatMode: false)
+        canFavoriteTrack = false
+        canDislikeTrack = false
+        isFavoriteStateKnown = false
+        isFavoriteTrack = false
+        albumArt = defaultImage
+        usingAppIconForArtwork = false
+        avgColor = .white
+        currentLyrics = ""
+        syncedLyrics = []
+        isFetchingLyrics = false
+        isFlipping = false
+        isTransitioning = false
     }
 
 
@@ -224,9 +279,7 @@ class MusicManager: ObservableObject {
         print("Preferred Media Controller: \(preferredType)")
 
         // If NowPlaying is deprecated but that's the preference, use Apple Music instead
-        let controllerType = (self.isNowPlayingDeprecated && preferredType == .nowPlaying)
-            ? .appleMusic
-            : preferredType
+        let controllerType = resolvedControllerType(preferredType)
 
         guard activeController == nil || selectedSource != controllerType else { return }
         if let controller = createController(for: controllerType) {

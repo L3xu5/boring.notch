@@ -52,7 +52,7 @@ struct YandexFavoriteTarget: Sendable {
         visit(root)
         let ids = Set(nodes.filter { $0.role == "AXLink" }.compactMap { $0.url.flatMap { YandexAccessibilityMetadata.entityID(in: $0, kind: "track") } })
         if let trackID, !ids.isEmpty { return ids == [trackID] }
-        if let metadata = YandexAccessibilityMetadata(root: root), matches(metadata) { return true }
+        let metadata = YandexAccessibilityMetadata(root: root)
         let title = normalized(title), artist = normalized(artist)
         guard !title.isEmpty, !artist.isEmpty, ids.count <= 1 else { return false }
         let texts = Set(nodes.filter { node in
@@ -62,13 +62,32 @@ struct YandexFavoriteTarget: Sendable {
             return YandexAccessibilityMetadata.entityID(in: url, kind: "track") != nil
                 || YandexAccessibilityMetadata.entityID(in: url, kind: "artist") != nil
         }.flatMap { $0.labels + [$0.value].compactMap { $0 } }.map(normalized))
-        return texts.contains(title) && texts.contains(artist)
+        func isArtistTextGroup(_ node: YandexAccessibilityNode) -> Bool {
+            switch node.role {
+            case "AXStaticText": return true
+            case "AXGroup": return !node.children.isEmpty && node.children.allSatisfy(isArtistTextGroup)
+            case "AXLink": return node.url.flatMap { YandexAccessibilityMetadata.entityID(in: $0, kind: "artist") } != nil
+            default: return false
+            }
+        }
+        // An artist list is rendered as separate names and comma spans. Compare the complete
+        // list so the first name alone cannot authorize a different recording with collaborators.
+        let completeArtistLists = nodes.filter {
+            $0.role == "AXGroup" && isArtistTextGroup($0)
+                && $0.renderedTexts.contains { $0.trimmingCharacters(in: .whitespacesAndNewlines) == "," }
+        }.map { normalized($0.renderedTexts.joined(separator: " ")) }
+        let linkedArtists = metadata.map { normalized($0.artist) }
+        let artistMatches: Bool
+        if !completeArtistLists.isEmpty { artistMatches = completeArtistLists.contains(artist) }
+        else if let linkedArtists, !linkedArtists.isEmpty { artistMatches = linkedArtists == artist }
+        else { artistMatches = texts.contains(artist) }
+        return (texts.contains(title) || metadata.map { normalized($0.title) } == title) && artistMatches
     }
 
     func matches(_ metadata: YandexAccessibilityMetadata) -> Bool {
         if let trackID, let observedID = metadata.trackID { return trackID == observedID }
-        return !title.isEmpty && normalized(title) == normalized(metadata.title)
-            && normalized(artist) == normalized(metadata.artist)
+        return !normalized(title).isEmpty && !normalized(artist).isEmpty
+            && normalized(title) == normalized(metadata.title) && normalized(artist) == normalized(metadata.artist)
     }
 }
 
@@ -88,6 +107,16 @@ struct YandexAccessibilityNode: Decodable, Sendable {
     let value: String?
     let url: URL?
     let children: [YandexAccessibilityNode]
+
+    /// Chromium keeps the base title, version and individual artist names in separate spans.
+    /// Read visible text in DOM order, without adding ARIA action prefixes a second time.
+    var renderedTexts: [String] {
+        if role == "AXStaticText" {
+            if let value, !value.isEmpty { return [value] }
+            return labels.first.map { [$0] } ?? []
+        }
+        return children.flatMap(\.renderedTexts)
+    }
 }
 
 /// A toggle's label describes the action in both states. Only its explicit AX value
@@ -146,7 +175,9 @@ struct YandexAccessibilityMetadata: Sendable {
             node.role == "AXLink" && ((node.url.flatMap { Self.entityID(in: $0, kind: "track") } != nil)
                 || node.labels.contains { $0.lowercased().hasPrefix("track ") || $0.lowercased().hasPrefix("трек ") })
         }
-        let titles = tracks.map { text($0, prefixes: ["track ", "трек "]) }.filter { !$0.isEmpty }
+        // Yandex's track-link ARIA label includes the recording version, while MediaSession
+        // publishes the base title. Its first visible text span contains that same base title.
+        let titles = tracks.map { $0.renderedTexts.first ?? text($0, prefixes: ["track ", "трек "]) }.filter { !$0.isEmpty }
         // A whole library/list is not the persistent player bar. Never borrow a random row's title.
         let trackPaths = Set(tracks.compactMap { $0.url.flatMap { Self.entityID(in: $0, kind: "track") } })
         guard let title = titles.first, Set(titles).count == 1, trackPaths.count <= 1 else { return nil }

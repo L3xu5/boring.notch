@@ -79,6 +79,14 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     private var favoriteStateKnown = false
     private var favoriteReadRevision: UInt = 0
     private var favoriteActionInFlight: UUID?
+    private var favoriteQueueTail: Task<Void, Never>?
+    private var favoriteQueueTailID: UUID?
+    private enum FavoriteCommand { case toggle, set(Bool), dislike }
+    private struct FavoriteCommandRequest {
+        let source: UUID
+        let lifetime: UUID
+        let item: MediaItemIdentity
+    }
     private struct FavoriteReadRequest {
         let source: UUID
         let lifetime: UUID
@@ -143,6 +151,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     private func handleYandexTerminated() {
         guard !stopped else { return }
         sourceLifetime.invalidate(); favoriteLifetime.invalidate(); transportLifetime.invalidate()
+        invalidateFavoriteQueue()
         favoriteActionInFlight = nil
         sessionIsYandex = false
         wire.reset()
@@ -167,9 +176,11 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         adapter.stop()
         accessibilityTask?.cancel()
         accessibilityArtworkTask?.cancel()
+        favoriteQueueTail?.cancel()
     }
     func stop() {
         sourceLifetime.invalidate(); favoriteLifetime.invalidate(); transportLifetime.invalidate()
+        invalidateFavoriteQueue()
         favoriteActionInFlight = nil
         stopped = true
         sessionIsYandex = false
@@ -195,7 +206,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
                     let metadata = await reader.read(processIdentifier: pid)
                     guard !Task.isCancelled else { return }
                     var scopedFavorite: Bool?
-                    if metadata == nil, self?.isCurrentFavoriteRead(favorite) == true {
+                    if self?.needsScopedFavorite(metadata, request: favorite) == true {
                         scopedFavorite = await reader.favoriteState(processIdentifier: pid,
                             expectedTrack: Self.favoriteTarget(favorite.item))
                         guard !Task.isCancelled else { return }
@@ -234,7 +245,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         let metadata = await reader.read(processIdentifier: pid)
         guard !Task.isCancelled else { return }
         var scopedFavorite: Bool?
-        if metadata == nil, isCurrentFavoriteRead(favorite) {
+        if needsScopedFavorite(metadata, request: favorite) {
             scopedFavorite = await reader.favoriteState(processIdentifier: pid, expectedTrack: Self.favoriteTarget(favorite.item))
             guard !Task.isCancelled else { return }
         }
@@ -247,11 +258,10 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
               isCurrentFavoriteRead(favorite) else { return }
         if let metadata {
             if !sessionIsYandex { applyAccessibilityMetadata(metadata, generation: generation) }
-            _ = reconcileFavoriteObservation(metadata, request: favorite)
-        } else {
-            clearAccessibilityObservations(generation: generation)
-            publishFavoriteObservation(scopedFavorite)
-        }
+        } else { clearAccessibilityObservations(generation: generation) }
+        guard isCurrentFavoriteRead(favorite) else { return }
+        let metadataFavorite = metadata.flatMap { metadataMatchesCurrentTrack($0) ? $0.isFavorite : nil }
+        publishFavoriteObservation(metadataFavorite ?? scopedFavorite)
     }
 
     @MainActor
@@ -266,13 +276,20 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         guard !stopped, !Task.isCancelled, !sessionIsYandex, generation == accessibilityGeneration else { return }
         accessibilityMetadataLastReadAt = Date()
         accessibilityIsPlaying = metadata.isPlaying
-        let trackChanged = metadata.title != playbackState.title || metadata.artist != playbackState.artist
-            || (metadata.trackID != nil && accessibilityTrackID != nil && metadata.trackID != accessibilityTrackID)
+        let trackIDChanged: Bool
+        if let currentID = playbackState.nativeTrackID ?? accessibilityTrackID, let observedID = metadata.trackID {
+            trackIDChanged = currentID != observedID
+        } else { trackIDChanged = false }
+        // A renderer can expose the current title but omit its artist links. Missing data for
+        // the same title must not erase the identity that a scoped favorite read just verified.
+        let artist = metadata.artist.isEmpty && metadata.title == playbackState.title && !trackIDChanged
+            ? playbackState.artist : metadata.artist
+        let trackChanged = metadata.title != playbackState.title || artist != playbackState.artist || trackIDChanged
         accessibilityTrackID = metadata.trackID
         var state = playbackState
         state.nativeTrackID = metadata.trackID
         state.title = metadata.title
-        state.artist = metadata.artist
+        state.artist = artist
         state.album = metadata.album.isEmpty && !trackChanged ? state.album : metadata.album
         if let playing = metadata.isPlaying {
             if state.isPlaying {
@@ -294,6 +311,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         }
         if state.identity != playbackState.identity {
             favoriteLifetime.invalidate()
+            invalidateFavoriteQueue()
             favoriteActionInFlight = nil
             favoriteReadRevision &+= 1
             favoriteStateKnown = false
@@ -477,42 +495,16 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     /// A user click requests one press of the current player's toggle. Its pressed state may
     /// be unreadable; that must not disable the action or turn the click into an assumed "set".
     func toggleFavorite() async {
-        let action = beginFavoriteAction()
-        defer { finishFavoriteAction(action) }
-        let ticket = sourceLifetime.ticket(), item = playbackState.identity
-        let favoriteTicket = favoriteLifetime.ticket()
-        guard isCurrentCommand(ticket) else { return }
-        let performed = await performFavoriteAction(item: item, sourceTicket: ticket, favoriteTicket: favoriteTicket)
-        guard isCurrentCommand(ticket), favoriteLifetime.isCurrent(favoriteTicket), playbackState.identity == item else { return }
-        guard performed else { return }
-        clearFavoriteObservation()
-        do { try await Task.sleep(for: .milliseconds(200)) } catch { return }
-        guard isCurrentCommand(ticket), favoriteLifetime.isCurrent(favoriteTicket), playbackState.identity == item else { return }
-        await refreshFavoriteState()
+        guard let queued = enqueueFavoriteCommand(.toggle) else { return }
+        await Self.waitForFavoriteCommand(queued)
     }
 
     // Honors the requested target state: a blind press would mis-toggle when the track is
     // already in the requested state (the protocol contract is "set", not "toggle").
     @MainActor
     func setFavorite(_ favorite: Bool) async {
-        let action = beginFavoriteAction()
-        defer { finishFavoriteAction(action) }
-        let ticket = sourceLifetime.ticket(), item = playbackState.identity
-        let favoriteTicket = favoriteLifetime.ticket()
-        guard isCurrentCommand(ticket) else { return }
-        let current = await readLikeState()
-        guard isCurrentCommand(ticket), favoriteLifetime.isCurrent(favoriteTicket), playbackState.identity == item else { return }
-        // A missing or previous-track control cannot safely implement a requested target state.
-        // A blind toggle here could remove a like when the user asked to add it.
-        guard let current else { return }
-        if current == favorite { return }
-        let performed = await performFavoriteAction(item: item, desiredState: favorite, sourceTicket: ticket, favoriteTicket: favoriteTicket)
-        guard isCurrentCommand(ticket), favoriteLifetime.isCurrent(favoriteTicket), playbackState.identity == item else { return }
-        guard performed else { return }
-        clearFavoriteObservation()
-        do { try await Task.sleep(for: .milliseconds(200)) } catch { return }
-        guard isCurrentCommand(ticket), favoriteLifetime.isCurrent(favoriteTicket), playbackState.identity == item else { return }
-        await refreshFavoriteState()
+        guard let queued = enqueueFavoriteCommand(.set(favorite)) else { return }
+        await Self.waitForFavoriteCommand(queued)
     }
     @MainActor
     private func refreshFavoriteState() async {
@@ -520,17 +512,71 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     }
     @MainActor
     func dislike() async {
+        guard let queued = enqueueFavoriteCommand(.dislike) else { return }
+        await Self.waitForFavoriteCommand(queued)
+    }
+
+    private func enqueueFavoriteCommand(_ command: FavoriteCommand) -> Task<Void, Never>? {
+        guard !stopped, !Task.isCancelled else { return nil }
+        let request = FavoriteCommandRequest(source: sourceLifetime.ticket(), lifetime: favoriteLifetime.ticket(),
+                                             item: playbackState.identity)
+        let previous = favoriteQueueTail, id = UUID()
+        let queued = Task { @MainActor [weak self] in
+            defer { self?.finishFavoriteQueueEntry(id) }
+            // Waiting commands retain only the preceding task and value request, never their source.
+            await previous?.value
+            guard !Task.isCancelled else { return }
+            await self?.executeFavoriteCommand(command, request: request)
+        }
+        favoriteQueueTail = queued
+        favoriteQueueTailID = id
+        return queued
+    }
+
+    private static func waitForFavoriteCommand(_ queued: Task<Void, Never>) async {
+        await withTaskCancellationHandler { await queued.value } onCancel: { queued.cancel() }
+    }
+
+    private func finishFavoriteQueueEntry(_ id: UUID) {
+        if favoriteQueueTailID == id {
+            favoriteQueueTail = nil
+            favoriteQueueTailID = nil
+        }
+    }
+
+    private func invalidateFavoriteQueue() {
+        favoriteQueueTail?.cancel()
+        favoriteQueueTail = nil
+        favoriteQueueTailID = nil
+    }
+
+    private func isCurrentFavoriteCommand(_ request: FavoriteCommandRequest) -> Bool {
+        isCurrentCommand(request.source) && favoriteLifetime.isCurrent(request.lifetime)
+            && playbackState.identity == request.item
+    }
+
+    private func executeFavoriteCommand(_ command: FavoriteCommand, request: FavoriteCommandRequest) async {
+        guard isCurrentFavoriteCommand(request) else { return }
         let action = beginFavoriteAction()
         defer { finishFavoriteAction(action) }
-        let ticket = sourceLifetime.ticket(), item = playbackState.identity
-        let favoriteTicket = favoriteLifetime.ticket()
-        guard isCurrentCommand(ticket) else { return }
-        let performed = await performPlayerAction(.dislike, sourceTicket: ticket, favoriteTicket: favoriteTicket)
-        guard isCurrentCommand(ticket), favoriteLifetime.isCurrent(favoriteTicket), playbackState.identity == item else { return }
+        let performed: Bool
+        switch command {
+        case .toggle:
+            performed = await performFavoriteAction(item: request.item, sourceTicket: request.source, favoriteTicket: request.lifetime)
+        case .set(let favorite):
+            let current = await readLikeState()
+            guard isCurrentFavoriteCommand(request), let current else { return }
+            if current == favorite { return }
+            performed = await performFavoriteAction(item: request.item, desiredState: favorite,
+                                                     sourceTicket: request.source, favoriteTicket: request.lifetime)
+        case .dislike:
+            performed = await performPlayerAction(.dislike, sourceTicket: request.source, favoriteTicket: request.lifetime)
+        }
+        guard isCurrentFavoriteCommand(request) else { return }
         guard performed else { return }
         clearFavoriteObservation()
         do { try await Task.sleep(for: .milliseconds(200)) } catch { return }
-        guard isCurrentCommand(ticket), favoriteLifetime.isCurrent(favoriteTicket), playbackState.identity == item else { return }
+        guard isCurrentFavoriteCommand(request) else { return }
         await refreshFavoriteState()
     }
 
@@ -545,6 +591,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     private func resetAdapterState() {
         transportLifetime.invalidate()
         favoriteLifetime.invalidate()
+        invalidateFavoriteQueue()
         favoriteActionInFlight = nil
         clearFavoriteObservation()
         wire.reset(); sessionIsYandex = false
@@ -603,7 +650,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     }
 
     private func beginFavoriteAction() -> UUID {
-        favoriteLifetime.invalidate()
+        favoriteReadRevision &+= 1
         let action = UUID()
         favoriteActionInFlight = action
         return action
@@ -624,18 +671,17 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         // Both IDs come from trusted Yandex track links, rather than opaque MediaRemote IDs.
         // A partial/localized artist label must not defeat an exact recording match.
         if let currentID = state.nativeTrackID, let observedID = metadata.trackID { return currentID == observedID }
-        guard !state.title.isEmpty, MediaText.normalized(metadata.title) == MediaText.normalized(state.title),
-              MediaText.normalized(metadata.artist) == MediaText.normalized(state.artist) else { return false }
+        let title = MediaText.normalized(state.title), artist = MediaText.normalized(state.artist)
+        guard !title.isEmpty, !artist.isEmpty, MediaText.normalized(metadata.title) == title,
+              MediaText.normalized(metadata.artist) == artist else { return false }
         if !state.album.isEmpty, !metadata.album.isEmpty, state.album != metadata.album { return false }
         return true
     }
 
-    @discardableResult
-    private func reconcileFavoriteObservation(_ metadata: YandexAccessibilityMetadata?, request: FavoriteReadRequest) -> Bool? {
-        guard isCurrentFavoriteRead(request) else { return nil }
-        let liked = metadata.flatMap { metadataMatchesCurrentTrack($0) ? $0.isFavorite : nil }
-        publishFavoriteObservation(liked)
-        return liked
+    private func needsScopedFavorite(_ metadata: YandexAccessibilityMetadata?, request: FavoriteReadRequest) -> Bool {
+        guard isCurrentFavoriteRead(request) else { return false }
+        guard let metadata else { return true }
+        return metadata.isFavorite == nil || !metadataMatchesCurrentTrack(metadata)
     }
 
     private func publishFavoriteObservation(_ liked: Bool?) {
@@ -701,9 +747,8 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
             || previousForeignActivity != lastForeignMediaActivity { transportLifetime.invalidate() }
         sessionIsYandex = (parent ?? payload.string("bundleIdentifier")) == Self.bundleID
         if sessionIsYandex != wasYandex {
-            favoriteLifetime.invalidate()
-            favoriteActionInFlight = nil
-            clearFavoriteObservation()
+            // This only changes which metadata stream is authoritative. Directed AX favorite
+            // commands still target the same Yandex track and retain their own lifetime ticket.
             accessibilityGeneration &+= 1
             accessibilityIsPlaying = nil
             accessibilityMetadataLastReadAt = nil
@@ -722,6 +767,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         let trackChanged = newState.identity != playbackState.identity
         if trackChanged {
             favoriteLifetime.invalidate()
+            invalidateFavoriteQueue()
             favoriteActionInFlight = nil
             favoriteReadRevision &+= 1
             favoriteStateKnown = false
