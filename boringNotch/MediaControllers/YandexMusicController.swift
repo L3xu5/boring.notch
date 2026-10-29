@@ -78,6 +78,16 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     private let favoriteLifetime = YandexCommandLifetime()
     private let transportLifetime = YandexCommandLifetime()
     private var favoriteStateKnown = false
+    private struct FavoriteEvidence {
+        let id = UUID()
+        let source: UUID
+        let lifetime: UUID
+        let item: MediaItemIdentity
+        let processIdentifier: pid_t
+        let observedAt: TimeInterval
+    }
+    private var favoriteEvidence: FavoriteEvidence?
+    private var favoriteEvidenceExpiryTask: Task<Void, Never>?
     private var favoriteReadRevision: UInt = 0
     private var favoriteActionInFlight: UUID?
     private var favoriteQueueTail: Task<Void, Never>?
@@ -93,6 +103,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         let lifetime: UUID
         let item: MediaItemIdentity
         let revision: UInt
+        let processIdentifier: pid_t
     }
     private var accessibilityTask: Task<Void, Never>?
     private var playbackTask: Task<Void, Never>?
@@ -241,6 +252,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         stopped.lastUpdated = now
         stopped.isPlaying = false
         stopped.playbackRate = 0
+        invalidateFavoriteEvidence()
         favoriteStateKnown = false
         favoriteReadRevision &+= 1
         stopped.isFavorite = false
@@ -256,6 +268,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         accessibilityArtworkTask?.cancel()
         artworkSnapshotTask?.cancel()
         favoriteQueueTail?.cancel()
+        favoriteEvidenceExpiryTask?.cancel()
     }
     func stop() {
         sourceLifetime.invalidate(); favoriteLifetime.invalidate(); transportLifetime.invalidate()
@@ -382,13 +395,13 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         // A user command owns its pre-read, press and verification. A passive refresh must not
         // supersede that read revision and silently turn a valid click into an unknown state.
         guard !stopped, !Task.isCancelled, favoriteActionInFlight == nil else { return nil }
-        guard let pid = currentProcessIdentifier() else {
+        guard let pid = observeProcessPresence() else {
             clearFavoriteObservation()
             return nil
         }
         // The worker performs the no-prompt AX trust check. Reading the same bounded player-bar
         // snapshot also reconciles likes when Yandex owns MediaRemote, without replacing its metadata.
-        return (accessibilityReader, pid, accessibilityGeneration, beginFavoriteRead())
+        return (accessibilityReader, pid, accessibilityGeneration, beginFavoriteRead(processIdentifier: pid))
     }
 
     /// A fresh, read-only AX sample for callers that need evidence about the actual Yandex player.
@@ -408,14 +421,28 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
 
     private func receiveAccessibilitySnapshot(_ metadata: YandexAccessibilityMetadata?, scopedFavorite: Bool?, generation: UInt,
                                               favorite: FavoriteReadRequest) {
+        if !stopped, currentProcessIdentifier() != favorite.processIdentifier {
+            _ = observeProcessPresence()
+            return
+        }
         guard !stopped, !Task.isCancelled, generation == accessibilityGeneration,
               isCurrentFavoriteRead(favorite) else { return }
         if let metadata {
             if !sessionIsYandex { applyAccessibilityMetadata(metadata, generation: generation) }
         }
-        guard isCurrentFavoriteRead(favorite) else { return }
+        if !isCurrentFavoriteRead(favorite) {
+            // Applying this exact AX snapshot may establish a new track or trusted ID.
+            // Only its own matched Like belongs to that new item; the scoped read above
+            // was requested for the old item and must never be transferred to it.
+            if !sessionIsYandex, isCurrentCommand(favorite.source), generation == accessibilityGeneration,
+               currentProcessIdentifier() == favorite.processIdentifier,
+               let metadata, metadataMatchesCurrentTrack(metadata), let liked = metadata.isFavorite {
+                reconcileFavoriteObservation(liked, processIdentifier: favorite.processIdentifier)
+            }
+            return
+        }
         let metadataFavorite = metadata.flatMap { metadataMatchesCurrentTrack($0) ? $0.isFavorite : nil }
-        publishFavoriteObservation(metadataFavorite ?? scopedFavorite)
+        reconcileFavoriteObservation(metadataFavorite ?? scopedFavorite, processIdentifier: favorite.processIdentifier)
     }
 
     @MainActor
@@ -430,9 +457,16 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         let artist = metadata.artist.isEmpty && metadata.title == playbackState.title && !trackIDChanged
             ? playbackState.artist : metadata.artist
         let trackChanged = metadata.title != playbackState.title || artist != playbackState.artist || trackIDChanged
-        accessibilityTrackID = metadata.trackID
+        let sameCompleteText = !MediaText.normalized(metadata.title).isEmpty
+            && !MediaText.normalized(metadata.artist).isEmpty
+            && MediaText.normalized(metadata.title) == MediaText.normalized(playbackState.title)
+            && MediaText.normalized(metadata.artist) == MediaText.normalized(playbackState.artist)
+            && (metadata.album.isEmpty || playbackState.album.isEmpty
+                || MediaText.normalized(metadata.album) == MediaText.normalized(playbackState.album))
+        let retainedID = !trackChanged && sameCompleteText ? playbackState.nativeTrackID ?? accessibilityTrackID : nil
+        accessibilityTrackID = metadata.trackID ?? retainedID
         var state = playbackState
-        state.nativeTrackID = metadata.trackID
+        state.nativeTrackID = metadata.trackID ?? retainedID
         state.title = metadata.title
         state.artist = artist
         state.album = metadata.album.isEmpty && !trackChanged ? state.album : metadata.album
@@ -457,6 +491,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
             invalidateFavoriteQueue()
             favoriteActionInFlight = nil
             favoriteReadRevision &+= 1
+            invalidateFavoriteEvidence()
             favoriteStateKnown = false
             state.isFavorite = false
         }
@@ -804,22 +839,26 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     }
     private func readLikeState() async -> Bool? {
         guard !stopped, !Task.isCancelled else { return nil }
-        guard let pid = currentProcessIdentifier() else { clearFavoriteObservation(); return nil }
-        let request = beginFavoriteRead()
+        guard let pid = observeProcessPresence() else { clearFavoriteObservation(); return nil }
+        let request = beginFavoriteRead(processIdentifier: pid)
         let liked = await accessibilityReader.favoriteState(processIdentifier: pid, expectedTrack: Self.favoriteTarget(request.item))
+        if !stopped, currentProcessIdentifier() != request.processIdentifier {
+            _ = observeProcessPresence()
+            return nil
+        }
         guard isCurrentFavoriteRead(request) else { return nil }
-        publishFavoriteObservation(liked)
+        reconcileFavoriteObservation(liked, processIdentifier: pid)
         return liked
     }
 
-    private func beginFavoriteRead() -> FavoriteReadRequest {
+    private func beginFavoriteRead(processIdentifier: pid_t) -> FavoriteReadRequest {
         favoriteReadRevision &+= 1
         return .init(source: sourceLifetime.ticket(), lifetime: favoriteLifetime.ticket(),
-                     item: playbackState.identity, revision: favoriteReadRevision)
+                     item: playbackState.identity, revision: favoriteReadRevision, processIdentifier: processIdentifier)
     }
 
     private func beginFavoriteAction() -> UUID {
-        favoriteReadRevision &+= 1
+        clearFavoriteObservation()
         let action = UUID()
         favoriteActionInFlight = action
         return action
@@ -833,6 +872,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     private func isCurrentFavoriteRead(_ request: FavoriteReadRequest) -> Bool {
         isCurrentCommand(request.source) && favoriteLifetime.isCurrent(request.lifetime)
             && request.revision == favoriteReadRevision && request.item == playbackState.identity
+            && currentProcessIdentifier() == request.processIdentifier
     }
 
     private func metadataMatchesCurrentTrack(_ metadata: YandexAccessibilityMetadata) -> Bool {
@@ -865,7 +905,54 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
 
     private func clearFavoriteObservation() {
         favoriteReadRevision &+= 1
+        invalidateFavoriteEvidence()
         publishFavoriteObservation(nil)
+    }
+
+    private func invalidateFavoriteEvidence() {
+        favoriteEvidence = nil
+        favoriteEvidenceExpiryTask?.cancel()
+        favoriteEvidenceExpiryTask = nil
+    }
+
+    private func reconcileFavoriteObservation(_ liked: Bool?, processIdentifier: pid_t) {
+        if let liked {
+            invalidateFavoriteEvidence()
+            favoriteEvidence = .init(source: sourceLifetime.ticket(), lifetime: favoriteLifetime.ticket(),
+                item: playbackState.identity, processIdentifier: processIdentifier, observedAt: metadataClock())
+            publishFavoriteObservation(liked)
+            return
+        }
+        guard let evidence = favoriteEvidence, isCurrentFavoriteEvidence(evidence) else {
+            invalidateFavoriteEvidence()
+            publishFavoriteObservation(nil)
+            return
+        }
+        scheduleFavoriteEvidenceExpiry(evidence)
+    }
+
+    private func isCurrentFavoriteEvidence(_ evidence: FavoriteEvidence) -> Bool {
+        let age = metadataClock() - evidence.observedAt
+        return !stopped && sourceLifetime.isCurrent(evidence.source) && favoriteLifetime.isCurrent(evidence.lifetime)
+            && evidence.item == playbackState.identity && currentProcessIdentifier() == evidence.processIdentifier
+            && age >= 0 && age < 3
+    }
+
+    private func scheduleFavoriteEvidenceExpiry(_ evidence: FavoriteEvidence) {
+        guard favoriteEvidenceExpiryTask == nil else { return }
+        let remaining = max(0, 3 - (metadataClock() - evidence.observedAt))
+        favoriteEvidenceExpiryTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(remaining)) } catch { return }
+            guard !Task.isCancelled else { return }
+            self?.expireFavoriteEvidence(evidence.id)
+        }
+    }
+
+    private func expireFavoriteEvidence(_ id: UUID) {
+        guard let evidence = favoriteEvidence, evidence.id == id else { return }
+        favoriteEvidenceExpiryTask = nil
+        if isCurrentFavoriteEvidence(evidence) { scheduleFavoriteEvidenceExpiry(evidence) }
+        else { clearFavoriteObservation() }
     }
 
     private func recordAXMetadataAuthority(_ state: PlaybackState) {
@@ -971,6 +1058,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
             invalidateFavoriteQueue()
             favoriteActionInFlight = nil
             favoriteReadRevision &+= 1
+            invalidateFavoriteEvidence()
             favoriteStateKnown = false
             state.isFavorite = false
             transportLifetime.invalidate()
@@ -1140,6 +1228,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
             invalidateFavoriteQueue()
             favoriteActionInFlight = nil
             favoriteReadRevision &+= 1
+            invalidateFavoriteEvidence()
             favoriteStateKnown = false
         }
         if trackChanged || newState.isPlaying != playbackState.isPlaying { transportLifetime.invalidate() }
