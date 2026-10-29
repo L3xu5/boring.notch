@@ -66,6 +66,8 @@ Playback, like and dislike commands target Yandex's own accessible player button
 
 The animation reads playback independently of track metadata and likes. With a closed window, Yandex desktop 5.124.1 exposes its playback-owned Electron sleep assertion; a pause requires two seconds of consistent absence. This read-only check does not open the window, capture audio or change assertions. An unknown or failed query does not imply a pause.
 
+A confirmed pause freezes the current track's position even if the system still reports an advancing playing session. Explicit seeks remain available while Yandex owns Now Playing; the progress control reconciles their preview even while paused.
+
 Artwork is associated with the current track. A changed title clears the preceding cover while the replacement is decoded; shared covers remain in place. A bounded, read-only adapter snapshot can verify delayed artwork against the current source and track.
 
 Physical media keys always retain native macOS handling. Play/Pause recovery is limited to a proven unresponsive, paused foreign session, followed by fresh Yandex evidence and a final check before an AX action. Active or focused foreign players keep their native behavior. Configurable media shortcuts explicitly control the selected source.

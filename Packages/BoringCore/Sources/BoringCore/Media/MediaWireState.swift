@@ -65,12 +65,22 @@ public struct MediaWireState: Sendable {
             && (state.album.isEmpty || previous.album.isEmpty || state.album == previous.album)
             && (state.duration <= 0 || previous.duration <= 0 || abs(state.duration - previous.duration) <= 5)
         state.nativeTrackID = sameMetadata ? previous.nativeTrackID : nil
-        state.lastUpdated = patch.string("timestamp").flatMap(Self.date) ?? (diff ? previous.lastUpdated : now)
+        let timestamp = patch.string("timestamp").flatMap(Self.date)
+        let playing = payload.boolean("playing") ?? false
+        let rate = max(0, payload.number("playbackRate") ?? 1)
+        // A transport-only change has no new elapsed-time anchor. Integrate the old
+        // rate up to receipt before changing it, rather than replaying paused time
+        // from the previous anchor on resume. Position patches keep the adapter's
+        // timestamp contract, including its retained timestamp when none is sent.
+        let hasTransportPatch = patch["playing"] != nil || patch["playbackRate"] != nil
+        let reanchorTransport = diff && hasTransportPatch && timestamp == nil && patch["elapsedTime"] == nil
+            && (playing != previous.isPlaying || rate != previous.playbackRate)
+        state.lastUpdated = timestamp ?? (reanchorTransport ? now : (diff ? previous.lastUpdated : now))
         if let position = patch.number("elapsedTime") { state.currentTime = max(0, position) }
         else if !diff || patch["elapsedTime"] != nil { state.currentTime = 0 }
         else { state.currentTime = previous.timeline.position(at: state.lastUpdated) }
-        state.isPlaying = payload.boolean("playing") ?? false
-        state.playbackRate = max(0, payload.number("playbackRate") ?? 1)
+        state.isPlaying = playing
+        state.playbackRate = rate
         state.volume = min(1, max(0, payload.number("volume") ?? 0.5))
         if let shuffle = payload.number("shuffleMode") { state.isShuffled = shuffle != 1 }
         else if patch["shuffleMode"] != nil { state.isShuffled = false }

@@ -1177,6 +1177,207 @@ private struct YandexMetadataRegressionTests {
     }
 
     @MainActor
+    private static func pausedTimelineReconciliation() async throws {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        func seed(_ controller: YandexMusicController, playing: Bool = true, title: String = "Paused track") async throws {
+            try await controller.metadataTestUpdate(["bundleIdentifier": YandexMusicController.bundleID,
+                "title": title, "artist": "Artist", "album": "Album", "contentItemIdentifier": "item A",
+                "playing": playing, "playbackRate": playing ? 1.0 : 0.0, "elapsedTime": 40.0,
+                "timestamp": formatter.string(from: Date()), "duration": 240.0], diff: false)
+        }
+        for pauseSource in ["scoped playback", "accepted local pause", "unknown after scoped pause"] {
+            let client = SnapshotYandexAX(nil)
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await seed(controller)
+            if pauseSource == "accepted local pause" {
+                await client.setReceipt(true)
+                await controller.pause()
+            } else {
+                await client.setPlaybackState(false)
+                await controller.metadataTestRefreshPlaying()
+                if pauseSource == "unknown after scoped pause" {
+                    await client.setPlaybackState(nil)
+                    await controller.metadataTestRefreshPlaying()
+                }
+            }
+            let anchor = controller.playbackState
+            var observed: [PlaybackState] = []
+            let subscription = controller.playbackStatePublisher.sink { observed.append($0) }
+            for elapsed in [50.0, 60.0, 70.0] {
+                try await controller.metadataTestUpdate(["playing": true, "playbackRate": 1.0, "elapsedTime": elapsed,
+                    "timestamp": formatter.string(from: Date().addingTimeInterval(elapsed))])
+            }
+            try await controller.metadataTestUpdate(["timestamp": formatter.string(from: Date().addingTimeInterval(100))])
+            try expect(observed.allSatisfy { !$0.isPlaying && $0.playbackRate == 0
+                && $0.currentTime == anchor.currentTime && $0.lastUpdated == anchor.lastUpdated
+                && $0.timeline.position(at: anchor.lastUpdated.addingTimeInterval(120)) == anchor.currentTime },
+                "Stale MR elapsed/timestamp heartbeats moved the confirmed paused timeline (\(pauseSource))")
+            _ = subscription
+            controller.stop(); passed += 1
+            print("PASS paused timeline ignores cached playing MR anchors after \(pauseSource)")
+        }
+        do {
+            let client = SnapshotYandexAX(nil)
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 }, startMonitoring: false)!
+            try await seed(controller)
+            await client.setPlaybackState(false)
+            await controller.metadataTestRefreshPlaying()
+            try await controller.metadataTestUpdate(["playing": false, "playbackRate": 0.0, "elapsedTime": 45.0,
+                "timestamp": formatter.string(from: Date())])
+            try await controller.metadataTestUpdate(["elapsedTime": 120.0, "timestamp": formatter.string(from: Date())])
+            try expect(!controller.playbackState.isPlaying && controller.playbackState.currentTime == 120,
+                       "An acknowledged native pause blocked a real paused position/seek update")
+            try await controller.metadataTestUpdate(["playing": true, "playbackRate": 1.0, "elapsedTime": 120.0,
+                "timestamp": formatter.string(from: Date())])
+            let resumed = controller.playbackState
+            try expect(resumed.isPlaying && resumed.timeline.position(at: resumed.lastUpdated.addingTimeInterval(10)) == 130,
+                       "A fresh native resume could not replace a frozen scoped-pause anchor")
+            controller.stop(); passed += 1
+            print("PASS native pause acknowledgement permits paused seek and subsequent resume")
+        }
+        do {
+            let client = SnapshotYandexAX(nil)
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 }, startMonitoring: false)!
+            try await seed(controller)
+            await client.setPlaybackState(false)
+            await controller.metadataTestRefreshPlaying()
+            try await controller.metadataTestUpdate(["title": "Next track", "contentItemIdentifier": "item B", "elapsedTime": 0.0,
+                "timestamp": formatter.string(from: Date())])
+            try expect(!controller.playbackState.isPlaying && controller.playbackState.currentTime == 0,
+                       "A previous recording's paused anchor leaked into a new recording")
+            await client.setPlaybackState(true)
+            await controller.metadataTestRefreshPlaying()
+            try expect(controller.playbackState.isPlaying, "The new recording could not resume from fresh scoped evidence")
+            controller.stop(); passed += 1
+            print("PASS new recording resets a paused timeline and accepts fresh scoped playback")
+        }
+        do {
+            let client = SnapshotYandexAX(nil)
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 }, startMonitoring: false)!
+            try await seed(controller)
+            await client.setPlaybackState(false)
+            await controller.metadataTestRefreshPlaying()
+            let anchor = controller.playbackState
+            try await controller.metadataTestUpdate(["bundleIdentifier": "com.apple.Safari", "title": "Browser", "playing": true], diff: false)
+            try await seed(controller)
+            try await controller.metadataTestUpdate(["elapsedTime": 100.0, "timestamp": formatter.string(from: Date())])
+            try expect(!controller.playbackState.isPlaying && controller.playbackState.currentTime == anchor.currentTime,
+                       "Returning system ownership accepted a stale position over the same paused Yandex recording")
+            controller.stop(); passed += 1
+            print("PASS returning Yandex owner retains the same recording's confirmed paused anchor")
+        }
+        do {
+            let client = SnapshotYandexAX(nil)
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 }, startMonitoring: false)!
+            try await seed(controller)
+            await client.setPlaybackState(true)
+            await controller.metadataTestRefreshPlaying()
+            try await controller.metadataTestUpdate(["elapsedTime": 65.0, "timestamp": formatter.string(from: Date())])
+            try expect(controller.playbackState.isPlaying && controller.playbackState.currentTime == 65,
+                       "Paused-anchor protection suppressed genuine background playback position updates")
+            controller.stop(); passed += 1
+            print("PASS confirmed background playback continues accepting native positions")
+        }
+    }
+
+    @MainActor
+    private static func pausedSeekIntent() async throws {
+        func seed(_ controller: YandexMusicController, duration: Double = 180) async throws {
+            try await controller.metadataTestUpdate(["bundleIdentifier": YandexMusicController.bundleID,
+                "title": "Seek track", "artist": "Artist", "contentItemIdentifier": "item A",
+                "elapsedTime": 40.0, "duration": duration, "playing": true, "playbackRate": 1.0], diff: false)
+        }
+        for nativePaused in [false, true] {
+            let client = SnapshotYandexAX(nil)
+            var dispatched: [Double] = []
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 }, startMonitoring: false,
+                seekDispatcher: { dispatched.append($0) })!
+            try await seed(controller)
+            await client.setPlaybackState(false)
+            await controller.metadataTestRefreshPlaying()
+            if nativePaused { try await controller.metadataTestUpdate(["playing": false, "playbackRate": 0.0]) }
+            for (requested, expected) in [(120.0, 120.0), (500.0, 180.0), (-20.0, 0.0)] {
+                await controller.seek(to: requested)
+                try expect(controller.playbackState.currentTime == expected && !controller.playbackState.isPlaying,
+                           "An explicit paused seek did not update/clamp its local intent")
+                if !nativePaused {
+                    try await controller.metadataTestUpdate(["elapsedTime": 77.0, "playing": true])
+                    try expect(controller.playbackState.currentTime == expected, "Cached MR elapsed replaced an explicit paused seek")
+                }
+            }
+            try expect(dispatched == [120, 180, 0], "Paused seek dispatcher received unclamped or duplicate commands")
+            try await controller.metadataTestUpdate(["playing": false, "playbackRate": 0.0, "elapsedTime": 12.0])
+            try expect(controller.playbackState.currentTime == 12, "Native paused acknowledgement could not correct an unconfirmed seek intent")
+            controller.stop(); passed += 1
+            print("PASS paused seek local intent and native correction (native pause acknowledged \(nativePaused))")
+        }
+        do {
+            let client = SnapshotYandexAX(nil)
+            var dispatched: [Double] = []
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 }, startMonitoring: false,
+                seekDispatcher: { dispatched.append($0) })!
+            try await seed(controller, duration: 0)
+            await client.setPlaybackState(false)
+            await controller.metadataTestRefreshPlaying()
+            await controller.seek(to: 600)
+            await controller.seek(to: .nan)
+            await controller.seek(to: .infinity)
+            await controller.seek(to: -.infinity)
+            try expect(dispatched == [600] && controller.playbackState.currentTime == 600,
+                       "Unknown duration clamped seek to zero or nonfinite input reached native dispatch")
+            controller.stop(); passed += 1
+            print("PASS paused seek handles unknown duration and rejects nonfinite positions")
+        }
+        for boundary in ["foreign", "stopped", "missing PID"] {
+            let pid = PlaybackPIDBox(), client = SnapshotYandexAX(nil)
+            var dispatched: [Double] = []
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { pid.value }, startMonitoring: false,
+                seekDispatcher: { dispatched.append($0) })!
+            try await seed(controller)
+            await client.setPlaybackState(false)
+            await controller.metadataTestRefreshPlaying()
+            switch boundary {
+            case "foreign": try await controller.metadataTestUpdate(["bundleIdentifier": "com.apple.Safari", "title": "Browser"], diff: false)
+            case "stopped": controller.stop()
+            default: pid.value = nil
+            }
+            let before = controller.playbackState.currentTime
+            await controller.seek(to: 120)
+            try expect(dispatched.isEmpty && controller.playbackState.currentTime == before,
+                       "Paused seek escaped its source guard for \(boundary)")
+            controller.stop(); passed += 1
+            print("PASS paused seek is not dispatched for \(boundary)")
+        }
+        for boundary in ["track", "opaque item", "stop", "foreign", "PID", "cancel"] {
+            let gate = FavoriteQueueGate(), pid = PlaybackPIDBox(), client = SnapshotYandexAX(nil)
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { pid.value }, startMonitoring: false,
+                seekDispatcher: { _ in await gate.wait() })!
+            try await seed(controller)
+            await client.setPlaybackState(false)
+            await controller.metadataTestRefreshPlaying()
+            let seek = Task { await controller.seek(to: 120) }
+            try await waitForAX("Injected seek did not enter dispatch") { await gate.ready }
+            switch boundary {
+            case "track": try await controller.metadataTestUpdate(["title": "Other track", "contentItemIdentifier": "item B", "elapsedTime": 0.0])
+            case "opaque item": try await controller.metadataTestUpdate(["title": "Seek track", "contentItemIdentifier": "item B", "elapsedTime": 0.0])
+            case "stop": controller.stop()
+            case "foreign": try await controller.metadataTestUpdate(["bundleIdentifier": "com.apple.Safari", "title": "Browser"], diff: false)
+            case "PID": pid.value = 43
+            default: seek.cancel()
+            }
+            let before = controller.playbackState
+            await gate.finish()
+            await seek.value
+            try expect(controller.playbackState.currentTime == before.currentTime && controller.playbackState.lastUpdated == before.lastUpdated,
+                       "A delayed seek applied its old position after \(boundary)")
+            controller.stop(); passed += 1
+            print("PASS delayed paused seek cannot reanchor after \(boundary)")
+        }
+    }
+
+    @MainActor
     private static func playbackEvidence() async throws {
         func seed(_ controller: YandexMusicController, playing: Bool = true) async throws {
             try await controller.metadataTestUpdate(["bundleIdentifier": "ru.yandex.desktop.music", "title": "Before", "artist": "Artist",
@@ -1695,6 +1896,8 @@ private struct YandexMetadataRegressionTests {
 
     @MainActor
     static func main() async throws {
+        try await pausedTimelineReconciliation()
+        try await pausedSeekIntent()
         try await delayedAXLifecycle()
         try await favoriteReconciliation()
         try await favoriteCommandPriority()

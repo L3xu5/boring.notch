@@ -14,11 +14,6 @@ extension Color {
     static var effectiveAccent: Color { .blue }
     func ensureMinimumBrightness(factor: CGFloat) -> Color { self }
 }
-final class MusicManager {
-    static let shared = MusicManager()
-    func estimatedPlaybackPosition(at: Date) -> Double { 10 }
-}
-
 @MainActor private final class SliderState: ObservableObject {
     @Published var value = 10.0
     @Published var dragging = false
@@ -28,6 +23,32 @@ final class MusicManager {
     var commits: [Double] = []
     var changes: [Double] = []
     var ancestorActions = 0
+}
+
+@MainActor private final class ProgressState: ObservableObject {
+    @Published var value = 0.0
+    @Published var duration = 180.0
+    @Published var dragging = false
+    @Published var lastDragged = Date.distantPast
+    @Published var tick = Date()
+    @Published var timestamp = Date()
+    @Published var elapsed = 40.0
+    @Published var rate = 1.0
+    @Published var playing = true
+    var commands = 0
+}
+
+private struct ProgressFixture: View {
+    @ObservedObject var state: ProgressState
+    var body: some View {
+        MusicSliderView(sliderValue: $state.value, duration: $state.duration,
+                        lastDragged: $state.lastDragged, color: .white, dragging: $state.dragging,
+                        currentDate: state.tick, timestampDate: state.timestamp,
+                        elapsedTime: state.elapsed, playbackRate: state.rate, isPlaying: state.playing) { _ in
+            state.commands += 1
+        }
+        .frame(width: 200, height: 60)
+    }
 }
 
 private struct SliderFixture: View {
@@ -162,6 +183,60 @@ struct SliderInputTests {
                 "unknown or zero duration cannot dispatch a seek")
         require(!panel.isKeyWindow && !app.isActive, "pointer seeking never activates the app or makes the hover panel key")
 
+        progressSynchronization(window: panel)
+
         print("Slider input: \(checks) checks passed (whole production sources, own-window events only)")
+    }
+
+    private static func progressSynchronization(window: NSWindow) {
+        let state = ProgressState()
+        state.timestamp = Date().addingTimeInterval(-2)
+        let host = NotchHostingView(rootView: ProgressFixture(state: state))
+        host.frame = NSRect(x: 0, y: 0, width: 240, height: 60)
+        window.contentView = host
+        drain(0.15)
+        require(state.value >= 42 && state.value < 43, "progress estimates the supplied playing timeline")
+
+        state.elapsed = 42
+        state.timestamp = Date()
+        state.playing = false
+        state.rate = 0
+        drain()
+        require(state.value == 42, "pause commits the final position without another timeline tick")
+        state.tick = Date().addingTimeInterval(100)
+        drain(0.3)
+        require(state.value == 42, "paused progress remains stationary even when the view refreshes")
+
+        state.timestamp = Date().addingTimeInterval(-2)
+        state.rate = 0.5
+        state.playing = true
+        drain()
+        require(state.value >= 43 && state.value < 44, "resume preserves the source playback rate")
+        state.rate = 2
+        drain()
+        require(state.value >= 46 && state.value < 47, "a rate-only change refreshes progress without a new tick")
+
+        state.value = 90
+        state.lastDragged = Date()
+        state.elapsed = 45
+        state.timestamp = Date()
+        state.playing = false
+        state.rate = 0
+        drain(0.15)
+        require(state.value == 90, "a pending paused seek keeps its short local preview")
+        state.elapsed = 46
+        drain(0.95)
+        require(state.value == 46, "a paused seek reconciles the newest source position after grace with no tick")
+
+        state.dragging = true
+        state.value = 75
+        state.elapsed = 47
+        drain()
+        require(state.value == 75, "source updates do not overwrite a drag in progress")
+        state.lastDragged = Date()
+        state.dragging = false
+        drain(1.05)
+        require(state.value == 47, "a completed paused drag eventually reconciles without a timeline tick")
+        require(state.commands == 0, "passive progress synchronization never sends a media command")
     }
 }

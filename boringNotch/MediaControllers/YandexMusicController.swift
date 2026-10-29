@@ -73,6 +73,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     private let accessibilityReader: any YandexAccessibilityProviding
     private let currentProcessIdentifier: @MainActor () -> pid_t?
     private let unavailableTransport: (@MainActor () -> Void)?
+    private let seekDispatcher: (@MainActor (Double) async -> Void)?
     private let sourceLifetime = YandexCommandLifetime()
     private let favoriteLifetime = YandexCommandLifetime()
     private let transportLifetime = YandexCommandLifetime()
@@ -188,10 +189,12 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
               })?.processIdentifier
           }, onTransportUnavailable: (@MainActor () -> Void)? = nil, startMonitoring: Bool = true,
           metadataClock: @escaping @MainActor () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
-          snapshotReader: (@Sendable () async -> MediaWireUpdate?)? = nil) {
+          snapshotReader: (@Sendable () async -> MediaWireUpdate?)? = nil,
+          seekDispatcher: (@MainActor (Double) async -> Void)? = nil) {
         self.accessibilityReader = accessibility
         self.currentProcessIdentifier = processIdentifier
         self.unavailableTransport = onTransportUnavailable
+        self.seekDispatcher = seekDispatcher
         self.metadataClock = metadataClock
         if let snapshotReader { self.snapshotReader = snapshotReader }
         else if startMonitoring { self.snapshotReader = { @Sendable in await MediaAdapterSnapshotReader().read() } }
@@ -611,8 +614,18 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     func seek(to time: Double) async {
         // MediaRemote seeks the session owner; only do so while Yandex owns the session, to
         // avoid scrubbing whatever else (e.g. a browser tab) currently holds it.
-        guard sessionIsYandex else { return }
-        commands.seek(time)
+        let source = sourceLifetime.ticket(), item = playbackState.identity, wireItem = publishedMRItemID
+        guard time.isFinite, isCurrentCommand(source), sessionIsYandex, seekDispatcher != nil || commands.canSeek,
+              let pid = currentProcessIdentifier() else { return }
+        let position = playbackState.duration > 0 ? min(max(0, time), playbackState.duration) : max(0, time)
+        if let seekDispatcher { await seekDispatcher(position) }
+        else { commands.seek(position) }
+        guard isCurrentCommand(source), sessionIsYandex, playbackState.identity == item, publishedMRItemID == wireItem,
+              currentProcessIdentifier() == pid, !playbackState.isPlaying else { return }
+        // MediaRemote gives no delivery receipt. Reflect this explicit paused seek locally;
+        // an eventual native paused snapshot can still correct the requested position.
+        playbackState.currentTime = position
+        playbackState.lastUpdated = Date()
     }
 
     @MainActor
@@ -1108,6 +1121,14 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
             if !freshArtwork { newState.artwork = nil }
         }
         let trackChanged = newState.identity != playbackState.identity || opaqueItemChanged
+        if confirmedPlayingPID == processIdentifier, confirmedPlaying == false, systemMediaIsPlaying == true,
+           MetadataRecord(newState, wireItemID: stagedArtworkAssociation ? publishedMRItemID : nextItemID)
+            .matches(MetadataRecord(playbackState, wireItemID: publishedMRItemID)) {
+            // Chromium can keep advancing elapsedTime after AX/power confirms a pause. Its
+            // cached playing session cannot replace this recording's frozen position anchor.
+            newState.currentTime = playbackState.currentTime
+            newState.lastUpdated = playbackState.lastUpdated
+        }
         if trackChanged {
             cancelArtworkSnapshot()
             if let oldArtwork = playbackState.artwork {

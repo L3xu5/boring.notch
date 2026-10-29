@@ -4,6 +4,8 @@ from pathlib import Path
 import subprocess
 import tempfile
 
+from media_test_support import core_arguments
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -19,9 +21,11 @@ def main() -> None:
             str(ROOT / "Tests/Fixtures/CameraDefaults.swift"), "-o", str(defaults_object),
         ], check=True, timeout=120)
         executable = directory / "slider-input-tests"
+        domain_arguments = core_arguments(directory)
         subprocess.run([
             "xcrun", "swiftc", "-swift-version", "5", "-parse-as-library",
             "-module-cache-path", str(directory / "ModuleCache"), "-I", str(directory),
+            *domain_arguments,
             str(ROOT / "boringNotch/components/Music/PlayerProgressControl.swift"),
             str(ROOT / "boringNotch/extensions/PanGesture.swift"),
             str(ROOT / "boringNotch/App/NotchHostingView.swift"),

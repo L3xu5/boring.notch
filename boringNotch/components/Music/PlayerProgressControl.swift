@@ -1,4 +1,5 @@
 import Defaults
+import BoringCore
 import SwiftUI
 
 struct MusicSliderView: View {
@@ -49,15 +50,39 @@ struct MusicSliderView: View {
         .onChange(of: currentDate) {
             updatePosition()
         }
-        .onAppear { updatePosition() }
-        .onChange(of: elapsedTime) { _, _ in updatePosition() }
-        .onChange(of: timestampDate) { _, _ in updatePosition() }
-        .onChange(of: isPlaying) { _, _ in updatePosition() }
+        .task(id: synchronization) {
+            guard !dragging else { return }
+            // A paused TimelineView has no next tick. Reconcile once the seek preview
+            // expires even if the player rejects the seek or pauses during that grace.
+            let delay = max(0, 1 - Date().timeIntervalSince(lastDragged))
+            if delay > 0 {
+                do { try await Task.sleep(for: .seconds(delay)) }
+                catch { return }
+            }
+            guard !Task.isCancelled else { return }
+            updatePosition()
+        }
+    }
+
+    private struct Synchronization: Equatable {
+        let position: Double
+        let duration: Double
+        let timestamp: Date
+        let rate: Double
+        let playing: Bool
+        let lastDragged: Date
+        let dragging: Bool
+    }
+
+    private var synchronization: Synchronization {
+        .init(position: elapsedTime, duration: duration, timestamp: timestampDate,
+              rate: playbackRate, playing: isPlaying, lastDragged: lastDragged, dragging: dragging)
     }
 
     private func updatePosition() {
         guard !dragging, Date().timeIntervalSince(lastDragged) >= 1 else { return }
-        sliderValue = MusicManager.shared.estimatedPlaybackPosition(at: Date())
+        sliderValue = MediaTimeline(position: elapsedTime, duration: duration, observedAt: timestampDate,
+                                    rate: playbackRate, isPlaying: isPlaying).position(at: Date())
     }
 
     func timeString(from seconds: Double) -> String {
