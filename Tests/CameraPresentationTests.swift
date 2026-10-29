@@ -118,6 +118,26 @@ struct CameraPresentationTests {
         let first = BoringViewModel()
         let second = BoringViewModel()
         first.open(); second.open()
+        require(!first.preventsAutomaticClose && !second.preventsAutomaticClose,
+                "idle displays allow automatic closure")
+        first.isScrubbingMusic = true
+        require(first.preventsAutomaticClose && !second.preventsAutomaticClose,
+                "music scrubbing prevents automatic closure only on its own display")
+        first.keyboardInteractionActive = true
+        first.isScrubbingMusic = false
+        require(first.preventsAutomaticClose, "ending scrubbing retains an independent keyboard interaction")
+        first.keyboardInteractionActive = false
+        require(!first.preventsAutomaticClose, "ending the last interaction allows automatic closure again")
+        first.isScrubbingMusic = true
+        first.close()
+        require(first.notchState == .closed && !first.isScrubbingMusic,
+                "manual close remains available during scrubbing and clears its transient state")
+        first.open()
+        let destroyedInteraction = BoringViewModel()
+        destroyedInteraction.isScrubbingMusic = true
+        destroyedInteraction.destroy()
+        require(!destroyedInteraction.isScrubbingMusic && !destroyedInteraction.preventsAutomaticClose,
+                "destroying a display releases its scrubbing hold")
         first.toggleCameraPreview()
         require(first.isCameraExpanded, "opening a local preview works when another display is capturing")
         require(webcam.startRequests == 1 && webcam.stopRequests == 0, "expand requests running without toggling global state")

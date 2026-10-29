@@ -165,7 +165,8 @@ final class NotchWindowCoordinator {
                 guard let record, !record.model.isBatteryPopoverActive else { return }
                 record.window.acceptsKeyboardFocus = false
                 record.model.keyboardInteractionActive = false
-                if !record.model.isMouseHovering() && !record.model.anyDropZoneTargeting { record.model.close() }
+                if !record.model.preventsAutomaticClose && !record.model.isMouseHovering()
+                    && !record.model.anyDropZoneTargeting { record.model.close() }
             }
         })
         model.$notchState.receive(on: RunLoop.main).sink { [weak record] state in
@@ -233,7 +234,8 @@ final class NotchWindowCoordinator {
             record.model.isBatteryPopoverActive = false
             record.model.keyboardInteractionActive = false
             record.window.acceptsKeyboardFocus = false
-            if !record.model.isMouseHovering() && !record.model.anyDropZoneTargeting { record.model.close() }
+            if !record.model.preventsAutomaticClose && !record.model.isMouseHovering()
+                && !record.model.anyDropZoneTargeting { record.model.close() }
         }
     }
 

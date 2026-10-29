@@ -33,6 +33,9 @@ class BoringViewModel: NSObject, ObservableObject {
     @Published var isHoveringCalendar: Bool = false
     @Published var isBatteryPopoverActive: Bool = false
     @Published var keyboardInteractionActive = false
+    @Published var isScrubbingMusic = false
+
+    var preventsAutomaticClose: Bool { keyboardInteractionActive || isScrubbingMusic }
 
     @Published var screenUUID: String?
 
@@ -53,6 +56,7 @@ class BoringViewModel: NSObject, ObservableObject {
 
     func destroy() {
         keyboardInteractionActive = false
+        isScrubbingMusic = false
         isCameraExpanded = false
         isRequestingAuthorization = false
         cancellables.forEach { $0.cancel() }
@@ -229,6 +233,7 @@ class BoringViewModel: NSObject, ObservableObject {
         self.closedNotchSize = self.notchSize
         self.notchState = .closed
         self.keyboardInteractionActive = false
+        self.isScrubbingMusic = false
         self.isCameraExpanded = false
         self.isRequestingAuthorization = false
         self.isBatteryPopoverActive = false

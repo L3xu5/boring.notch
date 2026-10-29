@@ -145,13 +145,13 @@ struct ContentView: View {
                             }
                     }
                     .onReceive(NotificationCenter.default.publisher(for: .sharingDidFinish)) { _ in
-                        if vm.notchState == .open && !isHovering && !vm.isBatteryPopoverActive && !vm.keyboardInteractionActive {
+                        if vm.notchState == .open && !isHovering && !vm.isBatteryPopoverActive && !vm.preventsAutomaticClose {
                             hoverTask?.cancel()
                             hoverTask = Task {
                                 try? await Task.sleep(for: .milliseconds(100))
                                 guard !Task.isCancelled else { return }
                                 await MainActor.run {
-                                    if self.vm.notchState == .open && !self.isHovering && !self.vm.isBatteryPopoverActive && !self.vm.keyboardInteractionActive && !SharingStateManager.shared.preventNotchClose {
+                                    if self.vm.notchState == .open && !self.isHovering && !self.vm.isBatteryPopoverActive && !self.vm.preventsAutomaticClose && !SharingStateManager.shared.preventNotchClose {
                                         self.vm.close()
                                     }
                                 }
@@ -166,18 +166,21 @@ struct ContentView: View {
                         }
                     }
                     .onChange(of: vm.isBatteryPopoverActive) {
-                        if !vm.isBatteryPopoverActive && !isHovering && vm.notchState == .open && !vm.keyboardInteractionActive && !SharingStateManager.shared.preventNotchClose {
+                        if !vm.isBatteryPopoverActive && !isHovering && vm.notchState == .open && !vm.preventsAutomaticClose && !SharingStateManager.shared.preventNotchClose {
                             hoverTask?.cancel()
                             hoverTask = Task {
                                 try? await Task.sleep(for: .milliseconds(100))
                                 guard !Task.isCancelled else { return }
                                 await MainActor.run {
-                                    if !self.vm.isBatteryPopoverActive && !self.isHovering && self.vm.notchState == .open && !self.vm.keyboardInteractionActive && !SharingStateManager.shared.preventNotchClose {
+                                    if !self.vm.isBatteryPopoverActive && !self.isHovering && self.vm.notchState == .open && !self.vm.preventsAutomaticClose && !SharingStateManager.shared.preventNotchClose {
                                         self.vm.close()
                                     }
                                 }
                             }
                         }
+                    }
+                    .onChange(of: vm.isScrubbingMusic) { _, isScrubbing in
+                        if !isScrubbing && !isHovering { handleHover(false) }
                     }
                     .sensoryFeedback(.alignment, trigger: haptics)
                     .contextMenu {
@@ -233,7 +236,7 @@ struct ContentView: View {
                 }
 
                 vm.dropEvent = false
-                if !vm.keyboardInteractionActive && !SharingStateManager.shared.preventNotchClose {
+                if !vm.preventsAutomaticClose && !SharingStateManager.shared.preventNotchClose {
                     vm.close()
                 }
             }
@@ -403,7 +406,7 @@ struct ContentView: View {
                         self.isHovering = false
                     }
                     
-                    if self.vm.notchState == .open && !self.vm.isBatteryPopoverActive && !self.vm.keyboardInteractionActive && !SharingStateManager.shared.preventNotchClose {
+                    if self.vm.notchState == .open && !self.vm.isBatteryPopoverActive && !self.vm.preventsAutomaticClose && !SharingStateManager.shared.preventNotchClose {
                         self.vm.close()
                     }
                 }
@@ -437,7 +440,7 @@ struct ContentView: View {
     }
 
     private func handleUpGesture(translation: CGFloat, phase: NSEvent.Phase) {
-        guard vm.notchState == .open && !vm.isHoveringCalendar else { return }
+        guard vm.notchState == .open && !vm.isHoveringCalendar && !vm.isScrubbingMusic else { return }
 
         withAnimation(animationSpring) {
             gestureProgress = (translation / Defaults[.gestureSensitivity]) * -20

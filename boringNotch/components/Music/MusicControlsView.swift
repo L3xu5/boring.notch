@@ -17,6 +17,12 @@ struct MusicControlsView: View {
             slotToolbar
         }
         .buttonStyle(PlainButtonStyle())
+        .onChange(of: dragging) { _, isDragging in
+            vm.isScrubbingMusic = isDragging
+        }
+        .onDisappear {
+            vm.isScrubbingMusic = false
+        }
     }
 
     private var songInfoAndSlider: some View {

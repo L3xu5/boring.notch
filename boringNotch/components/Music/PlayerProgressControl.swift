@@ -137,7 +137,7 @@ struct CustomSlider: View {
             .frame(height: 10)
             .opacity(isEnabled ? 1 : 0.4)
             .contentShape(Rectangle())
-            .gesture(
+            .highPriorityGesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { gesture in
                         guard isEnabled else { return }
@@ -149,10 +149,17 @@ struct CustomSlider: View {
                         value = min(max(newValue, range.lowerBound), range.upperBound)
                         onDragChange?(value)
                     }
-                    .onEnded { _ in
-                        onValueChange?(value)
+                    .onEnded { gesture in
+                        guard dragging, isEnabled, width > 0, rangeSpan.isFinite, rangeSpan > 0 else {
+                            dragging = false
+                            return
+                        }
+                        let position = range.lowerBound + Double(gesture.location.x / width) * rangeSpan
+                        let committedValue = min(max(position, range.lowerBound), range.upperBound)
+                        value = committedValue
                         dragging = false
                         lastDragged = Date()
+                        onValueChange?(committedValue)
                     }
             )
             .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.7), value: dragging)
@@ -176,6 +183,15 @@ struct CustomSlider: View {
         .onKeyPress(.leftArrow) { adjust(-1); return .handled }
         .onKeyPress(.upArrow) { adjust(1); return .handled }
         .onKeyPress(.downArrow) { adjust(-1); return .handled }
+        .onChange(of: isEnabled) { _, enabled in
+            if !enabled { dragging = false }
+        }
+        .onChange(of: range) { _, limits in
+            if limits.upperBound <= limits.lowerBound || !(limits.upperBound - limits.lowerBound).isFinite {
+                dragging = false
+            }
+        }
+        .onDisappear { dragging = false }
         .disabled(range.upperBound <= range.lowerBound)
     }
 
