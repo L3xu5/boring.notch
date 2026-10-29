@@ -101,6 +101,42 @@ private actor DelayedYandexAX: YandexAccessibilityProviding {
     }
 }
 
+private actor AcceptedTransportYandexAX: YandexAccessibilityProviding {
+    private var reply: CheckedContinuation<Bool, Never>?
+    private(set) var accepted = 0
+    var waitingForReply: Bool { reply != nil }
+    func read(processIdentifier: pid_t) -> YandexAccessibilityMetadata? { nil }
+    func favoriteState(processIdentifier: pid_t) -> Bool? { nil }
+    func perform(_ action: YandexPlayerAction, processIdentifier: pid_t,
+                 isCurrent: @escaping @Sendable () -> Bool) async -> Bool {
+        guard !Task.isCancelled, isCurrent() else { return false }
+        accepted += 1
+        return await withCheckedContinuation { reply = $0 }
+    }
+    func finish() { reply?.resume(returning: true); reply = nil }
+}
+
+private actor ExplicitTransportYandexAX: YandexAccessibilityProviding {
+    struct Request: Sendable { let action: String; let desiredPlaying: Bool? }
+    private(set) var explicitRequests: [Request] = []
+    private(set) var passiveRequests: [String] = []
+    func read(processIdentifier: pid_t) -> YandexAccessibilityMetadata? { nil }
+    func favoriteState(processIdentifier: pid_t) -> Bool? { nil }
+    func perform(_ action: YandexPlayerAction, processIdentifier: pid_t,
+                 isCurrent: @escaping @Sendable () -> Bool) -> Bool {
+        guard isCurrent(), !Task.isCancelled else { return false }
+        passiveRequests.append(String(describing: action))
+        return true
+    }
+    func performExplicitTransport(_ action: YandexPlayerAction, desiredPlaying: Bool?, processIdentifier: pid_t,
+                                  isCurrent: @escaping @Sendable () -> Bool) async -> Bool {
+        guard isCurrent(), !Task.isCancelled else { return false }
+        explicitRequests.append(.init(action: String(describing: action), desiredPlaying: desiredPlaying))
+        // An already-satisfied native desired state is a successful receipt without a toggle.
+        return true
+    }
+}
+
 private actor SnapshotYandexAX: YandexAccessibilityProviding {
     private var metadata: YandexAccessibilityMetadata?
     private var receipt = false
@@ -304,6 +340,152 @@ private struct YandexMetadataRegressionTests {
         await refresh.value
         let after = await client.pendingFavorites
         try expect(after == before, "Passive favorite polling scheduled an AX read during \(phase)")
+    }
+
+    @MainActor
+    private static func directedTransportArbitration() async throws {
+        func seed(_ controller: YandexMusicController, playing: Bool = true, rate: Double = 1) async throws {
+            try await controller.metadataTestUpdate(["bundleIdentifier": YandexMusicController.bundleID,
+                "title": "Before", "artist": "Artist", "contentItemIdentifier": "item A",
+                "playing": playing, "playbackRate": rate, "artworkData": Data("cover A".utf8).base64EncodedString()], diff: false)
+        }
+        for recovery in [false, true] {
+            for change in ["foreign heartbeat", "owner switch", "album enrichment", "native ID enrichment", "AX rate correction"] {
+                let client = DelayedYandexAX()
+                var unavailable = 0
+                let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                    onTransportUnavailable: { unavailable += 1 }, startMonitoring: false)!
+                try await seed(controller, rate: change == "AX rate correction" ? 0 : 1)
+                if change == "foreign heartbeat" || change == "native ID enrichment" {
+                    try await controller.metadataTestUpdate(["bundleIdentifier": "com.apple.Safari", "title": "Browser",
+                                                            "playing": false, "elapsedTime": 20.0], diff: false)
+                }
+                var receipt = false
+                let command = Task {
+                    if recovery { receipt = await controller.togglePlayWithReceipt() }
+                    else { await controller.pause() }
+                }
+                try await waitForAX("Directed pause did not enter AX") { await client.pendingActions == 1 }
+                switch change {
+                case "foreign heartbeat": try await controller.metadataTestUpdate(["elapsedTime": 21.0])
+                case "owner switch": try await controller.metadataTestUpdate(["bundleIdentifier": "com.apple.Safari", "title": "Browser", "playing": false], diff: false)
+                case "album enrichment": try await controller.metadataTestUpdate(["album": "Album"])
+                case "native ID enrichment":
+                    controller.metadataTestSkipArtwork("Before|Artist|123|")
+                    controller.metadataTestApplyAX(node("AXGroup", children: [
+                        node("AXLink", "Track Before", url: "music-application://desktop/track?trackId=123"),
+                        node("AXLink", "Artist Artist", url: "music-application://desktop/artist/1")]))
+                default: await client.setPlaybackState(true); await controller.metadataTestRefreshPlaying()
+                }
+                await client.finishAction(true); await command.value
+                let performed = await client.performedCount
+                let rejected = recovery && (change == "foreign heartbeat" || change == "owner switch")
+                try expect(performed == (rejected ? 0 : 1) && controller.playbackState.isPlaying == rejected && unavailable == 0,
+                           "\(change) incorrectly canceled or allowed \(recovery ? "hardware recovery" : "directed UI pause")")
+                if recovery { try expect(receipt == !rejected, "Transport delivery receipt disagreed with its actual accepted press") }
+                controller.stop(); passed += 1
+                print("PASS transport \(change) (hardware recovery \(recovery))")
+            }
+        }
+        for action in ["play", "pause", "toggle", "next", "previous", "hardware"] {
+            let client = ExplicitTransportYandexAX()
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await seed(controller, playing: action != "play")
+            switch action {
+            case "play": await controller.play()
+            case "pause": await controller.pause()
+            case "toggle": await controller.togglePlay()
+            case "next": await controller.nextTrack()
+            case "previous": await controller.previousTrack()
+            default: _ = await controller.togglePlayWithReceipt()
+            }
+            let explicit = await client.explicitRequests, passive = await client.passiveRequests
+            if action == "hardware" {
+                try expect(explicit.isEmpty && passive == ["playPause"], "Hardware recovery requested window-opening explicit transport")
+            } else {
+                let desired: Bool? = action == "play" ? true : ["pause", "toggle"].contains(action) ? false : nil
+                try expect(explicit.count == 1 && explicit[0].desiredPlaying == desired && passive.isEmpty,
+                           "Explicit \(action) lost desired-state routing or used the no-reopen hardware entrypoint")
+                if let desired { try expect(controller.playbackState.isPlaying == desired, "Satisfied explicit receipt failed to reconcile the requested state") }
+            }
+            controller.stop(); passed += 1
+            print("PASS explicit/passive transport API routing for \(action)")
+        }
+        for action in ["play", "toggle", "next", "previous"] {
+            let client = DelayedYandexAX()
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await seed(controller, playing: action != "play")
+            try await controller.metadataTestUpdate(["bundleIdentifier": "com.apple.Safari", "title": "Browser",
+                                                    "playing": true, "elapsedTime": 20.0], diff: false)
+            let command = Task {
+                switch action {
+                case "play": await controller.play()
+                case "toggle": await controller.togglePlay()
+                case "next": await controller.nextTrack()
+                default: await controller.previousTrack()
+                }
+            }
+            try await waitForAX("Directed \(action) did not enter AX") { await client.pendingActions == 1 }
+            try await controller.metadataTestUpdate(["elapsedTime": 21.0])
+            await client.finishAction(true); await command.value
+            let actions = await client.performedActions
+            try expect(actions == [action == "next" || action == "previous" ? action : "playPause"],
+                       "Foreign playback heartbeat canceled a directed \(action)")
+            controller.stop(); passed += 1
+            print("PASS directed \(action) survives foreign playback activity")
+        }
+        for boundary in ["native pause", "scoped pause", "track", "opaque", "known album", "stop", "reset", "PID", "cancel"] {
+            let client = DelayedYandexAX(), pid = PlaybackPIDBox()
+            var unavailable = 0
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { pid.value },
+                onTransportUnavailable: { unavailable += 1 }, startMonitoring: false)!
+            try await seed(controller)
+            if boundary == "known album" { try await controller.metadataTestUpdate(["album": "Album A"]) }
+            let command = Task { await controller.pause() }
+            try await waitForAX("Guarded pause did not enter AX") { await client.pendingActions == 1 }
+            switch boundary {
+            case "native pause": try await controller.metadataTestUpdate(["playing": false])
+            case "scoped pause": await client.setPlaybackState(false); await controller.metadataTestRefreshPlaying()
+            case "track": try await controller.metadataTestUpdate(["title": "After"])
+            case "opaque": try await controller.metadataTestUpdate(["contentItemIdentifier": "item B"])
+            case "known album": try await controller.metadataTestUpdate(["album": "Album B"])
+            case "stop": controller.stop()
+            case "reset": controller.metadataTestReset()
+            case "PID": pid.value = 43; await controller.metadataTestRefreshPlaying()
+            default: command.cancel()
+            }
+            await client.finishAction(true); await command.value
+            let performed = await client.performedCount
+            try expect(performed == 0 && unavailable == 0,
+                       "A stale unaccepted pause pressed/reopened the player after \(boundary)")
+            if boundary == "native pause" || boundary == "scoped pause" {
+                try expect(!controller.playbackState.isPlaying, "A stale toggle resumed an already paused player")
+            }
+            controller.stop(); passed += 1
+            print("PASS unaccepted transport canceled by \(boundary)")
+        }
+        for change in ["native pause", "foreign activity"] {
+            let client = AcceptedTransportYandexAX()
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await seed(controller)
+            if change == "foreign activity" {
+                try await controller.metadataTestUpdate(["bundleIdentifier": "com.apple.Safari", "title": "Browser",
+                                                        "playing": false, "elapsedTime": 20.0], diff: false)
+            }
+            let command = Task { await controller.togglePlayWithReceipt() }
+            try await waitForAX("Accepted transport did not wait for its reply") { await client.waitingForReply }
+            if change == "native pause" { try await controller.metadataTestUpdate(["playing": false]) }
+            else { try await controller.metadataTestUpdate(["elapsedTime": 21.0]) }
+            await client.finish()
+            let receipt = await command.value, accepted = await client.accepted
+            try expect(receipt && accepted == 1, "New \(change) erased an already accepted transport receipt")
+            if change == "native pause" { try expect(!controller.playbackState.isPlaying, "An accepted reply inverted a newer pause") }
+            controller.stop(); passed += 1
+            print("PASS accepted transport receipt survives newer \(change)")
+        }
     }
 
     @MainActor
@@ -2010,9 +2192,11 @@ private struct YandexMetadataRegressionTests {
             let subscription = controller.playbackStatePublisher.sink { states.append($0) }
             try await controller.metadataTestUpdate(["artworkData": Data("art B".utf8).base64EncodedString(), "contentItemIdentifier": "opaque B"])
             try expect(controller.playbackState.artwork == Data("art A".utf8), "Art-first diff exposed A text with B artwork")
+            try expect(controller.playbackState.artworkItemIdentifier == "opaque A", "Staged candidate relabeled the displayed cover's item")
             try await waitForAX("Staged artwork did not request validation") { await fixture.pending == 1 }
             try await controller.metadataTestUpdate(["title": "B", "album": "Album B"])
             try expect(controller.playbackState.artwork == nil, "New item retained A cover while validation was pending")
+            try expect(controller.playbackState.artworkItemIdentifier == "opaque B", "New title did not publish its artwork association")
             try await waitForAX("New title did not request current artwork") { await fixture.pending == 2 }
             await fixture.finish(try wireSnapshot(track("B", album: "Album B", id: "opaque B", art: "art B")))
             try await Task.sleep(for: .milliseconds(20))
@@ -2080,6 +2264,7 @@ private struct YandexMetadataRegressionTests {
             try expect(controller.playbackState.artwork == Data("art A".utf8), "Same-title item bypassed artwork association")
             try await waitFor("Verified same-title opaque item never promoted its cover") { controller.playbackState.artwork == Data("art B".utf8) }
             try expect(controller.playbackState.nativeTrackID == nil, "Verified new opaque item retained the old native recording ID")
+            try expect(controller.playbackState.artworkItemIdentifier == "opaque B", "Verified same-title candidate kept the preceding cover's opaque association")
             controller.stop(); passed += 1
             print("PASS same-title new opaque item verifies cover and releases old API identity")
         }
@@ -2123,7 +2308,37 @@ private struct YandexMetadataRegressionTests {
     }
 
     @MainActor
+    private static func artworkPresentationAssociation() async throws {
+        do {
+            let controller = YandexMusicController(accessibility: SnapshotYandexAX(nil), processIdentifier: { 42 }, startMonitoring: false)!
+            try await controller.metadataTestUpdate(track("Same title", id: "opaque A", art: "art A"), diff: false)
+            try await controller.metadataTestUpdate(["playing": false, "artworkData": NSNull()])
+            try expect(controller.playbackState.artwork == nil && controller.playbackState.artworkItemIdentifier == "opaque A",
+                       "A same-item paused nil cover lost its presentation association")
+            try await controller.metadataTestUpdate(["contentItemIdentifier": "opaque B"])
+            try expect(controller.playbackState.artwork == nil && controller.playbackState.artworkItemIdentifier == "opaque B",
+                       "A distinct opaque recording inherited the previous cover's association")
+            controller.stop(); passed += 1
+            print("PASS paused missing cover distinguishes same item from new opaque recording")
+        }
+        do {
+            let controller = YandexMusicController(accessibility: SnapshotYandexAX(nil), processIdentifier: { 42 }, startMonitoring: false)!
+            try await controller.metadataTestUpdate(track("A", id: "opaque A", art: "art A"), diff: false)
+            try await controller.metadataTestUpdate(track("Browser", owner: "com.apple.Safari"), diff: false)
+            controller.metadataTestApplyAX(node("AXGroup", children: [node("AXLink", "Track B"), node("AXLink", "Artist Artist")]))
+            try expect(controller.playbackState.artworkItemIdentifier == nil,
+                       "A new AX recording inherited a different MR recording's cover association")
+            try await controller.metadataTestUpdate(track("A", id: "opaque A", art: "art A"), diff: false)
+            try expect(controller.playbackState.title == "B" && controller.playbackState.artworkItemIdentifier == nil,
+                       "A suppressed old MR snapshot relabeled the held AX recording's artwork")
+            controller.stop(); passed += 1
+            print("PASS AX recording and stale-MR barrier retain the current cover association")
+        }
+    }
+
+    @MainActor
     static func main() async throws {
+        try await directedTransportArbitration()
         try await pausedTimelineReconciliation()
         try await pausedSeekIntent()
         try await delayedAXLifecycle()
@@ -2137,6 +2352,7 @@ private struct YandexMetadataRegressionTests {
         try await playbackEvidence()
         try await metadataOwnership()
         try await artworkAssociation()
+        try await artworkPresentationAssociation()
         try await stream("parent owner survives helper-only diff", [
             update(["parentApplicationBundleIdentifier": "ru.yandex.desktop.music", "bundleIdentifier": "ru.yandex.helper.1",
                     "title": "Old title", "artist": "Old artist"], diff: false),

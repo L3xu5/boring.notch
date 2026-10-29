@@ -12,7 +12,7 @@ import Defaults
 import SwiftUI
 
 let defaultImage: NSImage = .init(
-    systemSymbolName: "heart.fill",
+    systemSymbolName: "music.note",
     accessibilityDescription: "Album Art"
 )!
 
@@ -326,7 +326,8 @@ class MusicManager: ObservableObject {
         presentationSnapshot = state
         if hasContentChange {
             triggerFlipAnimation()
-            artworkPresentation.apply(data: state.artwork, bundleIdentifier: state.bundleIdentifier, identity: state.identity)
+            artworkPresentation.apply(data: state.artwork, bundleIdentifier: state.bundleIdentifier, identity: state.identity,
+                                      artworkItemIdentifier: state.artworkItemIdentifier)
         }
 
         let timeChanged = state.currentTime != self.elapsedTime
@@ -524,7 +525,7 @@ class MusicManager: ObservableObject {
 
     private func configureArtworkPresentation() {
         artworkPresentation = ArtworkPresentationService(defaultImage: defaultImage,
-            icon: { AppIconAsNSImage(for: $0) }, colorEnabled: { Defaults[.coloredSpectrogram] })
+            colorEnabled: { Defaults[.coloredSpectrogram] })
         artworkPresentation.$image.sink { [weak self] image in
             withAnimation(.smooth) { self?.albumArt = image }
         }.store(in: &cancellables)

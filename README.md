@@ -64,6 +64,8 @@ The integration reads the system Now Playing stream through the bundled [mediare
 
 Playback, like and dislike commands target Yandex's own accessible player buttons. If Safari or another app owns the system media session, Accessibility supplies Yandex's title and artist; artwork can be loaded using the exact track link. This does not claim the system session or send playback commands to that other app.
 
+An explicit transport-button click can restore Yandex's closed window while preserving the previously focused app. Play/Pause checks the player again after the window is available, so an already completed pause is not toggled back to playing. Physical media keys and passive reads do not reopen the window.
+
 The current track's verified like state survives brief incomplete Accessibility reads for up to three seconds. A confirmed unlike replaces it immediately; changing the track, player process or issuing a favorite action clears the previous observation.
 
 The animation reads playback independently of track metadata and likes. With a closed window, Yandex desktop 5.124.1 exposes its playback-owned Electron sleep assertion; a pause requires two seconds of consistent absence. This read-only check does not open the window, capture audio or change assertions. An unknown or failed query does not imply a pause.
@@ -72,7 +74,7 @@ A confirmed pause freezes the current track's position even if the system still 
 
 Dragging the progress bar keeps the notch open until the pointer is released, including outside the panel. The release position determines the seek, and the notch's own gestures leave the slider interaction in control.
 
-Artwork is associated with the current track. A changed title clears the preceding cover while the replacement is decoded; shared covers remain in place. A bounded, read-only adapter snapshot can verify delayed artwork against the current source and track.
+Artwork is associated with the current track. Its verified cover survives incomplete same-track updates and pause; a new recording uses a neutral placeholder while its replacement is decoded. Already decoded shared covers remain in place, and the application logo is never used as an intermediate cover. A bounded, read-only adapter snapshot can verify delayed artwork against the current source and track.
 
 Physical media keys always retain native macOS handling. Play/Pause recovery is limited to a proven unresponsive, paused foreign session, followed by fresh Yandex evidence and a final check before an AX action. Active or focused foreign players keep their native behavior. Configurable media shortcuts explicitly control the selected source.
 

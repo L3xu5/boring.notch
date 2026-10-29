@@ -8,6 +8,16 @@ import Testing
         var changed = original; changed.volume = 0.8; #expect(changed != original)
         changed = original; changed.playbackRate = 2; #expect(changed != original)
         changed = original; changed.lastUpdated = Date(); #expect(changed != original)
+        changed = original; changed.artworkItemIdentifier = "opaque item"; #expect(changed != original)
+    }
+    @Test func artworkCorrelationRefreshesPresentationWithoutBecomingANativeTrackID() {
+        let first = MediaPlaybackState(bundleIdentifier: "player", title: "Same text", artist: "Same artist",
+                                       artworkItemIdentifier: "opaque A")
+        var next = first; next.artworkItemIdentifier = "opaque B"
+        #expect(first.identity == next.identity && next.nativeTrackID == nil)
+        #expect(MediaContentChange.hasChanged(from: first, to: next))
+        var pause = next; pause.isPlaying = false; pause.playbackRate = 0
+        #expect(!MediaContentChange.hasChanged(from: next, to: pause))
     }
     @Test func unknownDurationAndPausedTimeline() {
         let now = Date(timeIntervalSince1970: 100)

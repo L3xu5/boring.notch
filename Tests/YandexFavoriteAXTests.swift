@@ -1,5 +1,66 @@
 import Foundation
 
+private actor ExplicitTransportFixture {
+    nonisolated let lifetime: YandexCommandLifetime
+    nonisolated let ticket: UUID
+    private let afterWindow: Bool?
+    private let windowAvailable: Bool
+    private let pressSucceeds: Bool
+    private let expireAfterWindow: Bool
+    private let expireAfterState: Bool
+    private var observed: Bool?
+    private(set) var events: [String] = []
+
+    init(observed: Bool?, afterWindow: Bool? = nil, windowAvailable: Bool = true, pressSucceeds: Bool = true,
+         expireAfterWindow: Bool = false, expireAfterState: Bool = false) {
+        let lifetime = YandexCommandLifetime()
+        self.lifetime = lifetime
+        ticket = lifetime.ticket()
+        self.observed = observed
+        self.afterWindow = afterWindow
+        self.windowAvailable = windowAvailable
+        self.pressSucceeds = pressSucceeds
+        self.expireAfterWindow = expireAfterWindow
+        self.expireAfterState = expireAfterState
+    }
+
+    nonisolated func isCurrent() -> Bool { lifetime.isCurrent(ticket) }
+    func ensureWindow() async -> Bool {
+        events.append("window")
+        await Task.yield()
+        if let afterWindow { observed = afterWindow }
+        if expireAfterWindow { lifetime.invalidate() }
+        return windowAvailable
+    }
+    func playbackState() async -> Bool? {
+        events.append("state")
+        await Task.yield()
+        if expireAfterState { lifetime.invalidate() }
+        return observed
+    }
+    func press() -> Bool {
+        events.append("press")
+        return pressSucceeds
+    }
+}
+
+private actor ExplicitTransportWindowGate {
+    private var entered = false
+    private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiter: CheckedContinuation<Void, Never>?
+    func wait() async {
+        entered = true
+        enteredWaiters.forEach { $0.resume() }
+        enteredWaiters.removeAll()
+        await withCheckedContinuation { releaseWaiter = $0 }
+    }
+    func waitUntilEntered() async {
+        if entered { return }
+        await withCheckedContinuation { enteredWaiters.append($0) }
+    }
+    func release() { releaseWaiter?.resume(); releaseWaiter = nil }
+}
+
 @main
 private enum YandexFavoriteAXTests {
     private static var checks = 0
@@ -294,7 +355,80 @@ private enum YandexFavoriteAXTests {
                "A partial Pause substring overrode the actual paused control")
     }
 
-    static func main() {
+    private static func explicitTransport(_ fixture: ExplicitTransportFixture, action: YandexPlayerAction = .playPause,
+                                          desired: Bool? = true) async -> Bool {
+        await YandexExplicitTransportCommand.perform(action, desiredPlaying: desired, isCurrent: { fixture.isCurrent() },
+            ensureWindow: { await fixture.ensureWindow() }, playbackState: { await fixture.playbackState() },
+            press: { await fixture.press() })
+    }
+
+    private static func explicitTransportRecovery() async {
+        let cases: [(String, ExplicitTransportFixture, YandexPlayerAction, Bool?, Bool, [String])] = [
+            ("play becomes satisfied while the window opens", .init(observed: false, afterWindow: true), .playPause, true, true, ["window", "state"]),
+            ("pause becomes satisfied while the window opens", .init(observed: true, afterWindow: false), .playPause, false, true, ["window", "state"]),
+            ("a previously satisfied play becomes stale during recovery", .init(observed: true, afterWindow: false), .playPause, true, true, ["window", "state", "press"]),
+            ("a known mismatch sends one directed press", .init(observed: false), .playPause, true, true, ["window", "state", "press"]),
+            ("an unknown control state does not invent a satisfied intent", .init(observed: nil), .playPause, true, true, ["window", "state", "press"]),
+            ("an unknown desired state preserves explicit toggle", .init(observed: true), .playPause, nil, true, ["window", "press"]),
+            ("next restores the window without a playback-state guess", .init(observed: true), .next, true, true, ["window", "press"]),
+            ("previous restores the window without a playback-state guess", .init(observed: false), .previous, false, true, ["window", "press"]),
+            ("an unavailable window cannot report a delivered command", .init(observed: true, windowAvailable: false), .playPause, true, false, ["window"]),
+            ("failed native delivery remains a failure", .init(observed: false, pressSucceeds: false), .playPause, true, false, ["window", "state", "press"]),
+            ("a replaced intent after window recovery does not press", .init(observed: false, expireAfterWindow: true), .playPause, true, false, ["window"]),
+            ("a replaced intent after the fresh state read does not press", .init(observed: false, expireAfterState: true), .playPause, true, false, ["window", "state"]),
+            ("the transport recovery entrypoint never handles like", .init(observed: false), .like, true, false, []),
+            ("the transport recovery entrypoint never handles dislike", .init(observed: false), .dislike, true, false, []),
+        ]
+        for (name, fixture, action, desired, expected, expectedEvents) in cases {
+            let result = await explicitTransport(fixture, action: action, desired: desired)
+            let events = await fixture.events
+            expect(result == expected && events == expectedEvents, "Explicit transport: \(name), events \(events)")
+        }
+        for labels in [["Pause on hover"], ["Pause", "Playback"], ["Play queue"]] {
+            let observed = YandexPlaybackControl.state(role: "AXButton", labels: labels)
+            let fixture = ExplicitTransportFixture(observed: observed)
+            let result = await explicitTransport(fixture)
+            let events = await fixture.events
+            expect(observed == nil && result && events == ["window", "state", "press"],
+                   "Ambiguous/partial native labels guessed a satisfied explicit play intent: \(labels)")
+        }
+        let expired = ExplicitTransportFixture(observed: false)
+        expired.lifetime.invalidate()
+        let expiredResult = await explicitTransport(expired)
+        let expiredEvents = await expired.events
+        expect(!expiredResult && expiredEvents.isEmpty, "An expired explicit click started window recovery")
+
+        let cancelled = ExplicitTransportFixture(observed: false)
+        let gate = ExplicitTransportWindowGate()
+        let task = Task {
+            await YandexExplicitTransportCommand.perform(.playPause, desiredPlaying: true,
+                isCurrent: { cancelled.isCurrent() }, ensureWindow: { await gate.wait(); return true },
+                playbackState: { await cancelled.playbackState() }, press: { await cancelled.press() })
+        }
+        await gate.waitUntilEntered()
+        task.cancel()
+        await gate.release()
+        let cancelledResult = await task.value
+        let cancelledEvents = await cancelled.events
+        expect(!cancelledResult && cancelledEvents.isEmpty, "Cancellation during window recovery still read or pressed a control")
+
+        let replaced = ExplicitTransportFixture(observed: false)
+        let replacementGate = ExplicitTransportWindowGate()
+        let replacementTask = Task {
+            await YandexExplicitTransportCommand.perform(.playPause, desiredPlaying: true,
+                isCurrent: { replaced.isCurrent() }, ensureWindow: { await replacementGate.wait(); return true },
+                playbackState: { await replaced.playbackState() }, press: { await replaced.press() })
+        }
+        await replacementGate.waitUntilEntered()
+        replaced.lifetime.invalidate()
+        await replacementGate.release()
+        let replacedResult = await replacementTask.value
+        let replacedEvents = await replaced.events
+        expect(!replacedResult && replacedEvents.isEmpty, "A replaced click survived asynchronous window recovery")
+    }
+
+    static func main() async {
+        await explicitTransportRecovery()
         for role in ["AXButton", "AXCheckBox"] {
             for label in ["Like", "Нравится", "Мне нравится", "Ұнайды", "Yoqadi"] {
                 expect(metadata([node(role, [label], value: "1")])?.isFavorite == true, "Pressed toggle lost its state")

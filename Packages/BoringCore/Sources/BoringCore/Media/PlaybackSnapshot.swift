@@ -72,18 +72,21 @@ public struct MediaPlaybackState: Equatable, Sendable {
     public var volume: Double
     public var isFavorite: Bool
     public var nativeTrackID: String?
+    /// Source-local artwork correlation only; never a native API track identifier.
+    public var artworkItemIdentifier: String?
 
     public init(bundleIdentifier: String, isPlaying: Bool = false, title: String = "", artist: String = "",
                 album: String = "", currentTime: TimeInterval = 0, duration: TimeInterval = 0,
                 playbackRate: Double = 1, isShuffled: Bool = false, repeatMode: MediaRepeatMode = .off,
                 lastUpdated: Date = .distantPast, artwork: Data? = nil, volume: Double = 0.5,
-                isFavorite: Bool = false, nativeTrackID: String? = nil) {
+                isFavorite: Bool = false, nativeTrackID: String? = nil, artworkItemIdentifier: String? = nil) {
         self.bundleIdentifier = bundleIdentifier; self.isPlaying = isPlaying
         self.title = title; self.artist = artist; self.album = album
         self.currentTime = currentTime; self.duration = duration; self.playbackRate = playbackRate
         self.isShuffled = isShuffled; self.repeatMode = repeatMode; self.lastUpdated = lastUpdated
         self.artwork = artwork; self.volume = volume; self.isFavorite = isFavorite
         self.nativeTrackID = nativeTrackID
+        self.artworkItemIdentifier = artworkItemIdentifier
     }
 
     public var identity: MediaItemIdentity {

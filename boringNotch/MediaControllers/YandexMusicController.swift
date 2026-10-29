@@ -77,6 +77,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     private let sourceLifetime = YandexCommandLifetime()
     private let favoriteLifetime = YandexCommandLifetime()
     private let transportLifetime = YandexCommandLifetime()
+    private let systemSessionLifetime = YandexCommandLifetime()
     private var favoriteStateKnown = false
     private struct FavoriteEvidence {
         let id = UUID()
@@ -376,7 +377,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         state.lastUpdated = now
         state.isPlaying = playing
         state.playbackRate = rate
-        transportLifetime.invalidate()
+        if playbackState.isPlaying != playing { transportLifetime.invalidate() }
         playbackState = state
     }
 
@@ -476,6 +477,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
                 previousItemArtwork = .init(data: playbackState.artwork, album: playbackState.album)
             }
             publishedMRItemID = nil
+            state.artworkItemIdentifier = nil
             accessibilityArtworkGeneration &+= 1
             accessibilityArtworkTask?.cancel()
             accessibilityArtworkKey = ""
@@ -495,7 +497,9 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
             favoriteStateKnown = false
             state.isFavorite = false
         }
-        if state.identity != playbackState.identity || state.isPlaying != playbackState.isPlaying { transportLifetime.invalidate() }
+        if transportRecordingChanged(from: playbackState, to: state) || state.isPlaying != playbackState.isPlaying {
+            transportLifetime.invalidate()
+        }
         recordAXMetadataAuthority(state)
         playbackState = state
 
@@ -556,15 +560,25 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         let requestedState = !playbackState.isPlaying
         // Recovery of a native key has already proved a running, authorized player. Losing
         // that evidence while AX waits must never turn F8 into a launch/permission prompt.
-        return await performTransport(.playPause, optimisticState: requestedState, allowUnavailableFallback: false)
+        return await performTransport(.playPause, optimisticState: requestedState, allowUnavailableFallback: false,
+                                      requiresStableSystemSession: true)
     }
     @discardableResult
     private func performTransport(_ action: YandexPlayerAction, optimisticState: Bool? = nil,
-                                  allowUnavailableFallback: Bool = true) async -> Bool {
+                                  allowUnavailableFallback: Bool = true, requiresStableSystemSession: Bool = false) async -> Bool {
         let ticket = sourceLifetime.ticket(), transportTicket = transportLifetime.ticket()
+        let systemTicket = requiresStableSystemSession ? systemSessionLifetime.ticket() : nil
+        let pid = currentProcessIdentifier()
         guard isCurrentCommand(ticket) else { return false }
-        let performed = await performPlayerAction(action, sourceTicket: ticket, transportTicket: transportTicket)
-        guard isCurrentCommand(ticket), transportLifetime.isCurrent(transportTicket) else {
+        let performed = await performPlayerAction(action, sourceTicket: ticket, transportTicket: transportTicket,
+                                                systemTicket: systemTicket, explicitTransport: allowUnavailableFallback,
+                                                desiredPlaying: optimisticState)
+        if currentProcessIdentifier() != pid {
+            _ = observeProcessPresence()
+            return false
+        }
+        guard isCurrentCommand(ticket), transportLifetime.isCurrent(transportTicket),
+              systemTicket.map({ systemSessionLifetime.isCurrent($0) }) ?? true else {
             // A native update emitted by our accepted action may arrive before AX returns.
             // Preserve its receipt but never invert that newer playback observation.
             return performed && isCurrentCommand(ticket)
@@ -805,14 +819,22 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         invalidatePlaybackEvidence(stopPlayback: true)
     }
     private func performPlayerAction(_ action: YandexPlayerAction, sourceTicket: UUID, favoriteTicket: UUID? = nil,
-                                     transportTicket: UUID? = nil) async -> Bool {
+                                     transportTicket: UUID? = nil, systemTicket: UUID? = nil,
+                                     explicitTransport: Bool = false, desiredPlaying: Bool? = nil) async -> Bool {
         guard isCurrentCommand(sourceTicket), let pid = currentProcessIdentifier() else { return false }
         let scope = sourceLifetime, favoriteScope = favoriteLifetime, transportScope = transportLifetime
-        let performed = await accessibilityReader.perform(action, processIdentifier: pid, isCurrent: {
+        let systemScope = systemSessionLifetime
+        let isCurrent: @Sendable () -> Bool = {
             !Task.isCancelled && scope.isCurrent(sourceTicket)
                 && (favoriteTicket.map { favoriteScope.isCurrent($0) } ?? true)
                 && (transportTicket.map { transportScope.isCurrent($0) } ?? true)
-        })
+                && (systemTicket.map { systemScope.isCurrent($0) } ?? true)
+        }
+        let performed: Bool
+        if explicitTransport {
+            performed = await accessibilityReader.performExplicitTransport(action, desiredPlaying: desiredPlaying,
+                processIdentifier: pid, isCurrent: isCurrent)
+        } else { performed = await accessibilityReader.perform(action, processIdentifier: pid, isCurrent: isCurrent) }
         guard isCurrentCommand(sourceTicket), favoriteTicket.map({ favoriteScope.isCurrent($0) }) ?? true else { return false }
         return performed
     }
@@ -1052,6 +1074,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         var state = playbackState
         if let candidate = request.candidateWireItemID, let current = publishedMRItemID, candidate != current {
             publishedMRItemID = candidate
+            state.artworkItemIdentifier = candidate
             state.nativeTrackID = nil
             accessibilityTrackID = nil
             favoriteLifetime.invalidate()
@@ -1072,6 +1095,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     private func retainMetadata(reconciling transport: PlaybackState) {
         var held = playbackState
         if held.isPlaying != transport.isPlaying || held.playbackRate != transport.playbackRate {
+            if held.isPlaying != transport.isPlaying { transportLifetime.invalidate() }
             let now = Date()
             held.currentTime = held.timeline.position(at: now)
             held.lastUpdated = now
@@ -1079,6 +1103,15 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
             held.playbackRate = transport.playbackRate
         }
         playbackState = held
+    }
+
+    private func transportRecordingChanged(from old: PlaybackState, to new: PlaybackState) -> Bool {
+        if MediaText.normalized(old.title) != MediaText.normalized(new.title)
+            || MediaText.normalized(old.artist) != MediaText.normalized(new.artist) { return true }
+        if !old.album.isEmpty, !new.album.isEmpty,
+           MediaText.normalized(old.album) != MediaText.normalized(new.album) { return true }
+        if let oldID = old.nativeTrackID, let newID = new.nativeTrackID, oldID != newID { return true }
+        return false
     }
 
     // MARK: - Update handling
@@ -1128,7 +1161,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
             }
         }
         if previousOwner != systemMediaOwnerBundleIdentifier || previousSystemPlaying != systemMediaIsPlaying
-            || previousForeignActivity != lastForeignMediaActivity { transportLifetime.invalidate() }
+            || previousForeignActivity != lastForeignMediaActivity { systemSessionLifetime.invalidate() }
         sessionIsYandex = (parent ?? payload.string("bundleIdentifier")) == Self.bundleID
         if sessionIsYandex != wasYandex {
             // This only changes which metadata stream is authoritative. Directed AX favorite
@@ -1201,6 +1234,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
             newState.artwork = playbackState.artwork
         } else if freshMetadata { stagedArtworkAssociation = false }
         let nextItemID = payload.string("contentItemIdentifier")
+        newState.artworkItemIdentifier = stagedArtworkAssociation ? publishedMRItemID : nextItemID
         let opaqueItemChanged = !stagedArtworkAssociation && publishedMRItemID != nil
             && nextItemID != nil && publishedMRItemID != nextItemID
         if opaqueItemChanged {
@@ -1231,7 +1265,8 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
             invalidateFavoriteEvidence()
             favoriteStateKnown = false
         }
-        if trackChanged || newState.isPlaying != playbackState.isPlaying { transportLifetime.invalidate() }
+        if opaqueItemChanged || transportRecordingChanged(from: playbackState, to: newState)
+            || newState.isPlaying != playbackState.isPlaying { transportLifetime.invalidate() }
         // Chromium does not reliably publish likes through MediaRemote. The supervised AX poll
         // reconciles the current bar continuously, including same-track edits made in Yandex.
         newState.isFavorite = trackChanged ? false : playbackState.isFavorite

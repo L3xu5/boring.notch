@@ -7,6 +7,8 @@ protocol YandexAccessibilityProviding: Sendable {
     func playbackState(processIdentifier: pid_t) async -> Bool?
     func perform(_ action: YandexPlayerAction, processIdentifier: pid_t,
                  isCurrent: @escaping @Sendable () -> Bool) async -> Bool
+    func performExplicitTransport(_ action: YandexPlayerAction, desiredPlaying: Bool?, processIdentifier: pid_t,
+                                  isCurrent: @escaping @Sendable () -> Bool) async -> Bool
     func favoriteState(processIdentifier: pid_t) async -> Bool?
     func favoriteState(processIdentifier: pid_t, expectedTrack: YandexFavoriteTarget) async -> Bool?
     func setFavorite(_ favorite: Bool, processIdentifier: pid_t, expectedTrack: YandexFavoriteTarget,
@@ -16,6 +18,11 @@ protocol YandexAccessibilityProviding: Sendable {
 }
 
 extension YandexAccessibilityProviding {
+    func performExplicitTransport(_ action: YandexPlayerAction, desiredPlaying: Bool?, processIdentifier: pid_t,
+                                  isCurrent: @escaping @Sendable () -> Bool) async -> Bool {
+        await perform(action, processIdentifier: processIdentifier, isCurrent: isCurrent)
+    }
+
     func playbackState(processIdentifier: pid_t) async -> Bool? {
         await read(processIdentifier: processIdentifier)?.isPlaying
     }
@@ -607,6 +614,30 @@ extension YandexAccessibilityClient {
 
 enum YandexPlayerAction: Sendable { case playPause, next, previous, like, dislike }
 
+/// An explicit click can restore the hidden Electron window. Re-read the native transport
+/// after that asynchronous recovery so an already satisfied Play/Pause intent is not inverted.
+enum YandexExplicitTransportCommand {
+    static func perform(_ action: YandexPlayerAction, desiredPlaying: Bool?,
+                        isCurrent: @escaping @Sendable () -> Bool,
+                        ensureWindow: @Sendable () async -> Bool,
+                        playbackState: @Sendable () async -> Bool?,
+                        press: @Sendable () async -> Bool) async -> Bool {
+        switch action {
+        case .playPause, .next, .previous: break
+        case .like, .dislike: return false
+        }
+        guard !Task.isCancelled, isCurrent(), await ensureWindow(),
+              !Task.isCancelled, isCurrent() else { return false }
+        if case .playPause = action, let desiredPlaying {
+            let observedPlaying = await playbackState()
+            guard !Task.isCancelled, isCurrent() else { return false }
+            if observedPlaying == desiredPlaying { return true }
+        }
+        guard !Task.isCancelled, isCurrent() else { return false }
+        return await press()
+    }
+}
+
 extension YandexAccessibilityClient {
     private func prepare(_ processIdentifier: pid_t) {
         if cachedPID != processIdentifier {
@@ -627,6 +658,25 @@ extension YandexAccessibilityClient {
         case .like: return pressLikeButton()
         case .dislike: pressDislikeButton(); return true
         }
+    }
+
+    func performExplicitTransport(_ action: YandexPlayerAction, desiredPlaying: Bool?, processIdentifier: pid_t,
+                                  isCurrent: @escaping @Sendable () -> Bool) async -> Bool {
+        await YandexExplicitTransportCommand.perform(action, desiredPlaying: desiredPlaying, isCurrent: isCurrent,
+            ensureWindow: { await self.ensurePlayerWindow(processIdentifier: processIdentifier, isCurrent: isCurrent) },
+            playbackState: { await self.explicitTransportPlaybackState(processIdentifier: processIdentifier, isCurrent: isCurrent) },
+            press: { await self.perform(action, processIdentifier: processIdentifier, isCurrent: isCurrent) })
+    }
+
+    private func explicitTransportPlaybackState(processIdentifier: pid_t,
+                                                isCurrent: @escaping @Sendable () -> Bool) -> Bool? {
+        prepare(processIdentifier)
+        actionIsCurrent = isCurrent
+        controlDeadline = Date().addingTimeInterval(1)
+        guard AXIsProcessTrusted(), !Task.isCancelled, isCurrent(), let cluster = transportCluster() else { return nil }
+        var budget = 400
+        guard let snapshot = tree(cluster, remaining: &budget, deadline: controlDeadline) else { return nil }
+        return YandexPlaybackControl.state(in: snapshot)
     }
     func favoriteState(processIdentifier: pid_t) -> Bool? {
         prepare(processIdentifier)
@@ -703,19 +753,19 @@ extension YandexAccessibilityClient {
 
     func toggleFavorite(processIdentifier: pid_t, expectedTrack: YandexFavoriteTarget,
                         isCurrent: @escaping @Sendable () -> Bool) async -> Bool {
-        guard await ensureFavoriteWindow(processIdentifier: processIdentifier, isCurrent: isCurrent) else { return false }
+        guard await ensurePlayerWindow(processIdentifier: processIdentifier, isCurrent: isCurrent) else { return false }
         return changeFavorite(nil, processIdentifier: processIdentifier, expectedTrack: expectedTrack, isCurrent: isCurrent)
     }
 
     func setFavorite(_ favorite: Bool, processIdentifier: pid_t, expectedTrack: YandexFavoriteTarget,
                      isCurrent: @escaping @Sendable () -> Bool) async -> Bool {
-        guard await ensureFavoriteWindow(processIdentifier: processIdentifier, isCurrent: isCurrent) else { return false }
+        guard await ensurePlayerWindow(processIdentifier: processIdentifier, isCurrent: isCurrent) else { return false }
         return changeFavorite(favorite, processIdentifier: processIdentifier, expectedTrack: expectedTrack, isCurrent: isCurrent)
     }
 
     /// Electron removes the player from AX when its window is closed. Reopen only for an
     /// explicit command; passive reads never open a window or change the foreground app.
-    private func ensureFavoriteWindow(processIdentifier: pid_t,
+    private func ensurePlayerWindow(processIdentifier: pid_t,
                                       isCurrent: @escaping @Sendable () -> Bool) async -> Bool {
         guard AXIsProcessTrusted(), !Task.isCancelled, isCurrent() else { return false }
         let app = AXUIElementCreateApplication(processIdentifier)

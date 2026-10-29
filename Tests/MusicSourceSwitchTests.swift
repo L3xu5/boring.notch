@@ -108,10 +108,11 @@ final class MediaChecker: Sendable {
     @Published var image: NSImage
     @Published var usesApplicationIcon = false
     @Published var color: NSColor = .white
-    init(defaultImage: NSImage, icon: @escaping (String) -> NSImage?, colorEnabled: @escaping () -> Bool) { image = defaultImage }
+    init(defaultImage: NSImage, colorEnabled: @escaping () -> Bool) { image = defaultImage }
     func stop() {}
     func setImage(_ image: NSImage) { self.image = image }
-    func apply(data: Data?, bundleIdentifier: String, identity: MediaItemIdentity? = nil) {}
+    func apply(data: Data?, bundleIdentifier: String, identity: MediaItemIdentity? = nil,
+               artworkItemIdentifier: String? = nil) {}
     func calculateAverageColor() {}
 }
 func AppIconAsNSImage(for bundle: String) -> NSImage? { nil }
@@ -146,7 +147,7 @@ extension Notification.Name { static let mediaControllerChanged = Notification.N
 
 private extension MusicManager {
     func sourceTestPrepare() {
-        artworkPresentation = ArtworkPresentationService(defaultImage: defaultImage, icon: { _ in nil }, colorEnabled: { false })
+        artworkPresentation = ArtworkPresentationService(defaultImage: defaultImage, colorEnabled: { false })
         lyricsService = LyricsService()
     }
     func sourceTestStart() { startSelectedSource() }

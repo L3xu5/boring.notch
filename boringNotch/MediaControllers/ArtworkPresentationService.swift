@@ -15,46 +15,98 @@ final class ArtworkPresentationService: ObservableObject {
     @Published private(set) var usesApplicationIcon = false
     @Published private(set) var color: NSColor = .white
     private let defaultImage: NSImage
-    private let icon: (String) -> NSImage?
     private let colorEnabled: () -> Bool
     private let decode: @MainActor (Data) async -> NSImage?
     private let sampleColor: @MainActor (NSImage, @escaping (NSColor?) -> Void) -> Void
     private var data: Data?
     private var bundle: String?
     private var itemIdentity: MediaItemIdentity?
+    private var artworkItemIdentifier: String?
+    private var decodedData: Data?
+    private var decodedBundle: String?
+    private var decodedIdentity: MediaItemIdentity?
+    private var decodedItemIdentifier: String?
     private var revision = UUID()
     private var decodeTask: Task<Void, Never>?
 
-    init(defaultImage: NSImage, icon: @escaping (String) -> NSImage?, colorEnabled: @escaping () -> Bool = { true },
+    init(defaultImage: NSImage, colorEnabled: @escaping () -> Bool = { true },
          decode: @escaping @MainActor (Data) async -> NSImage? = ArtworkPresentationService.decodeImage,
          sampleColor: @escaping @MainActor (NSImage, @escaping (NSColor?) -> Void) -> Void = { $0.averageColor(completion: $1) }) {
         self.defaultImage = defaultImage; self.image = defaultImage
-        self.icon = icon; self.colorEnabled = colorEnabled
+        self.colorEnabled = colorEnabled
         self.decode = decode; self.sampleColor = sampleColor
     }
     deinit { decodeTask?.cancel() }
-    func stop() { decodeTask?.cancel(); decodeTask = nil; revision = UUID(); data = nil; bundle = nil; itemIdentity = nil }
+    func stop() {
+        cancelDecode()
+        data = nil; bundle = nil; itemIdentity = nil; artworkItemIdentifier = nil
+        clearDecodedAssociation()
+    }
 
-    func apply(data: Data?, bundleIdentifier: String, identity: MediaItemIdentity? = nil) {
-        guard self.data != data || bundle != bundleIdentifier else {
-            itemIdentity = identity
+    func apply(data: Data?, bundleIdentifier: String, identity: MediaItemIdentity? = nil,
+               artworkItemIdentifier: String? = nil) {
+        guard self.data != data || bundle != bundleIdentifier || itemIdentity != identity
+            || self.artworkItemIdentifier != artworkItemIdentifier else { return }
+        let sharedDecodedCover = data != nil && decodedData == data && decodedBundle == bundleIdentifier
+        let keepDecodedCover = decodedData != nil && decodedBundle == bundleIdentifier
+            && Self.sameItem(decodedIdentity, identity, oldIdentifier: decodedItemIdentifier,
+                             newIdentifier: artworkItemIdentifier)
+        let associatedIdentity = keepDecodedCover ? Self.refinedIdentity(decodedIdentity, identity) : identity
+        let associatedIdentifier = keepDecodedCover ? artworkItemIdentifier ?? decodedItemIdentifier : artworkItemIdentifier
+        cancelDecode()
+        self.data = data; bundle = bundleIdentifier; itemIdentity = identity
+        self.artworkItemIdentifier = artworkItemIdentifier
+        if sharedDecodedCover {
+            decodedIdentity = associatedIdentity; decodedItemIdentifier = associatedIdentifier
+            if colorEnabled() { calculateAverageColor() }
             return
         }
-        let changedTrack = itemIdentity != identity
-        stop()
-        self.data = data; bundle = bundleIdentifier; itemIdentity = identity
+        if keepDecodedCover {
+            decodedIdentity = associatedIdentity; decodedItemIdentifier = associatedIdentifier
+            if colorEnabled() { calculateAverageColor() }
+        } else { applyPlaceholder() }
         let ticket = revision
-        guard let data else { applyFallback(bundleIdentifier); return }
-        // A new title must never be paired with the preceding track's decoded image while
-        // this decode is pending. Shared covers and same-track quality updates stay seamless.
-        if changedTrack { applyFallback(bundleIdentifier) }
+        guard let data else { return }
         decodeTask = Task { @MainActor [weak self, decode] in
             let decoded = await decode(data)
             guard !Task.isCancelled, let self, self.revision == ticket else { return }
-            if let image = decoded { self.present(image, usesIcon: false) }
-            else { self.applyFallback(bundleIdentifier) }
+            if let image = decoded {
+                self.decodedData = data; self.decodedBundle = bundleIdentifier
+                self.decodedIdentity = associatedIdentity; self.decodedItemIdentifier = associatedIdentifier
+                self.present(image, usesIcon: false)
+            }
             self.decodeTask = nil
         }
+    }
+
+    private func cancelDecode() {
+        decodeTask?.cancel(); decodeTask = nil; revision = UUID()
+    }
+
+    private func clearDecodedAssociation() {
+        decodedData = nil; decodedBundle = nil; decodedIdentity = nil; decodedItemIdentifier = nil
+    }
+
+    private static func refinedIdentity(_ previous: MediaItemIdentity?, _ next: MediaItemIdentity?) -> MediaItemIdentity? {
+        guard let previous, let next else { return next }
+        // Partial observations cannot erase the recording that supplied these pixels.
+        return .init(source: next.source, nativeID: next.nativeID ?? previous.nativeID,
+            title: next.title.isEmpty ? previous.title : next.title,
+            artist: next.artist.isEmpty ? previous.artist : next.artist,
+            album: next.album.isEmpty ? previous.album : next.album)
+    }
+
+    private static func sameItem(_ previous: MediaItemIdentity?, _ next: MediaItemIdentity?,
+                                 oldIdentifier: String?, newIdentifier: String?) -> Bool {
+        guard let previous, let next, previous.source == next.source else { return false }
+        if let oldIdentifier, let newIdentifier, oldIdentifier != newIdentifier { return false }
+        if let oldID = previous.nativeID, let newID = next.nativeID { return oldID == newID }
+        if previous == next { return true }
+        let title = MediaText.normalized(previous.title), artist = MediaText.normalized(previous.artist)
+        return !title.isEmpty && !artist.isEmpty && title == MediaText.normalized(next.title)
+            && artist == MediaText.normalized(next.artist)
+            && (previous.album.isEmpty || next.album.isEmpty
+                || MediaText.normalized(previous.album) == MediaText.normalized(next.album))
     }
     private static func decodeImage(_ data: Data) async -> NSImage? {
         await Task.detached(priority: .userInitiated) {
@@ -68,9 +120,9 @@ final class ArtworkPresentationService: ObservableObject {
             return DecodedArtwork(image: NSImage(cgImage: thumbnail, size: .zero))
         }.value.image
     }
-    private func applyFallback(_ bundle: String) {
-        let image = icon(bundle)
-        present(image ?? defaultImage, usesIcon: image != nil)
+    private func applyPlaceholder() {
+        clearDecodedAssociation()
+        if image !== defaultImage || usesApplicationIcon { present(defaultImage, usesIcon: false) }
     }
     func setImage(_ image: NSImage, usesIcon: Bool = false) {
         stop(); present(image, usesIcon: usesIcon)
