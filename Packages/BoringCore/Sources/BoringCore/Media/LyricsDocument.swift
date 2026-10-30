@@ -51,14 +51,14 @@ public enum MediaText {
             .components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }.joined(separator: " ")
     }
     public static func artistsMatch(_ names: [String], target: String) -> Bool {
-        let names = Set(names.map(normalized).filter { !$0.isEmpty })
-        let targetName = normalized(target)
-        guard !targetName.isEmpty else { return false }
-        if names.contains(targetName) { return true }
-        let separated = target.replacingOccurrences(of: #"(?i)\s*(?:[,;&×]|\bfeaturing\b|\bfeat\.?(?=\s|$)|\bft\.?(?=\s|$)|\band\b)\s*"#,
+        func performers(_ value: String) -> [String] {
+            let separated = value.replacingOccurrences(of: #"(?i)\s*(?:[,;&×]|\bfeaturing\b|\bfeat\.?(?=\s|$)|\bft\.?(?=\s|$)|\band\b)\s*"#,
                                                     with: "\n", options: .regularExpression)
-        let targetNames = Set(separated.components(separatedBy: "\n").map(normalized).filter { !$0.isEmpty })
-        return targetNames.count > 1 && targetNames == names
+            return separated.components(separatedBy: "\n").map(normalized).filter { !$0.isEmpty }
+        }
+        let names = Set(names.flatMap(performers))
+        let targetNames = Set(performers(target))
+        return !targetNames.isEmpty && targetNames == names
     }
 }
 

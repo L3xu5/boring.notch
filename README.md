@@ -17,7 +17,7 @@ The UI and platform adapters remain native SwiftUI/AppKit. Two local packages se
 ## Features
 
 - **Music:** Yandex Music, Apple Music, Spotify, the YouTube Music desktop API client and generic macOS Now Playing; artwork, transport, source-dependent favorite/dislike controls and configurable shortcuts.
-- **Lyrics:** optional Yandex account connection, LRCLIB fallback, timing adjustment and a karaoke view with click-to-seek where the source supports seeking.
+- **Lyrics:** Yandex lyrics for the current recording after connecting your account, LRCLIB for other players, timing adjustment and a karaoke view with click-to-seek where the source supports seeking.
 - **Shelf:** file and clipboard imports, previews, Quick Look, drag-and-drop, sharing and AirDrop.
 - **Everyday tools:** calendar, camera preview, battery/charging activities, volume and brightness HUDs, menu-bar controls and launch-at-login settings.
 - **Multiple displays:** independent windows, keyboard focus, screen selection, fullscreen handling and sleep/lock cleanup.
@@ -54,7 +54,7 @@ Choose a music source during onboarding. A fresh installation waits for that cho
 
 The official **Yandex Music desktop app** (`ru.yandex.desktop.music`) needs no modification. In Settings, select **Yandex Music**, grant Accessibility and start playback in that app. Connecting a Yandex account inside the notch is optional: playback controls work independently of it.
 
-With lyrics enabled, track metadata is sent to LRCLIB or, when connected, Yandex's lyrics API. Yandex OAuth credentials are kept in **macOS Keychain**. Older preference-based tokens are removed only after a successful Keychain save; **Disconnect** removes the stored credential. Lyrics use a bounded, account-separated cache. Camera/calendar permissions and account credentials are not required to use the other features.
+With lyrics enabled, Yandex Music uses Yandex's lyrics API after you connect your account; other players use LRCLIB. A missing or unavailable Yandex lyric is never replaced with another provider's text. Yandex OAuth credentials are kept in **macOS Keychain**. Older preference-based tokens are removed only after a successful Keychain save; **Disconnect** removes the stored credential. Lyrics use a bounded, account-separated cache. Camera/calendar permissions and account credentials are not required to use the other features.
 
 Generated files dragged to an external app keep a durable copy so recipients can read the exported URL later. Removing the Shelf row does not delete these copies, and there is no automatic expiry. To review them in Finder, choose **Go → Go to Folder** and enter `~/Library/Application Support/boringNotch/Shelf/OwnedAssets`. Remove only copies you no longer need; deleting a retained copy can break links in the receiving app. Original user files are never deleted by Shelf cleanup.
 

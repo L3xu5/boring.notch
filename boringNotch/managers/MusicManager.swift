@@ -70,6 +70,7 @@ class MusicManager: ObservableObject {
 
     private var lyricsService: LyricsService!
     private var nativeTrackID: String?
+    private var lyricsItemIdentifier: String?
     private var commandTasks: [UUID: Task<Void, Never>] = [:]
     private var mediaKeyRecoveryCoordinator: MediaKeyRecoveryCoordinator?
 
@@ -161,6 +162,7 @@ class MusicManager: ObservableObject {
         transitionWorkItem?.cancel(); transitionWorkItem = nil
         presentationSnapshot = nil
         nativeTrackID = nil
+        lyricsItemIdentifier = nil
         songTitle = ""
         artistName = ""
         album = ""
@@ -399,6 +401,7 @@ class MusicManager: ObservableObject {
 
         self.timestampDate = state.lastUpdated
         self.nativeTrackID = state.nativeTrackID
+        self.lyricsItemIdentifier = state.artworkItemIdentifier
 
         // (Re)fetch lyrics for the current (title, artist, duration). Running this every update is
         // cheap — the per-key dedup returns immediately when nothing relevant changed — and it
@@ -494,7 +497,8 @@ class MusicManager: ObservableObject {
         let token = Defaults[.mediaController] == .yandexMusic ? YandexMusicTokenStore.shared.token : ""
         let request = LyricsRequest(source: Defaults[.mediaController].rawValue, bundleIdentifier: bundleIdentifier,
                                     title: title, artist: artist, album: album, duration: duration,
-                                    nativeTrackID: nativeTrackID, yandexToken: token)
+                                    nativeTrackID: nativeTrackID, yandexToken: token,
+                                    itemIdentifier: lyricsItemIdentifier)
         lyricsService?.request(request, enabled: Defaults[.enableLyrics], force: force)
     }
     func lyricLine(at elapsed: Double) -> String {

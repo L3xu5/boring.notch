@@ -139,7 +139,7 @@ extension MediaControllerType {
         case .youtubeMusic:
             return "Requires a third-party client with API plugin enabled."
         case .yandexMusic:
-            return "Works with the official Yandex Music app. Accessibility enables playback controls; connecting an account for lyrics is optional."
+            return "Works with the official Yandex Music app. Accessibility enables playback controls. Connect your account to display Yandex lyrics."
         }
     }
 }

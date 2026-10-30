@@ -7,11 +7,13 @@ struct LRCLIBClient: Sendable {
     func fetch(title: String, artist: String, album: String, duration: Double) async -> LyricsDocument? {
         if duration.isFinite, duration > 0, duration < Double(Int.max), !album.isEmpty,
            let data = await get("get", query: ["track_name": title, "artist_name": artist, "album_name": album, "duration": String(Int(duration.rounded()))]),
-           let item = try? JSONDecoder().decode(LyricsMatchCandidate.self, from: data), !item.document.isEmpty { return item.document }
+           let item = try? JSONDecoder().decode(LyricsMatchCandidate.self, from: data), item.matches(title: title, artist: artist),
+           let match = LyricsRecordingMatcher.best([item], duration: duration) { return match.document }
         guard !Task.isCancelled,
               let data = await get("search", query: ["track_name": title, "artist_name": artist]),
               let candidates = try? JSONDecoder().decode([LyricsMatchCandidate].self, from: data) else { return nil }
-        return LyricsRecordingMatcher.best(candidates, duration: duration)?.document ?? .init(plain: "", synced: [])
+        let exact = candidates.filter { $0.matches(title: title, artist: artist) }
+        return LyricsRecordingMatcher.best(exact, duration: duration)?.document ?? .init(plain: "", synced: [])
     }
     private func get(_ path: String, query: [String: String]) async -> Data? {
         var url = URLComponents(string: "https://lrclib.net/api/" + path)!

@@ -119,14 +119,16 @@ func AppIconAsNSImage(for bundle: String) -> NSImage? { nil }
 struct LyricsRequest {
     let source: String; let bundleIdentifier: String?; let title: String; let artist: String
     let album: String; let duration: Double; let nativeTrackID: String?; let yandexToken: String
+    var itemIdentifier: String? = nil
 }
 @MainActor final class LyricsService {
+    private(set) var lastRequest: LyricsRequest?
     @Published var document = LyricsDocument(plain: "", synced: [])
     @Published var isFetching = false
     init() {}
     init(cache: LyricsCache, nativeLyrics: @escaping @MainActor () async throws -> String?) {}
     func stop(clear: Bool) {}
-    func request(_ request: LyricsRequest, enabled: Bool, force: Bool) {}
+    func request(_ request: LyricsRequest, enabled: Bool, force: Bool) { lastRequest = request }
 }
 @MainActor final class YandexMusicTokenStore {
     static let shared = YandexMusicTokenStore()
@@ -155,6 +157,8 @@ private extension MusicManager {
     var sourceTestHasController: Bool { activeController != nil }
     var sourceTestCommandCount: Int { commandTasks.count }
     var sourceTestBridgeChecked: Bool { bridgeChecked }
+    var sourceTestLyricsRequest: LyricsRequest? { lyricsService.lastRequest }
+    func sourceTestPublish(_ state: PlaybackState) { updateFromPlaybackState(state) }
     func sourceTestSeedPresentation() {
         albumArt = NSImage(size: NSSize(width: 8, height: 8))
         avgColor = .red
@@ -207,6 +211,7 @@ private extension MusicManager {
         try await preserveSameSourceCommand()
         try await preserveResolvedFallback()
         try await rejectLateProbeAfterNewSelection()
+        try await forwardLyricsRecordingIdentity()
         print("Music source switching: \(checks) checks passed (whole production manager; in-memory boundaries only)")
     }
     private static func cancelOldSourceBeforeProbe() async throws {
@@ -278,6 +283,28 @@ private extension MusicManager {
         try await Task.sleep(for: .milliseconds(30))
         expect(old.stopCount == 1 && manager.sourceTestSelected == .spotify && !manager.sourceTestBridgeChecked,
                "A late cancelled probe replaced the newer source or poisoned bridge status")
+        manager.destroy()
+    }
+    private static func forwardLyricsRecordingIdentity() async throws {
+        let manager = try await manager()
+        var state = FixturePlayers.last(.yandexMusic)!.state
+        state.nativeTrackID = nil
+        state.artworkItemIdentifier = "recording A"
+        manager.sourceTestPublish(state)
+        expect(manager.sourceTestLyricsRequest?.itemIdentifier == "recording A",
+               "The displayed recording's opaque association was not forwarded to lyrics")
+        state.artworkItemIdentifier = "recording B"
+        manager.sourceTestPublish(state)
+        expect(manager.sourceTestLyricsRequest?.itemIdentifier == "recording B",
+               "Same-text recording change kept the previous lyrics association")
+        manager.reloadLyricsForCurrentTrack()
+        expect(manager.sourceTestLyricsRequest?.itemIdentifier == "recording B",
+               "Explicit lyrics reload lost the current recording association")
+        Defaults[.mediaController] = .spotify
+        manager.sourceTestStart()
+        try await eventually("Replacement source did not publish") { manager.songTitle == "spotify title" }
+        expect(manager.sourceTestLyricsRequest?.itemIdentifier == nil,
+               "A replacement source inherited Yandex's opaque lyrics association")
         manager.destroy()
     }
 }

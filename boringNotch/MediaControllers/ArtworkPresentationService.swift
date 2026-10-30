@@ -28,6 +28,13 @@ final class ArtworkPresentationService: ObservableObject {
     private var decodedItemIdentifier: String?
     private var revision = UUID()
     private var decodeTask: Task<Void, Never>?
+    private struct PendingDecode {
+        let data: Data
+        let bundle: String
+        var identity: MediaItemIdentity?
+        var itemIdentifier: String?
+    }
+    private var pendingDecode: PendingDecode?
 
     init(defaultImage: NSImage, colorEnabled: @escaping () -> Bool = { true },
          decode: @escaping @MainActor (Data) async -> NSImage? = ArtworkPresentationService.decodeImage,
@@ -53,6 +60,23 @@ final class ArtworkPresentationService: ObservableObject {
                              newIdentifier: artworkItemIdentifier)
         let associatedIdentity = keepDecodedCover ? Self.refinedIdentity(decodedIdentity, identity) : identity
         let associatedIdentifier = keepDecodedCover ? artworkItemIdentifier ?? decodedItemIdentifier : artworkItemIdentifier
+        if var pending = pendingDecode, pending.bundle == bundleIdentifier,
+           data == nil || data == pending.data,
+           Self.sameItem(pending.identity, identity, oldIdentifier: pending.itemIdentifier,
+                         newIdentifier: artworkItemIdentifier) {
+            // A pause or a partial metadata observation can omit bytes while their decoder is
+            // still running. Keep that verified work alive; waiting for another artwork event
+            // can otherwise leave the placeholder on screen for the rest of the song.
+            pending.identity = Self.refinedIdentity(pending.identity, identity)
+            pending.itemIdentifier = artworkItemIdentifier ?? pending.itemIdentifier
+            pendingDecode = pending
+            self.data = data; bundle = bundleIdentifier; itemIdentity = identity
+            self.artworkItemIdentifier = artworkItemIdentifier
+            if keepDecodedCover {
+                decodedIdentity = associatedIdentity; decodedItemIdentifier = associatedIdentifier
+            }
+            return
+        }
         cancelDecode()
         self.data = data; bundle = bundleIdentifier; itemIdentity = identity
         self.artworkItemIdentifier = artworkItemIdentifier
@@ -67,20 +91,23 @@ final class ArtworkPresentationService: ObservableObject {
         } else { applyPlaceholder() }
         let ticket = revision
         guard let data else { return }
+        pendingDecode = .init(data: data, bundle: bundleIdentifier, identity: associatedIdentity,
+                              itemIdentifier: associatedIdentifier)
         decodeTask = Task { @MainActor [weak self, decode] in
             let decoded = await decode(data)
-            guard !Task.isCancelled, let self, self.revision == ticket else { return }
+            guard !Task.isCancelled, let self, self.revision == ticket,
+                  let pending = self.pendingDecode else { return }
             if let image = decoded {
                 self.decodedData = data; self.decodedBundle = bundleIdentifier
-                self.decodedIdentity = associatedIdentity; self.decodedItemIdentifier = associatedIdentifier
+                self.decodedIdentity = pending.identity; self.decodedItemIdentifier = pending.itemIdentifier
                 self.present(image, usesIcon: false)
             }
-            self.decodeTask = nil
+            self.pendingDecode = nil; self.decodeTask = nil
         }
     }
 
     private func cancelDecode() {
-        decodeTask?.cancel(); decodeTask = nil; revision = UUID()
+        decodeTask?.cancel(); decodeTask = nil; pendingDecode = nil; revision = UUID()
     }
 
     private func clearDecodedAssociation() {

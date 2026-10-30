@@ -25,14 +25,17 @@ struct YandexLyricsProvider: Sendable {
         if let id = nativeTrackID, !id.isEmpty, id.allSatisfy({ $0 >= "0" && $0 <= "9" }) {
             return await lyrics(trackId: id)
         }
+        // Text alone cannot identify the timing of a live take, radio edit or remix.
+        // Wait for duration (or an exact source ID) instead of picking a random edition.
+        guard duration.isFinite, duration > 0 else { return .notFound }
         guard let best = await resolveTrack(title: title, artist: artist, album: album, duration: duration) else {
             return .notFound
         }
         guard !Task.isCancelled else { return .failed }
         // Synced lyrics are only correct for the *exact* recording. If the best match carries no
         // synced lyrics (e.g. a live take), don't fetch — it would 404, and any other edition's LRC
-        // would drift. Report notFound so the caller falls back to LRCLIB instead.
-        guard best.hasSync else { return .notFound }
+        // would drift. Report notFound and leave synchronized lyrics unavailable.
+        guard best.hasSync, abs(best.durMs - duration * 1000) <= Self.sameRecordingMs else { return .notFound }
         return await lyrics(trackId: best.id)
     }
 
@@ -86,8 +89,9 @@ struct YandexLyricsProvider: Sendable {
 
     private func trackMatches(_ track: [String: Any], title: String, artist: String) -> Bool {
         let baseTitle = track["title"] as? String ?? ""
-        let version = track["version"] as? String ?? ""
-        let matchesTitle = titleMatches(baseTitle, title)
+        let version = (track["version"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let remaster = !version.isEmpty && version.range(of: #"(?i)^(?:\d{4}\s+)?remaster(?:ed)?(?:\s+\d{4})?$"#, options: .regularExpression) != nil
+        let matchesTitle = ((version.isEmpty || remaster) && titleMatches(baseTitle, title))
             || (!baseTitle.isEmpty && !version.isEmpty && titleMatches(baseTitle + " " + version, title))
         return matchesTitle && artistsMatch(track, artist)
     }
@@ -128,7 +132,7 @@ struct YandexLyricsProvider: Sendable {
         let pool: [Candidate]
         if targetMs > 0 {
             let near = candidates.filter { abs($0.durMs - targetMs) <= Self.durationToleranceMs }
-            // Exact recording isn't in Yandex → don't guess a wrong-length edition; let LRCLIB try.
+            // Exact recording isn't in Yandex: do not guess a wrong-length edition.
             guard !near.isEmpty else { return nil }
             pool = near
         } else {

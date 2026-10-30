@@ -29,4 +29,24 @@ import Testing
         #expect(LyricsRecordingMatcher.best([exact, wrong, same], duration: 200)?.id == "same")
         #expect(LyricsRecordingMatcher.best([wrong], duration: 200) == nil)
     }
+    @Test func nearbyEditionCannotSupplyUnverifiedTimestamps() {
+        let exact = LyricsMatchCandidate(id: "exact", duration: 200, plain: "Exact plain")
+        let different = LyricsMatchCandidate(id: "different", duration: 204, plain: "Nearby plain", synced: "[00:01]Nearby timed")
+        #expect(LyricsRecordingMatcher.best([different, exact], duration: 200)?.id == "exact")
+        #expect(LyricsRecordingMatcher.best([different], duration: 200)?.document.synced.isEmpty == true)
+        #expect(LyricsRecordingMatcher.best([different], duration: 200)?.document.plain == "Nearby plain")
+    }
+    @Test func unknownDurationCannotGuessATimedEdition() {
+        let candidate = LyricsMatchCandidate(id: "unknown", duration: 200, plain: "Plain", synced: "[00:01]Timed")
+        #expect(LyricsRecordingMatcher.best([candidate], duration: 0)?.document == .init(plain: "Plain", synced: []))
+        #expect(LyricsRecordingMatcher.best([.init(duration: 200, synced: "[00:01]Timed")], duration: .nan) == nil)
+    }
+    @Test func keywordSearchRequiresFullTitleAndPerformerSet() throws {
+        let candidate = try JSONDecoder().decode(LyricsMatchCandidate.self, from: Data(#"{"trackName":"Sóng (Live)","artistName":"Artist feat. Guest","duration":200,"syncedLyrics":"[00:01]Live"}"#.utf8))
+        #expect(!candidate.matches(title: "Song", artist: "Artist feat. Guest"))
+        #expect(!candidate.matches(title: "Song Live", artist: "Artist"))
+        #expect(candidate.matches(title: "Song Live", artist: "Guest, Artist"))
+        #expect(!MediaText.artistsMatch(["Artist", "Guest"], target: "Artist"))
+        #expect(MediaText.artistsMatch(["Artist", "Guest"], target: "Artist featuring Guest"))
+    }
 }

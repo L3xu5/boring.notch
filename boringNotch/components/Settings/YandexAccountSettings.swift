@@ -16,7 +16,7 @@ struct YandexTokenSettingsView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Yandex Music account")
                     Text(!tokenStore.isConnected
-                         ? "Optional — connect your account for lyrics synced to the exact recording."
+                         ? "Connect your account to display Yandex lyrics for the current recording."
                          : "Connected. Yandex lyrics are used when available.")
                         .font(.caption)
                         .foregroundStyle(.secondary)

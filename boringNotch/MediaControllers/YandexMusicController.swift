@@ -156,6 +156,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     private var foreignMetadataRecord: MetadataRecord?
     private var awaitingYandexTitle = false
     private var publishedMRItemID: String?
+    private var previousOpaqueTrackID: String?
     private var stagedArtworkAssociation = false
     private let snapshotReader: (@Sendable () async -> MediaWireUpdate?)?
     private var artworkSnapshotTask: Task<Void, Never>?
@@ -171,6 +172,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         let item: MediaItemIdentity
         let wireItemID: String?
         let candidateWireItemID: String?
+        let timeline: MediaTimeline
     }
     @MainActor private(set) var systemMediaOwnerBundleIdentifier: String?
     @MainActor private(set) var systemMediaIsPlaying: Bool?
@@ -430,12 +432,13 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
               isCurrentFavoriteRead(favorite) else { return }
         if let metadata {
             if !sessionIsYandex { applyAccessibilityMetadata(metadata, generation: generation) }
+            else { enrichMatchedAccessibilityIdentity(metadata) }
         }
         if !isCurrentFavoriteRead(favorite) {
             // Applying this exact AX snapshot may establish a new track or trusted ID.
             // Only its own matched Like belongs to that new item; the scoped read above
             // was requested for the old item and must never be transferred to it.
-            if !sessionIsYandex, isCurrentCommand(favorite.source), generation == accessibilityGeneration,
+            if isCurrentCommand(favorite.source), generation == accessibilityGeneration,
                currentProcessIdentifier() == favorite.processIdentifier,
                let metadata, metadataMatchesCurrentTrack(metadata), let liked = metadata.isFavorite {
                 reconcileFavoriteObservation(liked, processIdentifier: favorite.processIdentifier)
@@ -444,6 +447,29 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         }
         let metadataFavorite = metadata.flatMap { metadataMatchesCurrentTrack($0) ? $0.isFavorite : nil }
         reconcileFavoriteObservation(metadataFavorite ?? scopedFavorite, processIdentifier: favorite.processIdentifier)
+    }
+
+    /// The system session carries opaque queue IDs. A fresh matching player-bar sample
+    /// supplies Yandex's actual recording ID, so lyrics never have to guess its edition.
+    private func enrichMatchedAccessibilityIdentity(_ metadata: YandexAccessibilityMetadata) {
+        guard sessionIsYandex, !stagedArtworkAssociation, playbackState.nativeTrackID == nil,
+              let trackID = metadata.trackID, trackID != previousOpaqueTrackID,
+              metadataMatchesCurrentTrack(metadata) else { return }
+        accessibilityTrackID = trackID
+        var state = playbackState
+        state.nativeTrackID = trackID
+        playbackReadRevision &+= 1
+        favoriteLifetime.invalidate()
+        invalidateFavoriteQueue()
+        favoriteActionInFlight = nil
+        favoriteReadRevision &+= 1
+        invalidateFavoriteEvidence()
+        favoriteStateKnown = false
+        state.isFavorite = false
+        playbackState = state
+        // A pending read was tied to the less specific identity. Validate the current
+        // cover again with the enriched identity rather than abandoning its recovery.
+        if state.artwork == nil { requestArtworkSnapshot() }
     }
 
     @MainActor
@@ -472,6 +498,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         state.artist = artist
         state.album = metadata.album.isEmpty && !trackChanged ? state.album : metadata.album
         if trackChanged {
+            previousOpaqueTrackID = nil
             cancelArtworkSnapshot()
             if playbackState.artwork != nil {
                 previousItemArtwork = .init(data: playbackState.artwork, album: playbackState.album)
@@ -861,6 +888,10 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     }
     private func readLikeState() async -> Bool? {
         guard !stopped, !Task.isCancelled else { return nil }
+        guard previousOpaqueTrackID == nil || playbackState.nativeTrackID != nil else {
+            clearFavoriteObservation()
+            return nil
+        }
         guard let pid = observeProcessPresence() else { clearFavoriteObservation(); return nil }
         let request = beginFavoriteRead(processIdentifier: pid)
         let liked = await accessibilityReader.favoriteState(processIdentifier: pid, expectedTrack: Self.favoriteTarget(request.item))
@@ -899,6 +930,8 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
 
     private func metadataMatchesCurrentTrack(_ metadata: YandexAccessibilityMetadata) -> Bool {
         let state = playbackState
+        if state.nativeTrackID == nil, let previousOpaqueTrackID,
+           metadata.trackID == nil || metadata.trackID == previousOpaqueTrackID { return false }
         // Both IDs come from trusted Yandex track links, rather than opaque MediaRemote IDs.
         // A partial/localized artist label must not defeat an exact recording match.
         if let currentID = state.nativeTrackID, let observedID = metadata.trackID { return currentID == observedID }
@@ -911,6 +944,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
 
     private func needsScopedFavorite(_ metadata: YandexAccessibilityMetadata?, request: FavoriteReadRequest) -> Bool {
         guard isCurrentFavoriteRead(request) else { return false }
+        if playbackState.nativeTrackID == nil, previousOpaqueTrackID != nil { return false }
         guard let metadata else { return true }
         return metadata.isFavorite == nil || !metadataMatchesCurrentTrack(metadata)
     }
@@ -1018,6 +1052,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         foreignMetadataRecord = nil
         awaitingYandexTitle = false
         publishedMRItemID = nil
+        previousOpaqueTrackID = nil
         stagedArtworkAssociation = false
         previousItemArtwork = nil
         cancelArtworkSnapshot()
@@ -1034,7 +1069,8 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         cancelArtworkSnapshot()
         let request = ArtworkSnapshotRequest(source: sourceLifetime.ticket(), generation: artworkSnapshotGeneration,
                                               item: playbackState.identity, wireItemID: publishedMRItemID,
-                                              candidateWireItemID: candidateWireItemID ?? publishedMRItemID)
+                                              candidateWireItemID: candidateWireItemID ?? publishedMRItemID,
+                                              timeline: playbackState.timeline)
         artworkSnapshotTask = Task { @MainActor [weak self] in
             do { try await Task.sleep(for: .milliseconds(150)) } catch { return }
             guard self?.isCurrentArtworkSnapshot(request) == true else { return }
@@ -1067,16 +1103,39 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
               !request.item.title.isEmpty,
               MediaText.normalized(payload.string("title") ?? "") == MediaText.normalized(request.item.title),
               MediaText.normalized(payload.string("artist") ?? "") == MediaText.normalized(request.item.artist),
-              MediaText.normalized(payload.string("album") ?? "") == MediaText.normalized(request.item.album),
+              request.item.album.isEmpty || MediaText.normalized(payload.string("album") ?? "") == MediaText.normalized(request.item.album),
               request.candidateWireItemID == nil || payload.string("contentItemIdentifier") == request.candidateWireItemID,
               let encoded = payload.string("artworkData"), let data = Data(base64Encoded: encoded),
-              !isPreviousItemArtwork(data, album: playbackState.album) else { return }
+              !isPreviousItemArtwork(data, album: payload.string("album") ?? playbackState.album) else { return }
         var state = playbackState
+        var reconciled: [String: MediaWireValue] = [:]
+        if state.album.isEmpty, let album = payload.string("album"), !album.isEmpty {
+            state.album = album
+            reconciled["album"] = .string(album)
+        }
+        if let duration = payload.number("duration"), duration > 0,
+           state.duration == request.timeline.duration {
+            state.duration = duration
+            reconciled["duration"] = .number(duration)
+        }
+        if payload.number("elapsedTime") != nil, state.timeline.position == request.timeline.position,
+           state.lastUpdated == request.timeline.observedAt {
+            // This is a full, freshly read snapshot of the verified recording. Its time
+            // belongs with its cover; a later heartbeat or explicit seek keeps precedence.
+            let sampled = confirmed.playbackState(applying: snapshot, previous: state, now: Date())
+            state.currentTime = sampled.currentTime
+            state.lastUpdated = sampled.lastUpdated
+            reconciled["elapsedTime"] = payload["elapsedTime"]
+            if let timestamp = payload["timestamp"] { reconciled["timestamp"] = timestamp }
+        }
+        wire.apply(.init(payload: reconciled))
         if let candidate = request.candidateWireItemID, let current = publishedMRItemID, candidate != current {
+            previousOpaqueTrackID = playbackState.nativeTrackID ?? previousOpaqueTrackID
             publishedMRItemID = candidate
             state.artworkItemIdentifier = candidate
             state.nativeTrackID = nil
             accessibilityTrackID = nil
+            playbackReadRevision &+= 1
             favoriteLifetime.invalidate()
             invalidateFavoriteQueue()
             favoriteActionInFlight = nil
@@ -1238,11 +1297,42 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         let opaqueItemChanged = !stagedArtworkAssociation && publishedMRItemID != nil
             && nextItemID != nil && publishedMRItemID != nextItemID
         if opaqueItemChanged {
+            // AX can lag the new opaque recording while its base title stays identical.
+            // Do not attach that retired native ID (and its lyrics) to the new recording.
+            previousOpaqueTrackID = sameText ? playbackState.nativeTrackID ?? previousOpaqueTrackID : nil
             newState.nativeTrackID = nil
             accessibilityTrackID = nil
             if !freshArtwork { newState.artwork = nil }
         }
         let trackChanged = newState.identity != playbackState.identity || opaqueItemChanged
+        let recordingChanged = opaqueItemChanged || transportRecordingChanged(from: playbackState, to: newState)
+        if recordingChanged && !sameText { previousOpaqueTrackID = nil }
+        let pendingRecording = stagedArtworkAssociation && nextItemID != nil && publishedMRItemID != nil
+            && nextItemID != publishedMRItemID
+        if pendingRecording {
+            newState.currentTime = playbackState.currentTime
+            newState.lastUpdated = playbackState.lastUpdated
+            newState.duration = playbackState.duration
+        } else if recordingChanged {
+            // A partial new-item patch cannot carry the old song's clock into its lyrics.
+            // Remove unobserved fields from the merged wire state too, so a heartbeat
+            // cannot resurrect the previous duration after this publication.
+            var stale: [String: MediaWireValue] = [:]
+            if update.payload["duration"] == nil {
+                newState.duration = 0
+                stale["duration"] = .null
+            }
+            if update.payload.number("elapsedTime") == nil {
+                newState.currentTime = 0
+                newState.lastUpdated = Date()
+                stale["elapsedTime"] = .null
+            }
+            if update.payload.string("timestamp").flatMap(Self.adapterDate) == nil {
+                newState.lastUpdated = Date()
+                stale["timestamp"] = .null
+            }
+            wire.apply(.init(payload: stale))
+        }
         if confirmedPlayingPID == processIdentifier, confirmedPlaying == false, systemMediaIsPlaying == true,
            MetadataRecord(newState, wireItemID: stagedArtworkAssociation ? publishedMRItemID : nextItemID)
             .matches(MetadataRecord(playbackState, wireItemID: publishedMRItemID)) {

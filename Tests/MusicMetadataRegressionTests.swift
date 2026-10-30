@@ -90,7 +90,10 @@ func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
         try await stoppingRejectsAnUncancelableDecode()
         try await sharedBytesCannotForgetDecodedAssociation()
         try await qualityCompletionCannotForgetDecodedAssociation()
-        print("17 music metadata regression scenarios passed (actual service/Core; real AppKit image values)")
+        try await sameItemNilKeepsPendingDecode()
+        try await pendingRefinementsDoNotRestartDecode()
+        try await pendingRefinementsPreserveRecordingProof()
+        print("20 music metadata regression scenarios passed (actual service/Core; real AppKit image values)")
     }
     @MainActor static func metadataWithSharedCover() async throws {
         let manager = MusicManager()
@@ -309,5 +312,68 @@ func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
         service.apply(data: nil, bundleIdentifier: new.bundleIdentifier, identity: new.identity)
         try await Task.sleep(for: .milliseconds(200))
         try expect(service.image === placeholder && !service.usesApplicationIcon, "A stopped decoder restored an old cover")
+    }
+
+    @MainActor static func sameItemNilKeepsPendingDecode() async throws {
+        let manager = MusicManager()
+        var track = state("Pending pause", artwork: "slow-pause-before-decode")
+        track.artworkItemIdentifier = "pending pause"
+        manager.apply(track)
+        try await eventually("pause decode started") { ImageFixtures.decoding.contains("slow-pause-before-decode") }
+        track.artwork = nil; track.isPlaying = false; track.playbackRate = 0
+        manager.apply(track)
+        try await eventually("paused cover completes without another artwork event") {
+            manager.albumArt === ImageFixtures.image("slow-pause-before-decode")
+        }
+    }
+
+    @MainActor static func pendingRefinementsDoNotRestartDecode() async throws {
+        let manager = MusicManager()
+        let name = "slow-pending-refinements"
+        let completed = ImageFixtures.completed[name, default: 0]
+        var track = state("Pending refinement", artwork: name)
+        manager.apply(track)
+        try await eventually("refinement decode started") { ImageFixtures.decoding.contains(name) }
+        track.nativeTrackID = "123"
+        manager.apply(track)
+        track.artworkItemIdentifier = "pending recording"
+        manager.apply(track)
+        track.album = ""
+        manager.apply(track)
+        track.artwork = nil
+        manager.apply(track)
+        try await eventually("refined pending cover completes") { manager.albumArt === ImageFixtures.image(name) }
+        try expect(ImageFixtures.completed[name, default: 0] == completed + 1,
+                   "Same-item metadata refinements restarted the pending image decoder")
+        track.artworkItemIdentifier = "another recording"
+        manager.apply(track)
+        try expect(manager.albumArt === ImageFixtures.image("default"),
+                   "A coalesced decode forgot the recording proof supplied while decoding")
+    }
+
+    @MainActor static func pendingRefinementsPreserveRecordingProof() async throws {
+        for boundary in ["opaque", "native", "album", "source"] {
+            let manager = MusicManager()
+            let name = "slow-pending-proof-" + boundary
+            var track = state("Pending proof", artwork: name)
+            track.nativeTrackID = "123"; track.artworkItemIdentifier = "opaque A"
+            manager.apply(track)
+            try await eventually("pending proof decode started") { ImageFixtures.decoding.contains(name) }
+            track.artwork = nil; track.nativeTrackID = nil; track.artworkItemIdentifier = nil; track.album = ""
+            manager.apply(track)
+            switch boundary {
+            case "opaque": track.artworkItemIdentifier = "opaque B"
+            case "native": track.nativeTrackID = "456"
+            case "album": track.album = "Another album"
+            default: track.bundleIdentifier = "another.player"
+            }
+            manager.apply(track)
+            try await eventually("rejected pending decode completed") { ImageFixtures.completed[name, default: 0] > 0 }
+            // The decoder completion is deliberately uncancelable. Let its caller resume,
+            // then verify that the revision gate rejected the obsolete image.
+            try await Task.sleep(for: .milliseconds(20))
+            try expect(manager.albumArt === ImageFixtures.image("default"),
+                       "A pending decoder crossed the \(boundary) boundary after a partial observation")
+        }
     }
 }
