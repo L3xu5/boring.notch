@@ -7,7 +7,7 @@ private struct SnapshotFixture: Sendable {
     let resources: MediaAdapterSnapshotReader.Resources
     var marker: URL { resources.framework.appendingPathComponent("started") }
 
-    init(_ body: String) throws {
+    init(_ body: String, startupDelay: TimeInterval = 0) throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent("snapshot-fixture-" + UUID().uuidString)
         let framework = directory.appendingPathComponent("Fixture Framework.framework", isDirectory: true)
         try FileManager.default.createDirectory(at: framework, withIntermediateDirectories: true)
@@ -18,9 +18,11 @@ private struct SnapshotFixture: Sendable {
         use warnings;
         $| = 1;
         die 'expected get only' unless @ARGV == 2 && $ARGV[1] eq 'get';
-        open(my $marker, '>', "$ARGV[0]/started") or die $!;
+        select(undef, undef, undef, \(startupDelay));
+        open(my $marker, '>', "$ARGV[0]/starting") or die $!;
         print $marker "$$\\n";
-        close($marker);
+        close($marker) or die $!;
+        rename("$ARGV[0]/starting", "$ARGV[0]/started") or die $!;
         """
         try Data((prefix + "\n" + body).utf8).write(to: script)
         resources = .init(script: script, framework: framework)
@@ -127,11 +129,18 @@ private struct SnapshotFixture: Sendable {
     }
 
     private static func timeoutAndCancellation() async throws {
-        let timeout = try SnapshotFixture("$SIG{TERM} = sub {}; sleep 60;")
+        let timeout = try SnapshotFixture("$SIG{TERM} = sub {}; sleep 60;", startupDelay: 0.25)
         defer { timeout.cleanup() }
-        let started = Date()
-        let expired = await timeout.reader(timeout: 0.15).read()
-        expect(expired == nil && Date().timeIntervalSince(started) < 1, "A silent get ignored its timeout")
+        let started = ContinuousClock.now
+        let expiration = Task { await timeout.reader().read() }
+        // Exercise the real three-second production bound. A loaded CI runner may not
+        // schedule Perl within 150 ms; require its atomically published PID before
+        // checking cleanup instead of assuming that a short timer proves startup.
+        try await wait("Timeout fixture did not start") { FileManager.default.fileExists(atPath: timeout.marker.path) }
+        let expired = await expiration.value
+        let elapsed = started.duration(to: .now)
+        expect(expired == nil && elapsed >= .seconds(2.5) && elapsed < .seconds(5),
+               "A silent get did not enforce its three-second timeout")
         try await dead(timeout)
 
         let cancelled = try SnapshotFixture("$SIG{TERM} = sub {}; sleep 60;")
@@ -150,9 +159,11 @@ private struct SnapshotFixture: Sendable {
         let earlyResult = await early.value
         expect(earlyResult == nil && !FileManager.default.fileExists(atPath: beforeStart.marker.path), "Pre-cancelled get still launched its subprocess")
 
-        let openAfterJSON = try SnapshotFixture("print q~" + valid + "~; close(STDOUT); sleep 60;")
+        let openAfterJSON = try SnapshotFixture("print q~" + valid + "~; close(STDOUT); sleep 60;", startupDelay: 0.25)
         defer { openAfterJSON.cleanup() }
-        let incomplete = await openAfterJSON.reader(timeout: 0.15).read()
+        let incompleteRead = Task { await openAfterJSON.reader().read() }
+        try await wait("EOF fixture did not start") { FileManager.default.fileExists(atPath: openAfterJSON.marker.path) }
+        let incomplete = await incompleteRead.value
         expect(incomplete == nil, "EOF before a successful process exit bypassed the timeout")
         try await dead(openAfterJSON)
     }

@@ -262,6 +262,8 @@ private final class YandexMetadataURLProtocol: URLProtocol {
 private extension YandexMusicController {
     var metadataTestProcess: Process? { process }
     var metadataTestReader: Task<Void, Never>? { streamTask }
+    var metadataTestStreamComplete: Bool { adapterPayload.boolean("__fixtureStreamComplete") == true }
+    var metadataTestArtworkSnapshotTask: Task<Void, Never>? { artworkSnapshotTask }
     @MainActor func metadataTestApplyAX(_ node: YandexAccessibilityNode) {
         if let metadata = YandexAccessibilityMetadata(root: node) {
             applyAccessibilityMetadata(metadata, generation: accessibilityGeneration)
@@ -2065,6 +2067,10 @@ private struct YandexMetadataRegressionTests {
             data.append(try JSONSerialization.data(withJSONObject: message, options: [.sortedKeys]))
             data.append(10)
         }
+        // A writer reaching EOF only proves that its pipe was filled. This sentinel must
+        // pass through the real adapter reader and MainActor reducer before assertions.
+        data.append(try JSONSerialization.data(withJSONObject: update(["__fixtureStreamComplete": true])))
+        data.append(10)
         try data.write(to: fixture)
         setenv("YANDEX_METADATA_FIXTURE", fixture.path, 1)
         setenv("YANDEX_METADATA_DONE", done.path, 1)
@@ -2075,7 +2081,12 @@ private struct YandexMetadataRegressionTests {
         weak var weakController = controller
         defer { weakController = nil }
         try await waitFor("fixture stream did not complete") { FileManager.default.fileExists(atPath: done.path) }
-        try await Task.sleep(for: .milliseconds(snapshot == nil ? 80 : 250))
+        try await waitFor("fixture stream was written but its final update was not consumed") {
+            controller!.metadataTestStreamComplete
+        }
+        // The final update can leave a debounced full-snapshot validation pending. Await
+        // that actual task rather than assuming the runner finishes it within 250 ms.
+        if let validation = controller!.metadataTestArtworkSnapshotTask { await validation.value }
         try await verify(controller!)
         let process = controller!.metadataTestProcess
         let reader = controller!.metadataTestReader
