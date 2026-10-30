@@ -93,6 +93,12 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     private var favoriteActionInFlight: UUID?
     private var favoriteQueueTail: Task<Void, Never>?
     private var favoriteQueueTailID: UUID?
+    private var navigationQueueTail: Task<Void, Never>?
+    private var navigationQueueTailID: UUID?
+    private struct NavigationRequest: Sendable {
+        let source: UUID
+        let processIdentifier: pid_t
+    }
     private enum FavoriteCommand { case toggle, set(Bool), dislike }
     private struct FavoriteCommandRequest {
         let source: UUID
@@ -238,6 +244,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         if let terminatedPID, let currentPID = currentProcessIdentifier(), currentPID != terminatedPID { return }
         sourceLifetime.invalidate(); favoriteLifetime.invalidate(); transportLifetime.invalidate()
         invalidateFavoriteQueue()
+        invalidateNavigationQueue()
         favoriteActionInFlight = nil
         clearMetadataAuthority()
         sessionIsYandex = false
@@ -271,11 +278,13 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         accessibilityArtworkTask?.cancel()
         artworkSnapshotTask?.cancel()
         favoriteQueueTail?.cancel()
+        navigationQueueTail?.cancel()
         favoriteEvidenceExpiryTask?.cancel()
     }
     func stop() {
         sourceLifetime.invalidate(); favoriteLifetime.invalidate(); transportLifetime.invalidate()
         invalidateFavoriteQueue()
+        invalidateNavigationQueue()
         favoriteActionInFlight = nil
         clearMetadataAuthority()
         stopped = true
@@ -658,11 +667,74 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
 
     @MainActor
     func nextTrack() async {
-        if await performTransport(.next) { clearMetadataAuthorityForNavigation() }
+        guard let queued = enqueueNavigation(.next) else { return }
+        await Self.waitForNavigationCommand(queued)
     }
     @MainActor
     func previousTrack() async {
-        if await performTransport(.previous) { clearMetadataAuthorityForNavigation() }
+        guard let queued = enqueueNavigation(.previous) else { return }
+        await Self.waitForNavigationCommand(queued)
+    }
+
+    private func enqueueNavigation(_ action: YandexPlayerAction) -> Task<Void, Never>? {
+        guard !stopped, !Task.isCancelled else { return nil }
+        guard let pid = observeProcessPresence() else {
+            handleTransportMiss(ticket: sourceLifetime.ticket(), transportTicket: transportLifetime.ticket())
+            return nil
+        }
+        let request = NavigationRequest(source: sourceLifetime.ticket(), processIdentifier: pid)
+        let previous = navigationQueueTail, id = UUID()
+        let reader = accessibilityReader, source = sourceLifetime
+        let queued = Task { @MainActor [weak self] in
+            defer { self?.finishNavigationQueueEntry(id) }
+            await previous?.value
+            guard !Task.isCancelled, self?.isCurrentNavigation(request) == true else { return }
+            let metadataTicket = self?.transportLifetime.ticket()
+            // Next/Previous target this player's current queue, including the item reached
+            // by the preceding click. Record/playing updates cannot cancel that intent.
+            let isCurrent: @Sendable () -> Bool = { !Task.isCancelled && source.isCurrent(request.source) }
+            let performed = await reader.performExplicitTransport(action, desiredPlaying: nil,
+                processIdentifier: request.processIdentifier, isCurrent: isCurrent)
+            guard let self, self.isCurrentNavigation(request) else { return }
+            if performed {
+                // The accepted press may already have produced new MR/AX content while
+                // its receipt was suspended. Release only the authority we started with.
+                if let metadataTicket, self.transportLifetime.isCurrent(metadataTicket) {
+                    self.clearMetadataAuthorityForNavigation()
+                }
+            } else {
+                self.handleTransportMiss(ticket: request.source, transportTicket: self.transportLifetime.ticket())
+            }
+        }
+        navigationQueueTail = queued
+        navigationQueueTailID = id
+        return queued
+    }
+
+    private static func waitForNavigationCommand(_ queued: Task<Void, Never>) async {
+        await withTaskCancellationHandler { await queued.value } onCancel: { queued.cancel() }
+    }
+
+    private func isCurrentNavigation(_ request: NavigationRequest) -> Bool {
+        guard isCurrentCommand(request.source) else { return false }
+        guard currentProcessIdentifier() == request.processIdentifier else {
+            _ = observeProcessPresence()
+            return false
+        }
+        return true
+    }
+
+    private func finishNavigationQueueEntry(_ id: UUID) {
+        if navigationQueueTailID == id {
+            navigationQueueTail = nil
+            navigationQueueTailID = nil
+        }
+    }
+
+    private func invalidateNavigationQueue() {
+        navigationQueueTail?.cancel()
+        navigationQueueTail = nil
+        navigationQueueTailID = nil
     }
 
     /// Called when an AX transport press couldn't be delivered. Rather than hijacking another
@@ -841,6 +913,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         }, onRestart: { [weak self] in await self?.resetAdapterState() })
     }
     private func resetAdapterState() {
+        let hadYandexSession = sessionIsYandex
         transportLifetime.invalidate()
         favoriteLifetime.invalidate()
         invalidateFavoriteQueue()
@@ -852,6 +925,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         systemMediaLastUpdated = nil; systemMediaTimestamp = nil
         accessibilityGeneration &+= 1
         invalidatePlaybackEvidence(stopPlayback: true)
+        if hadYandexSession { publishCapabilitiesChange() }
     }
     private func performPlayerAction(_ action: YandexPlayerAction, sourceTicket: UUID, favoriteTicket: UUID? = nil,
                                      transportTicket: UUID? = nil, systemTicket: UUID? = nil,
@@ -1172,6 +1246,13 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         playbackState = held
     }
 
+    private func publishCapabilitiesChange() {
+        // The facade refreshes capabilities from this publisher. Ownership can disable
+        // global seek/shuffle/repeat while every Yandex content field stays unchanged.
+        let held = playbackState
+        playbackState = held
+    }
+
     private func transportRecordingChanged(from old: PlaybackState, to new: PlaybackState) -> Bool {
         if MediaText.normalized(old.title) != MediaText.normalized(new.title)
             || MediaText.normalized(old.artist) != MediaText.normalized(new.artist) { return true }
@@ -1250,6 +1331,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
                 let foreign = wire.playbackState(applying: update, previous: playbackState, now: Date())
                 foreignMetadataRecord = MetadataRecord(foreign, wireItemID: payload.string("contentItemIdentifier"))
             }
+            if wasYandex { publishCapabilitiesChange() }
             return
         }
 

@@ -298,6 +298,9 @@ private extension YandexMusicController {
     }
     @MainActor var metadataTestFavoriteEvidenceTask: Task<Void, Never>? { favoriteEvidenceExpiryTask }
     @MainActor var metadataTestFavoriteQueueID: UUID? { favoriteQueueTailID }
+    @MainActor var metadataTestNavigationQueueID: UUID? { navigationQueueTailID }
+    @MainActor var metadataTestAccessibilityGeneration: UInt { accessibilityGeneration }
+    @MainActor func metadataTestEnqueueNavigation(_ action: YandexPlayerAction) -> Task<Void, Never>? { enqueueNavigation(action) }
     @MainActor func metadataTestPredecessor(_ task: Task<Void, Never>) { favoriteQueueTail = task; favoriteQueueTailID = UUID() }
     @MainActor func metadataTestEnqueueToggle() -> Task<Void, Never>? { enqueueFavoriteCommand(.toggle) }
     static func metadataTestFetchArtwork(_ node: YandexAccessibilityNode, token: String,
@@ -2670,7 +2673,254 @@ private struct YandexMetadataRegressionTests {
     }
 
     @MainActor
+    private static func navigationIntentFIFO() async throws {
+        func seed(_ controller: YandexMusicController) async throws {
+            try await controller.metadataTestUpdate(track("A", id: "opaque A", art: "art A"), diff: false)
+        }
+        for actions: [YandexPlayerAction] in [[.next, .next], [.previous, .previous], [.next, .previous, .next]] {
+            let client = DelayedYandexAX()
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await seed(controller)
+            let queued = actions.map { controller.metadataTestEnqueueNavigation($0)! }
+            for index in actions.indices {
+                try await waitForAX("Queued navigation did not enter AX in order") { await client.pendingActions == 1 }
+                let before = await client.performedCount
+                try expect(before == index, "Concurrent navigation bypassed FIFO ordering")
+                // A preceding click's native notification can arrive while the next AX
+                // lookup is suspended. That notification must not consume the next click.
+                try await controller.metadataTestUpdate(["title": "Track \(index)",
+                    "contentItemIdentifier": "opaque \(index)", "playing": index.isMultiple(of: 2)])
+                await client.finishAction(true)
+                await queued[index].value
+            }
+            let performed = await client.performedActions
+            try expect(performed == actions.map { String(describing: $0) }, "Rapid navigation lost or reordered a user click")
+            try expect(controller.metadataTestNavigationQueueID == nil, "Completed navigation retained its queue tail")
+            controller.stop(); passed += 1
+            print("PASS rapid directed navigation preserves FIFO: \(performed)")
+        }
+        for change in ["native pause", "scoped pause", "track", "opaque", "album", "native ID", "foreign activity", "owner switch", "adapter reset"] {
+            let client = DelayedYandexAX()
+            var unavailable = 0
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: { unavailable += 1 }, startMonitoring: false)!
+            try await seed(controller)
+            if change == "album" { try await controller.metadataTestUpdate(["album": "Album A"]) }
+            if change == "foreign activity" {
+                try await controller.metadataTestUpdate(track("Browser", owner: "com.apple.Safari"), diff: false)
+            }
+            let command = Task { await controller.nextTrack() }
+            try await waitForAX("Directed navigation did not enter AX before \(change)") { await client.pendingActions == 1 }
+            switch change {
+            case "native pause": try await controller.metadataTestUpdate(["playing": false, "playbackRate": 0.0])
+            case "scoped pause": await client.setPlaybackState(false); await controller.metadataTestRefreshPlaying()
+            case "track": try await controller.metadataTestUpdate(["title": "B", "contentItemIdentifier": "opaque B"])
+            case "opaque": try await controller.metadataTestUpdate(["contentItemIdentifier": "opaque B"])
+            case "album": try await controller.metadataTestUpdate(["album": "Album B"])
+            case "native ID":
+                let refresh = Task { await controller.refreshAccessibilityMetadata() }
+                try await waitForAX("Navigation identity enrichment did not read AX") { await client.pendingFavorites == 1 }
+                await client.finishSnapshot(favoriteMetadata(true, title: "A", trackID: "123")); await refresh.value
+                try expect(controller.playbackState.nativeTrackID == "123", "Navigation fixture did not enrich exact recording identity")
+            case "foreign activity": try await controller.metadataTestUpdate(["elapsedTime": 42.0])
+            case "owner switch": try await controller.metadataTestUpdate(track("Browser", owner: "com.apple.Safari"), diff: false)
+            default: controller.metadataTestReset()
+            }
+            await client.finishAction(true); await command.value
+            let performed = await client.performedActions
+            try expect(performed == ["next"] && unavailable == 0, "A recording/session update canceled directed navigation: \(change)")
+            if change == "adapter reset" {
+                try expect(controller.systemMediaOwnerBundleIdentifier == nil,
+                           "Directed navigation resurrected a reset global media session")
+            }
+            controller.stop(); passed += 1
+            print("PASS directed navigation survives \(change) without global media commands")
+        }
+        for boundary in ["stop", "quit", "PID", "cancel"] {
+            let pid = PlaybackPIDBox(), client = DelayedYandexAX()
+            var unavailable = 0
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { pid.value },
+                onTransportUnavailable: { unavailable += 1 }, startMonitoring: false)!
+            try await seed(controller)
+            let first = controller.metadataTestEnqueueNavigation(.next)!
+            let second = controller.metadataTestEnqueueNavigation(.previous)!
+            try await waitForAX("Navigation boundary fixture did not enter AX") { await client.pendingActions == 1 }
+            switch boundary {
+            case "stop": controller.stop()
+            case "quit": pid.value = nil; controller.metadataTestTerminate()
+            case "PID": pid.value = 43; await controller.metadataTestRefreshPlaying()
+            default: first.cancel(); second.cancel()
+            }
+            let generation = controller.metadataTestAccessibilityGeneration
+            await client.finishAction(true); await first.value; await second.value
+            let performed = await client.performedCount
+            try expect(performed == 0 && unavailable == 0, "Old active/queued navigation pressed or reopened the player after \(boundary)")
+            try expect(controller.metadataTestAccessibilityGeneration == generation,
+                       "A late old navigation reply cleared current metadata authority after \(boundary)")
+            controller.stop(); passed += 1
+            print("PASS active and queued navigation reject \(boundary)")
+        }
+        do {
+            let client = DelayedYandexAX()
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await seed(controller)
+            let first = controller.metadataTestEnqueueNavigation(.next)!
+            let canceled = controller.metadataTestEnqueueNavigation(.previous)!
+            let last = controller.metadataTestEnqueueNavigation(.next)!
+            try await waitForAX("Cancelable navigation did not enter AX") { await client.pendingActions == 1 }
+            canceled.cancel()
+            await client.finishAction(true); await first.value
+            try await waitForAX("Canceled middle navigation blocked its successor") { await client.pendingActions == 1 }
+            await client.finishAction(true); await canceled.value; await last.value
+            let performed = await client.performedActions
+            try expect(performed == ["next", "next"], "A canceled navigation consumed or reordered the following click")
+            controller.stop(); passed += 1
+            print("PASS canceling a queued navigation preserves its successor")
+        }
+        do {
+            let client = AcceptedTransportYandexAX()
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await seed(controller)
+            let first = controller.metadataTestEnqueueNavigation(.next)!
+            let second = controller.metadataTestEnqueueNavigation(.previous)!
+            try await waitForAX("Accepted old navigation did not suspend its reply") { await client.waitingForReply }
+            controller.stop()
+            let generation = controller.metadataTestAccessibilityGeneration
+            await client.finish(); await first.value; await second.value
+            let accepted = await client.accepted
+            try expect(accepted == 1 && controller.metadataTestAccessibilityGeneration == generation,
+                       "An already accepted old response released current metadata authority or ran its queued successor")
+            passed += 1
+            print("PASS accepted late navigation receipt cannot mutate a stopped source")
+        }
+        do {
+            let client = DelayedYandexAX()
+            var controller: YandexMusicController? = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false)!
+            try await seed(controller!)
+            let first = controller!.metadataTestEnqueueNavigation(.next)!
+            let second = controller!.metadataTestEnqueueNavigation(.previous)!
+            try await waitForAX("Navigation lifetime fixture did not enter AX") { await client.pendingActions == 1 }
+            weak var released = controller
+            defer { released = nil }
+            controller = nil
+            try await waitFor("Navigation queue retained the source while awaiting AX") { released == nil }
+            await client.finishAction(true); await first.value; await second.value
+            let performed = await client.performedCount
+            try expect(performed == 0, "A released navigation source still pressed the player")
+            passed += 1
+            print("PASS active and queued navigation release their source during AX IPC")
+        }
+    }
+
+    @MainActor
+    private static func ownerBoundaryCapabilities() async throws {
+        for owner: String? in ["com.apple.Safari", nil] {
+            let client = SnapshotYandexAX(favoriteMetadata(true, title: "A", trackID: "123"))
+            var seeks: [Double] = []
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 }, startMonitoring: false,
+                seekDispatcher: { seeks.append($0) })!
+            var initial = track("A", id: "opaque A", art: "art A")
+            initial["playing"] = false; initial["playbackRate"] = 0.0
+            initial["elapsedTime"] = 40.0; initial["duration"] = 180.0
+            try await controller.metadataTestUpdate(initial, diff: false)
+            await controller.refreshAccessibilityMetadata()
+            let held = controller.playbackState, ownedCapabilities = controller.capabilities
+            var publications: [(PlaybackState, MediaCapabilities)] = []
+            let subscription = controller.playbackStatePublisher.dropFirst().sink { state in
+                publications.append((state, controller.capabilities))
+            }
+            try await controller.metadataTestUpdate(owner.map { track("Browser", owner: $0) } ?? [:], diff: false)
+            try expect(publications.count == 1 && publications[0].0 == held,
+                       "An owner boundary did not publish retained Yandex content for its capability refresh")
+            let foreignCapabilities = publications[0].1
+            try expect(!foreignCapabilities.seek && !foreignCapabilities.shuffle && !foreignCapabilities.repeatMode,
+                       "An owner boundary published stale global-command capabilities")
+            try expect(controller.currentFavoriteState == true && controller.playbackState == held,
+                       "Refreshing owner-boundary capabilities changed Yandex content, time or favorite")
+            await controller.seek(to: 55)
+            try expect(seeks.isEmpty, "A disabled owner-boundary seek reached a foreign session")
+            try await controller.metadataTestUpdate(["elapsedTime": 99.0])
+            try expect(publications.count == 1, "Foreign heartbeats repeatedly republished unchanged Yandex content")
+            try await controller.metadataTestUpdate(initial, diff: false)
+            try expect(publications.last?.1 == ownedCapabilities && controller.playbackState.title == "A",
+                       "Returning Yandex ownership failed to restore its actual capabilities")
+            subscription.cancel(); controller.stop(); passed += 1
+            print("PASS owner boundary publishes capability changes without changing Yandex content: \(owner ?? "empty")")
+        }
+        do {
+            let controller = YandexMusicController(accessibility: SnapshotYandexAX(nil), processIdentifier: { 42 }, startMonitoring: false)!
+            var initial = track("A", id: "opaque A", art: "art A")
+            initial["playing"] = false; initial["playbackRate"] = 0.0
+            initial["elapsedTime"] = 40.0; initial["duration"] = 180.0
+            try await controller.metadataTestUpdate(initial, diff: false)
+            let held = controller.playbackState
+            var publications: [(PlaybackState, MediaCapabilities)] = []
+            let subscription = controller.playbackStatePublisher.dropFirst().sink { state in
+                publications.append((state, controller.capabilities))
+            }
+            controller.metadataTestReset()
+            try expect(publications.count == 1 && publications[0].0 == held && !publications[0].1.seek,
+                       "Resetting an already paused adapter left its old seek capability visible")
+            subscription.cancel(); controller.stop(); passed += 1
+            print("PASS paused adapter reset publishes disabled global-command capabilities")
+        }
+    }
+
+    @MainActor
+    private static func navigationReceiptMetadataPrecedence() async throws {
+        do {
+            let client = DelayedYandexAX(), fixture = MetadataGetFixture()
+            await fixture.delay()
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false, snapshotReader: { await fixture.read() })!
+            try await controller.metadataTestUpdate(track("A", id: "opaque A", art: "art A"), diff: false)
+            let next = Task { await controller.nextTrack() }
+            try await waitForAX("Delayed navigation did not enter AX") { await client.pendingActions == 1 }
+            try await controller.metadataTestUpdate(["title": "B", "contentItemIdentifier": "opaque B"])
+            try await waitForAX("New recording did not begin artwork validation") { await fixture.pending == 1 }
+            await client.finishAction(true); await next.value
+            await fixture.finish(try wireSnapshot(track("B", id: "opaque B", art: "art B")))
+            try await waitFor("A late navigation receipt canceled the new recording's cover validation") {
+                controller.playbackState.artwork == Data("art B".utf8)
+            }
+            let performed = await client.performedCount
+            try expect(performed == 1 && controller.playbackState.title == "B",
+                       "New metadata canceled delivery or a late receipt replaced the current recording")
+            controller.stop(); passed += 1
+            print("PASS new recording artwork validation takes precedence over a late navigation receipt")
+        }
+        do {
+            let client = DelayedYandexAX(), clock = MetadataClockFixture()
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 },
+                onTransportUnavailable: {}, startMonitoring: false, metadataClock: { clock.now })!
+            try await controller.metadataTestUpdate(track("A", id: "opaque A", art: "art A"), diff: false)
+            try await controller.metadataTestUpdate(track("Browser", owner: "com.apple.Safari"), diff: false)
+            func ax(_ title: String) -> YandexAccessibilityNode {
+                node("AXGroup", children: [node("AXLink", "Track \(title)"), node("AXLink", "Artist Artist")])
+            }
+            controller.metadataTestApplyAX(ax("B"))
+            let next = Task { await controller.nextTrack() }
+            try await waitForAX("AX authority navigation did not enter native dispatch") { await client.pendingActions == 1 }
+            controller.metadataTestApplyAX(ax("C"))
+            await client.finishAction(true); await next.value
+            try await controller.metadataTestUpdate(track("A", id: "opaque A", art: "art A"), diff: false)
+            let performed = await client.performedCount
+            try expect(performed == 1 && controller.playbackState.title == "C",
+                       "A late navigation receipt erased a newer AX metadata barrier")
+            controller.stop(); passed += 1
+            print("PASS new AX authority takes precedence over a late navigation receipt")
+        }
+    }
+
+    @MainActor
     static func main() async throws {
+        try await navigationReceiptMetadataPrecedence()
+        try await ownerBoundaryCapabilities()
+        try await navigationIntentFIFO()
         try await sameRecordingArtworkIdentity()
         try await recordingSynchronization()
         try await directedTransportArbitration()
