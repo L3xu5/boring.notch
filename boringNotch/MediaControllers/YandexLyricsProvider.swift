@@ -9,19 +9,25 @@ import Foundation
 struct YandexLyricsProvider: Sendable {
     var session: URLSession = MediaHTTPSession.shared
     let token: String
+    var timestamp: @Sendable () -> Int = { Int(Date().timeIntervalSince1970) }
     private let base = "https://api.music.yandex.net"
-    private let clientHeader = "YandexMusicAndroid/24023621"
-    private let signSecret = "p93jhgh689SBReK6ghtw62"
+    // Public protocol constants from the official macOS desktop client. The request
+    // signature is bound to its client family, not to an Android application version.
+    private let clientHeader = "YandexMusicDesktopAppMacOS/5.124.1"
+    private let signSecret = "uz0zSpaYCLmgk6C7YLdo5F"
 
     enum Result: Sendable {
         case lrc(String)   // synced LRC text
+        case plain(String) // the same exact recording has ordinary, unsynchronized text
+        case authenticationRequired
         case notFound      // reached the API, but the track/lyrics don't exist there
-        case failed        // network/auth error — caller should fall back and may retry
+        case failed        // temporary transport/schema/access error; retry this recording
     }
 
     /// Returns the raw LRC text for the exact playing recording, or a status for the caller.
     func fetchLRC(title: String, artist: String, album: String, duration: Double, nativeTrackID: String? = nil) async -> Result {
-        guard !Task.isCancelled, !token.isEmpty else { return .failed }
+        guard !Task.isCancelled else { return .failed }
+        guard !token.isEmpty else { return .authenticationRequired }
         if let id = nativeTrackID, !id.isEmpty, id.allSatisfy({ $0 >= "0" && $0 <= "9" }) {
             return await lyrics(trackId: id)
         }
@@ -183,17 +189,31 @@ struct YandexLyricsProvider: Sendable {
             .compactMap(candidate)
     }
 
+    private enum Format: String { case lrc = "LRC", text = "TEXT" }
+
     private func lyrics(trackId: String) async -> Result {
+        let synchronized = await lyrics(trackId: trackId, format: .lrc)
         guard !Task.isCancelled else { return .failed }
-        let ts = Int(Date().timeIntervalSince1970)
+        // The native player offers ordinary text independently of karaoke. A missing
+        // LRC must not hide that same recording's available text, and must never cause
+        // a search for another version. Auth/network errors retain their own meaning.
+        if case .notFound = synchronized { return await lyrics(trackId: trackId, format: .text) }
+        return synchronized
+    }
+
+    private func lyrics(trackId: String, format: Format) async -> Result {
+        guard !Task.isCancelled else { return .failed }
+        let ts = timestamp()
         let mac = HMAC<SHA256>.authenticationCode(
             for: Data("\(trackId)\(ts)".utf8), using: SymmetricKey(data: Data(signSecret.utf8)))
         let sign = Data(mac).base64EncodedString()
         guard let signEnc = queryValue(sign),
-              let url = URL(string: "\(base)/tracks/\(trackId)/lyrics?format=LRC&timeStamp=\(ts)&sign=\(signEnc)"),
+              let url = URL(string: "\(base)/tracks/\(trackId)/lyrics?format=\(format.rawValue)&timeStamp=\(ts)&sign=\(signEnc)"),
               let (data, resp) = try? await session.data(for: authorized(url)),
-              !Task.isCancelled else { return .failed }
+              !Task.isCancelled, resp.url?.scheme == "https", resp.url?.host == "api.music.yandex.net",
+              data.count <= 5_000_000 else { return .failed }
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        if code == 401 { return .authenticationRequired }
         if code == 404 { return .notFound }   // no lyrics for this track
         guard code == 200,
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -204,7 +224,8 @@ struct YandexLyricsProvider: Sendable {
               let (lrcData, lrcResp) = try? await session.data(for: URLRequest(url: dlURL, timeoutInterval: 10)),
               !Task.isCancelled,
               (lrcResp as? HTTPURLResponse)?.statusCode == 200, lrcResp.url?.scheme == "https", lrcData.count <= 2_000_000,
-              let text = String(data: lrcData, encoding: .utf8), !text.isEmpty else { return .failed }
-        return .lrc(text)
+              let text = String(data: lrcData, encoding: .utf8),
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return .failed }
+        return format == .lrc ? .lrc(text) : .plain(text.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 }

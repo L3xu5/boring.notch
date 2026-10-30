@@ -2614,7 +2614,64 @@ private struct YandexMetadataRegressionTests {
     }
 
     @MainActor
+    private static func sameRecordingArtworkIdentity() async throws {
+        do {
+            let client = SnapshotYandexAX(favoriteMetadata(true, title: "A", trackID: "123"))
+            let fixture = MetadataGetFixture(nil)
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 }, startMonitoring: false,
+                snapshotReader: { await fixture.read() })!
+            try await controller.metadataTestUpdate(track("A", id: "opaque A", art: "art A"), diff: false)
+            try await controller.metadataTestUpdate(["artworkData": Data("quality A".utf8).base64EncodedString()])
+            try await waitForAX("Same-recording quality validation did not run") { await fixture.reads == 1 }
+            // A failed quality lookup leaves its bytes unverified; it does not invalidate
+            // the exact recording identified independently by the player bar.
+            await controller.refreshAccessibilityMetadata()
+            try expect(controller.playbackState.nativeTrackID == "123" && controller.currentFavoriteState == true,
+                       "Failed same-opaque quality validation permanently blocked the exact AX recording ID")
+            try expect(controller.playbackState.artwork == Data("art A".utf8),
+                       "Exact ID enrichment published the unverified quality cover")
+            await fixture.set(try wireSnapshot(track("A", id: "opaque A", art: "quality A")))
+            try await waitFor("Enriched exact identity did not restart quality validation") {
+                controller.playbackState.artwork == Data("quality A".utf8)
+            }
+            try await controller.metadataTestUpdate(["elapsedTime": 10.0])
+            await controller.refreshAccessibilityMetadata()
+            try expect(controller.playbackState.nativeTrackID == "123", "A heartbeat lost the recovered exact recording ID")
+            controller.stop(); passed += 1
+            print("PASS failed same-opaque quality lookup permits exact identity and restarts cover validation")
+        }
+        do {
+            let client = SnapshotYandexAX(favoriteMetadata(false, title: "A", trackID: "123"))
+            let fixture = MetadataGetFixture()
+            await fixture.delay()
+            let controller = YandexMusicController(accessibility: client, processIdentifier: { 42 }, startMonitoring: false,
+                snapshotReader: { await fixture.read() })!
+            try await controller.metadataTestUpdate(track("A", id: "opaque A", art: "art A"), diff: false)
+            var covers: [Data?] = []
+            let subscription = controller.playbackStatePublisher.sink { covers.append($0.artwork) }
+            try await controller.metadataTestUpdate(["artworkData": Data("quality A".utf8).base64EncodedString()])
+            try await waitForAX("Old quality validation did not enter its reader") { await fixture.pending == 1 }
+            await controller.refreshAccessibilityMetadata()
+            try expect(controller.playbackState.nativeTrackID == "123", "Pending same-opaque quality validation blocked exact AX identity")
+            try await waitForAX("Exact identity did not replace the old quality request") { await fixture.pending == 2 }
+            await fixture.finish(try wireSnapshot(track("A", id: "opaque A", art: "stale quality")))
+            try await Task.sleep(for: .milliseconds(20))
+            try expect(controller.playbackState.artwork == Data("art A".utf8),
+                       "A late cover reply crossed exact identity enrichment")
+            await fixture.finish(try wireSnapshot(track("A", id: "opaque A", art: "quality A")))
+            try await waitFor("The enriched identity's current quality cover did not appear") {
+                controller.playbackState.artwork == Data("quality A".utf8)
+            }
+            try expect(!covers.contains(Data("stale quality".utf8)), "A stale quality cover appeared in an intermediate publication")
+            _ = subscription
+            controller.stop(); passed += 1
+            print("PASS exact identity replaces pending quality validation and rejects its stale response")
+        }
+    }
+
+    @MainActor
     static func main() async throws {
+        try await sameRecordingArtworkIdentity()
         try await recordingSynchronization()
         try await directedTransportArbitration()
         try await pausedTimelineReconciliation()

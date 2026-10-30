@@ -62,9 +62,11 @@ enum FixtureNetwork {
     static let lock = NSLock()
     static var handler: (URLRequest) -> FixtureResponse = { _ in .init() }
     static var requests: [URL] = []
+    static var httpRequests: [URLRequest] = []
     static func respond(_ request: URLRequest) -> FixtureResponse {
         lock.lock()
         requests.append(request.url!)
+        httpRequests.append(request)
         let response = handler(request)
         lock.unlock()
         return response
@@ -73,6 +75,7 @@ enum FixtureNetwork {
         lock.lock()
         handler = response
         requests = []
+        httpRequests = []
         lock.unlock()
     }
     static var count: Int {
@@ -186,7 +189,12 @@ func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
         try await disableDuringNativeFetch()
         try await staleWebFetch()
         try await negativeResultsRetry()
-        print("15 lyrics regression scenarios passed (actual service and Core module)")
+        try await desktopLyricsRequest()
+        try await plainNativeLyrics()
+        try await nativeLyricsFailureBoundaries()
+        try await availabilityTransitions()
+        try await availabilityLifetime()
+        print("20 lyrics regression scenarios passed (actual service and Core module)")
     }
 
     @MainActor static func durationMatching() throws {
@@ -301,16 +309,16 @@ func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
         FixtureNetwork.reset { _ in .init(status: 404) }
         service.request(request(), enabled: true)
         try await eventually("native Yandex lyrics unavailable") { !service.isFetching }
-        try expect(FixtureNetwork.requests.count == 1 && FixtureNetwork.requests[0].host == "api.music.yandex.net", "Yandex miss substituted another provider")
+        try expect(FixtureNetwork.requests.count == 2 && FixtureNetwork.requests.allSatisfy { $0.host == "api.music.yandex.net" && $0.path == "/tracks/123/lyrics" }, "Yandex miss substituted another provider or recording")
         try expect(service.document.isEmpty, "Yandex miss published unrelated text")
         let cachedMisses = await cache.count
         try expect(cachedMisses == 0, "A Yandex miss was cached")
         observedAt = observedAt.addingTimeInterval(59)
         service.request(request(), enabled: true)
-        try expect(!service.isFetching && FixtureNetwork.count == 1, "Yandex miss ignored its bounded backoff")
+        try expect(!service.isFetching && FixtureNetwork.count == 2, "Yandex miss ignored its bounded backoff")
         observedAt = observedAt.addingTimeInterval(2)
         service.request(request(), enabled: true)
-        try await eventually("Yandex miss can retry without a track change") { !service.isFetching && FixtureNetwork.count == 2 }
+        try await eventually("Yandex miss can retry without a track change") { !service.isFetching && FixtureNetwork.count == 4 }
 
         FixtureNetwork.reset { _ in .init(status: 503) }
         service.request(request(), enabled: true, force: true)
@@ -507,5 +515,149 @@ func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
         manager.retryNow()
         manager.request(bundle: "player")
         try await eventually("lyrics appeared after backoff") { manager.currentLyrics == "Now available" }
+    }
+
+    @MainActor static func desktopLyricsRequest() async throws {
+        FixtureNetwork.reset { request in
+            if request.url!.host == "api.music.yandex.net" {
+                return .init(json: ["result": ["downloadUrl": "https://fixture.invalid/desktop.lrc"]])
+            }
+            return .init(text: "[00:01.00]Desktop recording")
+        }
+        let provider = YandexLyricsProvider(session: .shared, token: "fixture-oauth", timestamp: { 1_700_000_000 })
+        let result = await provider.fetchLRC(title: "Song", artist: "Artist", album: "Album", duration: 200, nativeTrackID: "123")
+        guard case .lrc(let text) = result else { throw TestFailure(description: "Desktop request did not return its exact LRC") }
+        try expect(text.contains("Desktop recording"), "Desktop request lost its downloaded text")
+        let requests = FixtureNetwork.httpRequests
+        try expect(requests.count == 2 && requests[0].url?.path == "/tracks/123/lyrics", "Desktop lyrics did not use the trusted native ID")
+        let query = URLComponents(url: requests[0].url!, resolvingAgainstBaseURL: false)!.queryItems!
+        func value(_ name: String) -> String? { query.first { $0.name == name }?.value }
+        // Fixed vector from the installed desktop client's public signing contract, verified
+        // independently with Python's standard HMAC implementation; no signer is copied here.
+        try expect(value("format") == "LRC" && value("timeStamp") == "1700000000"
+                   && value("sign") == "ltY3/xcmbbFKhLcZA67zTlJ1jZHIasJGnWfzUKW8Tvc=", "Lyrics request used the obsolete Android signing contract")
+        try expect(requests[0].value(forHTTPHeaderField: "X-Yandex-Music-Client") == "YandexMusicDesktopAppMacOS/5.124.1", "Desktop lyrics used an unrelated client header")
+        try expect(requests[0].value(forHTTPHeaderField: "Authorization") == "OAuth fixture-oauth", "API request lost its explicit account credential")
+        try expect(requests[1].value(forHTTPHeaderField: "Authorization") == nil, "Lyrics download leaked OAuth to its file host")
+    }
+
+    @MainActor static func plainNativeLyrics() async throws {
+        FixtureNetwork.reset { request in
+            if request.url!.host == "api.music.yandex.net" {
+                let format = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "format" }?.value
+                if format == "LRC" { return .init(status: 404) }
+                if format == "TEXT" { return .init(json: ["result": ["downloadUrl": "https://fixture.invalid/native.txt"]]) }
+                return .init(status: 500)
+            }
+            return .init(text: "Exact recording plain text\nSecond native line")
+        }
+        let service = LyricsService(cache: LyricsCache(fileURL: temporaryDirectory.appendingPathComponent(UUID().uuidString + ".json")), session: .shared)
+        defer { service.stop(clear: true) }
+        service.request(request(), enabled: true)
+        try await eventually("native TEXT after absent LRC") { !service.isFetching && service.document.plain == "Exact recording plain text\nSecond native line" }
+        try expect(service.document.synced.isEmpty && service.availability == .available, "Unsynchronized native text was discarded or given fabricated timestamps")
+        let api = FixtureNetwork.requests.filter { $0.host == "api.music.yandex.net" }
+        let formats = api.map { url in URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "format" }?.value }
+        try expect(api.count == 2 && api.allSatisfy { $0.path == "/tracks/123/lyrics" } && formats == ["LRC", "TEXT"], "Plain fallback selected another recording or format")
+        try expect(FixtureNetwork.requests.allSatisfy { $0.host != "lrclib.net" && $0.path != "/search" }, "Native plain text was replaced with an external search result")
+    }
+
+    @MainActor static func nativeLyricsFailureBoundaries() async throws {
+        for scenario in ["unauthorized", "forbidden", "server error", "invalid metadata", "unsafe download", "empty download", "download missing"] {
+            FixtureNetwork.reset { request in
+                if request.url!.host == "api.music.yandex.net" {
+                    switch scenario {
+                    case "unauthorized": return .init(status: 401)
+                    case "forbidden": return .init(status: 403)
+                    case "server error": return .init(status: 503)
+                    case "invalid metadata": return .init(json: ["result": ["unexpected": "shape"]])
+                    case "unsafe download": return .init(json: ["result": ["downloadUrl": "http://fixture.invalid/untrusted.lrc"]])
+                    default: return .init(json: ["result": ["downloadUrl": "https://fixture.invalid/empty.lrc"]])
+                    }
+                }
+                return scenario == "download missing" ? .init(status: 404) : .init(text: "")
+            }
+            let result = await YandexLyricsProvider(session: .shared, token: "fixture").fetchLRC(title: "Song", artist: "Artist", album: "Album", duration: 200, nativeTrackID: "123")
+            switch result {
+            case .authenticationRequired:
+                try expect(scenario == "unauthorized", "A non-auth failure incorrectly requested reconnection")
+            case .failed:
+                try expect(scenario != "unauthorized", "Invalid OAuth was hidden as a missing lyric")
+            default: throw TestFailure(description: "Invalid native response supplied lyrics: " + scenario)
+            }
+            let api = FixtureNetwork.requests.filter { $0.host == "api.music.yandex.net" }
+            try expect(api.count == 1 && api[0].path == "/tracks/123/lyrics", "A failed LRC response started an unjustified TEXT/search fallback: " + scenario)
+        }
+        FixtureNetwork.reset { _ in .init(status: 500) }
+        let missing = await YandexLyricsProvider(session: .shared, token: "").fetchLRC(title: "Song", artist: "Artist", album: "Album", duration: 200, nativeTrackID: "123")
+        guard case .authenticationRequired = missing else { throw TestFailure(description: "An absent account was misreported as missing lyrics") }
+        try expect(FixtureNetwork.count == 0, "Absent-account provider performed a speculative network request")
+    }
+
+    @MainActor static func availabilityTransitions() async throws {
+        let service = LyricsService(cache: LyricsCache(fileURL: temporaryDirectory.appendingPathComponent(UUID().uuidString + ".json")), session: .shared)
+        defer { service.stop(clear: true) }
+        try expect(service.availability == .disabled, "Initial lyrics status was not disabled")
+        service.request(request(), enabled: false)
+        try expect(service.availability == .disabled && !service.isFetching && service.document.isEmpty, "Disabled lyrics retained a misleading fetch status")
+        FixtureNetwork.reset { _ in .init(status: 500) }
+        service.request(request(nativeID: nil, token: ""), enabled: true)
+        try await eventually("missing connection status") { service.availability == .connectionRequired && !service.isFetching }
+        try expect(FixtureNetwork.count == 0, "Missing account started a network request")
+        service.request(request(nativeID: nil), enabled: true)
+        try await eventually("waiting for exact track status") { service.availability == .waitingForTrack && !service.isFetching }
+        try expect(FixtureNetwork.count == 0, "Missing native recording started a speculative lookup")
+
+        FixtureNetwork.reset { _ in .init(status: 401) }
+        service.request(request(), enabled: true)
+        try expect(service.availability == .loading && service.isFetching, "Exact-ID enrichment did not publish a loading state immediately")
+        try await eventually("invalid account status") { service.availability == .authenticationRequired && !service.isFetching }
+        try expect(service.document.isEmpty, "An authentication error published another song's text")
+
+        FixtureNetwork.reset { _ in .init(status: 503) }
+        service.request(request(), enabled: true, force: true)
+        try await eventually("native temporary error status") { service.availability == .temporarilyUnavailable && !service.isFetching }
+        FixtureNetwork.reset { _ in .init(status: 404) }
+        service.request(request(), enabled: true, force: true)
+        try await eventually("both native formats not found") { service.availability == .notFound && !service.isFetching }
+        try expect(FixtureNetwork.count == 2, "Missing lyrics did not check both formats for the same recording")
+
+        FixtureNetwork.reset { request in
+            if request.url!.host == "api.music.yandex.net" { return .init(json: ["result": ["downloadUrl": "https://fixture.invalid/current.lrc"]]) }
+            return .init(text: "[00:01]Current native recording")
+        }
+        service.request(request(), enabled: true, force: true)
+        try await eventually("native lyrics available after recovery") { service.availability == .available && !service.isFetching }
+        try expect(service.document.plain == "Current native recording" && service.document.synced.count == 1, "Available status did not correspond to the current document")
+        service.request(request(), enabled: false)
+        try expect(service.availability == .disabled && service.document.isEmpty, "Disabling did not clear availability and document together")
+    }
+
+    @MainActor static func availabilityLifetime() async throws {
+        AppleScriptHelper.pending = []
+        var nativeCompleted = false
+        let service = LyricsService(cache: LyricsCache(fileURL: temporaryDirectory.appendingPathComponent(UUID().uuidString + ".json")), session: .shared, nativeLyrics: {
+            let result = try await AppleScriptHelper.execute("")?.stringValue
+            nativeCompleted = true
+            return result
+        })
+        defer { service.stop(clear: true) }
+        var previous = request(token: "")
+        previous.source = "Apple Music"; previous.bundleIdentifier = "com.apple.Music"
+        service.request(previous, enabled: true)
+        try await eventually("suspended native request status") { AppleScriptHelper.pending.count == 1 }
+        try expect(service.availability == .loading, "Suspended native request lost its loading status")
+        service.request(request(token: ""), enabled: true)
+        try await eventually("replacement source connection status") { service.availability == .connectionRequired && !service.isFetching }
+        AppleScriptHelper.complete(0, with: "Previous source lyrics")
+        try await eventually("cancelled native request completed") { nativeCompleted }
+        await Task.yield()
+        try expect(service.document.isEmpty && service.availability == .connectionRequired && !service.isFetching,
+                   "An uncancellable old native reply replaced the current source's document/status")
+        service.request(request(nativeID: nil), enabled: true)
+        try await eventually("replacement track wait status") { service.availability == .waitingForTrack && !service.isFetching }
+        service.stop(clear: true)
+        try expect(service.availability == .disabled && service.document.isEmpty && !service.isFetching,
+                   "Stopping did not clear the current availability state")
     }
 }

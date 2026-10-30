@@ -23,6 +23,7 @@ struct LyricsRequest: Sendable {
 final class LyricsService: ObservableObject {
     @Published private(set) var document = LyricsDocument(plain: "", synced: [])
     @Published private(set) var isFetching = false
+    @Published private(set) var availability: LyricsAvailability = .disabled
     private(set) var positiveCacheCount = 0
     private let cache: LyricsCache
     private let session: URLSession
@@ -59,7 +60,7 @@ final class LyricsService: ObservableObject {
     func stop(clear: Bool = false) {
         task?.cancel(); task = nil; generation = UUID(); lastKey = ""; retryAfter = nil
         isFetching = false
-        if clear { document = .init(plain: "", synced: []) }
+        if clear { document = .init(plain: "", synced: []); availability = .disabled }
     }
     func retryNow() { retryAfter = .distantPast }
     func request(_ request: LyricsRequest, enabled: Bool, force: Bool = false) {
@@ -73,15 +74,24 @@ final class LyricsService: ObservableObject {
         lastKey = context
         let ticket = generation
         isFetching = true
+        availability = .loading
         document = .init(plain: "", synced: [])
         task = Task { [weak self, cache, session, nativeLyrics] in
             let yandex = request.usesYandexProvider
+            if yandex, request.yandexToken.isEmpty {
+                guard let self, self.isCurrent(ticket, key: context) else { return }
+                self.isFetching = false
+                self.availability = .connectionRequired
+                self.retryAfter = self.now().addingTimeInterval(60)
+                return
+            }
             if yandex, request.nativeTrackID.map({ !$0.isEmpty && $0.allSatisfy { $0 >= "0" && $0 <= "9" } }) != true {
                 // A matching title/duration can still identify a different edit. Wait for
                 // Accessibility to establish the exact source ID before reading any cache
                 // or provider; its arrival changes the key and starts the request at once.
                 guard let self, self.isCurrent(ticket, key: context) else { return }
                 self.isFetching = false
+                self.availability = .waitingForTrack
                 self.retryAfter = self.now().addingTimeInterval(60)
                 return
             }
@@ -89,12 +99,13 @@ final class LyricsService: ObservableObject {
             guard !Task.isCancelled else { return }
             if let cached = await cache.value(for: key) {
                 guard let self, self.isCurrent(ticket, key: context) else { return }
-                self.document = cached; self.isFetching = false
+                self.document = cached; self.isFetching = false; self.availability = .available
                 self.positiveCacheCount = await cache.count
                 return
             }
             var result: LyricsDocument?
             var transientFailure = false
+            var unavailable: LyricsAvailability = .notFound
             if !yandex, request.bundleIdentifier == "com.apple.Music", let plain = try? await nativeLyrics(), !plain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 result = .init(plain: plain.trimmingCharacters(in: .whitespacesAndNewlines), synced: [])
             }
@@ -107,8 +118,12 @@ final class LyricsService: ObservableObject {
                     let lines = LRCParser.parse(text)
                     let document = LyricsDocument(plain: lines.map(\.text).joined(separator: "\n"), synced: lines)
                     if !document.isEmpty { result = document }
+                case .plain(let text):
+                    let document = LyricsDocument(plain: text.trimmingCharacters(in: .whitespacesAndNewlines), synced: [])
+                    if !document.isEmpty { result = document }
+                case .authenticationRequired: unavailable = .authenticationRequired
                 case .notFound: break
-                case .failed: transientFailure = true
+                case .failed: transientFailure = true; unavailable = .temporarilyUnavailable
                 }
             }
             guard !Task.isCancelled, self?.isCurrent(ticket, key: context) == true else { return }
@@ -119,10 +134,12 @@ final class LyricsService: ObservableObject {
                 result = await LRCLIBClient(session: session).fetch(title: request.title, artist: request.artist,
                                                                   album: request.album, duration: request.duration)
                 transientFailure = result == nil
+                if transientFailure { unavailable = .temporarilyUnavailable }
             }
             guard let self, self.isCurrent(ticket, key: context) else { return }
             self.document = result ?? .init(plain: "", synced: [])
             self.isFetching = false
+            self.availability = result?.isEmpty == false ? .available : unavailable
             if let result, !result.isEmpty {
                 await cache.insert(result, for: key)
                 if self.isCurrent(ticket, key: context) { self.positiveCacheCount = await cache.count }

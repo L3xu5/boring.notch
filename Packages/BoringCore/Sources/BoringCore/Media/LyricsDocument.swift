@@ -1,5 +1,10 @@
 import Foundation
 
+public enum LyricsAvailability: Equatable, Sendable {
+    case disabled, loading, available, waitingForTrack, connectionRequired
+    case authenticationRequired, notFound, temporarilyUnavailable
+}
+
 public struct LyricsLine: Codable, Equatable, Sendable {
     public var time: Double
     public var text: String

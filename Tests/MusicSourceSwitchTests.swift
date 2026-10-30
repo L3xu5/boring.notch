@@ -125,6 +125,7 @@ struct LyricsRequest {
     private(set) var lastRequest: LyricsRequest?
     @Published var document = LyricsDocument(plain: "", synced: [])
     @Published var isFetching = false
+    @Published var availability: LyricsAvailability = .disabled
     init() {}
     init(cache: LyricsCache, nativeLyrics: @escaping @MainActor () async throws -> String?) {}
     func stop(clear: Bool) {}
@@ -203,7 +204,8 @@ private extension MusicManager {
                "Previous source action capabilities or heart remain active during the probe")
         expect(manager.albumArt === defaultImage && !manager.usingAppIconForArtwork && manager.avgColor == .white,
                "Previous source artwork remains visible during the probe")
-        expect(manager.currentLyrics.isEmpty && manager.syncedLyrics.isEmpty && !manager.isFetchingLyrics,
+        expect(manager.currentLyrics.isEmpty && manager.syncedLyrics.isEmpty && !manager.isFetchingLyrics
+               && manager.lyricsAvailability == .disabled,
                "Previous source lyrics remain visible during the probe")
     }
     static func main() async throws {

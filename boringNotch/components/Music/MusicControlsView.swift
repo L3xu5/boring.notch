@@ -52,17 +52,23 @@ struct MusicControlsView: View {
             )
             .fontWeight(.medium)
             if Defaults[.enableLyrics] && !musicManager.songTitle.isEmpty {
+                if musicManager.lyricsNeedConnection {
+                    Button(musicManager.lyricsStatusMessage) { YandexAuthWindowController.shared.present() }
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .help("Connect your account to load this recording's lyrics from Yandex Music")
+                } else {
                 TimelineView(.animation(minimumInterval: 0.25, paused: !musicManager.isPlaying)) { timeline in
                     let currentElapsed = musicManager.estimatedPlaybackPosition(at: timeline.date)
                     let line: String = {
-                        if musicManager.isFetchingLyrics { return "Loading lyrics…" }
+                        if musicManager.isFetchingLyrics { return musicManager.lyricsStatusMessage }
                         if !musicManager.syncedLyrics.isEmpty {
                             // Shift the lookup earlier by the user's offset so lines that run
                             // ahead of the audio (output latency, LRC timing) line up.
                             return musicManager.lyricLine(at: max(0, currentElapsed - Defaults[.lyricsOffset]))
                         }
                         let trimmed = musicManager.currentLyrics.trimmingCharacters(in: .whitespacesAndNewlines)
-                        return trimmed.isEmpty ? "No lyrics found" : trimmed.replacingOccurrences(of: "\n", with: " ")
+                        return trimmed.isEmpty ? musicManager.lyricsStatusMessage : trimmed.replacingOccurrences(of: "\n", with: " ")
                     }()
                     let isPersian = line.unicodeScalars.contains { scalar in
                         let v = scalar.value
@@ -77,8 +83,8 @@ struct MusicControlsView: View {
                     )
                     .font(isPersian ? .custom("Vazirmatn-Regular", size: NSFont.preferredFont(forTextStyle: .subheadline).pointSize) : .subheadline)
                     .lineLimit(1)
-                    .opacity(musicManager.isPlaying ? 1 : 0)
                     .transition(.opacity.combined(with: .move(edge: .top)))
+                }
                 }
             }
         }

@@ -452,7 +452,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
     /// The system session carries opaque queue IDs. A fresh matching player-bar sample
     /// supplies Yandex's actual recording ID, so lyrics never have to guess its edition.
     private func enrichMatchedAccessibilityIdentity(_ metadata: YandexAccessibilityMetadata) {
-        guard sessionIsYandex, !stagedArtworkAssociation, playbackState.nativeTrackID == nil,
+        guard sessionIsYandex, !hasPendingOpaqueRecording, playbackState.nativeTrackID == nil,
               let trackID = metadata.trackID, trackID != previousOpaqueTrackID,
               metadataMatchesCurrentTrack(metadata) else { return }
         accessibilityTrackID = trackID
@@ -469,7 +469,15 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         playbackState = state
         // A pending read was tied to the less specific identity. Validate the current
         // cover again with the enriched identity rather than abandoning its recovery.
-        if state.artwork == nil { requestArtworkSnapshot() }
+        if state.artwork == nil || stagedArtworkAssociation || artworkSnapshotTask != nil {
+            requestArtworkSnapshot()
+        }
+    }
+
+    private var hasPendingOpaqueRecording: Bool {
+        guard stagedArtworkAssociation, let publishedMRItemID,
+              let candidate = adapterPayload.string("contentItemIdentifier") else { return false }
+        return candidate != publishedMRItemID
     }
 
     @MainActor
@@ -1307,9 +1315,7 @@ final class YandexMusicController: ObservableObject, MediaControllerProtocol {
         let trackChanged = newState.identity != playbackState.identity || opaqueItemChanged
         let recordingChanged = opaqueItemChanged || transportRecordingChanged(from: playbackState, to: newState)
         if recordingChanged && !sameText { previousOpaqueTrackID = nil }
-        let pendingRecording = stagedArtworkAssociation && nextItemID != nil && publishedMRItemID != nil
-            && nextItemID != publishedMRItemID
-        if pendingRecording {
+        if hasPendingOpaqueRecording {
             newState.currentTime = playbackState.currentTime
             newState.lastUpdated = playbackState.lastUpdated
             newState.duration = playbackState.duration

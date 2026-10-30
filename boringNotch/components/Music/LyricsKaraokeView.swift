@@ -10,14 +10,30 @@ struct LyricsKaraokeView: View {
 
     var body: some View {
         Group {
-            if musicManager.syncedLyrics.isEmpty {
+            if musicManager.syncedLyrics.isEmpty, !musicManager.currentLyrics.isEmpty {
+                ScrollView {
+                    Text(musicManager.currentLyrics)
+                        .font(.callout)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                }
+            } else if musicManager.syncedLyrics.isEmpty {
                 VStack(spacing: 6) {
                     Image(systemName: "quote.bubble")
                         .font(.title2)
                         .foregroundStyle(.secondary)
-                    Text(musicManager.isFetchingLyrics ? "Loading lyrics…" : "No synced lyrics")
+                    Text(musicManager.lyricsStatusMessage)
                         .font(.callout)
                         .foregroundStyle(.secondary)
+                    if musicManager.lyricsNeedConnection {
+                        Button("Connect Yandex Music") { YandexAuthWindowController.shared.present() }
+                            .buttonStyle(.borderless)
+                    } else if musicManager.lyricsAvailability == .temporarilyUnavailable {
+                        Button("Retry") { musicManager.reloadLyricsForCurrentTrack() }
+                            .buttonStyle(.borderless)
+                    }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 // If synced lyrics aren't available, don't strand the user on an empty tab.

@@ -59,6 +59,7 @@ class MusicManager: ObservableObject {
     @Published var usingAppIconForArtwork: Bool = false
     @Published var currentLyrics: String = ""
     @Published var isFetchingLyrics: Bool = false
+    @Published private(set) var lyricsAvailability: LyricsAvailability = .disabled
     @Published var syncedLyrics: [(time: Double, text: String)] = []
     @Published var canFavoriteTrack: Bool = false
     @Published var canDislikeTrack: Bool = false
@@ -189,6 +190,7 @@ class MusicManager: ObservableObject {
         currentLyrics = ""
         syncedLyrics = []
         isFetchingLyrics = false
+        lyricsAvailability = .disabled
         isFlipping = false
         isTransitioning = false
     }
@@ -486,8 +488,23 @@ class MusicManager: ObservableObject {
             self?.syncedLyrics = document.synced.map { (time: $0.time, text: $0.text) }
         }.store(in: &cancellables)
         lyricsService.$isFetching.sink { [weak self] value in self?.isFetchingLyrics = value }.store(in: &cancellables)
+        lyricsService.$availability.sink { [weak self] value in self?.lyricsAvailability = value }.store(in: &cancellables)
     }
     private func cancelLyricsFetch() { lyricsService?.stop(clear: true) }
+    var lyricsNeedConnection: Bool {
+        lyricsAvailability == .connectionRequired || lyricsAvailability == .authenticationRequired
+    }
+    var lyricsStatusMessage: String {
+        switch lyricsAvailability {
+        case .loading: return "Loading lyrics…"
+        case .waitingForTrack: return "Waiting for the current track…"
+        case .connectionRequired: return "Connect Yandex Music for lyrics"
+        case .authenticationRequired: return "Reconnect Yandex Music for lyrics"
+        case .temporarilyUnavailable: return "Could not load lyrics. Try again."
+        case .available: return syncedLyrics.isEmpty ? "No synced lyrics" : ""
+        case .disabled, .notFound: return "No lyrics found for this recording"
+        }
+    }
     func reloadLyricsForCurrentTrack() {
         fetchLyricsIfAvailable(bundleIdentifier: bundleIdentifier, title: songTitle, artist: artistName,
                                album: album, duration: songDuration, force: true)

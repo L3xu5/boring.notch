@@ -25,10 +25,10 @@ struct TabSelectionView: View {
     @Default(.boringShelf) private var shelfEnabled
     @Namespace var animation
 
-    // A Lyrics tab appears only when synced lyrics are actually available for the current track.
+    // The source may provide the exact recording's plain text without synchronized lines.
     private var tabs: [TabModel] {
         var result = [TabModel(label: "Home", icon: "house.fill", view: .home)]
-        if enableLyrics, !musicManager.syncedLyrics.isEmpty {
+        if enableLyrics, !musicManager.syncedLyrics.isEmpty || !musicManager.currentLyrics.isEmpty {
             result.append(TabModel(label: "Lyrics", icon: "quote.bubble.fill", view: .lyrics))
         }
         if shelfEnabled { result.append(TabModel(label: "Shelf", icon: "tray.fill", view: .shelf)) }
